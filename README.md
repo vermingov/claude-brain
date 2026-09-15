@@ -53,13 +53,19 @@ your own cloud account.
   procedural brain: two folded hemispheres, the fissure between them, the cerebellum, a
   brainstem. Folders are lobes and take anatomical regions, the biggest first. Every kind
   of edge is a synapse (wikilinks, similarity, shared tags, notes recalled together, the
-  journal timeline). Notes you recall often and recently run hot and glow; when Claude
-  Code recalls something, the daemon streams the event and the dashboard flashes those
-  notes and sends signals out along their synapses as it happens. The layout is computed
-  once by the daemon and kept, so the brain looks the same each time and a new note lands
-  in its lobe; the page draws notes, halos and sparks as GPU-billboarded sprites with
-  multisampled edges, one draw call per layer, at the display's frame rate on an
-  integrated GPU with well over a thousand notes.
+  journal timeline).
+- **It is quiet until it is used.** At rest the brain is translucent tissue: cells are
+  rim-lit membrane you can see through, synapses are faint threads, nothing glows and
+  nothing moves. Then Claude Code calls a tool, and the daemon streams what it did: the
+  notes the recall returned fire, signals set off down their synapses, arrive at the
+  neighbours a beat later and fire those, and the volley dies out a few hops from where
+  it started. `path` runs one signal along the route it actually walked. The status line
+  says which tool, from where. A note you recall often fires harder than a cold one.
+- **Fast with it** — the layout is computed once by the daemon and kept, so the brain
+  looks the same each time and a new note lands in its lobe; the page draws cells, flares
+  and signals as GPU-billboarded sprites with multisampled edges, one draw call per
+  layer, and a whole volley is one buffer write, not a frame loop. The display's frame
+  rate on an integrated GPU with well over a thousand notes.
 - **A dashboard with a Home** — the brain in numbers, activity over the last two weeks
   (memories recorded, notes recalled), the notes you recall most, the themes that keep
   recurring across separate sessions, recent sessions and the largest clusters, all

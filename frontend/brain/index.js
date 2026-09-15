@@ -1,7 +1,10 @@
-// The 3D brain: notes as lit discs, halos and travelling sparks drawn as GPU-billboarded
-// sprites (one draw call per layer), synapses as one line system, layout served by the
-// daemon. Per frame the CPU updates a time uniform and the camera; everything that scales
-// with the size of the vault happens on the GPU or once, on a change.
+// The 3D brain. At rest it is translucent tissue: cells are membrane, synapses are faint
+// threads, nothing emits light and nothing moves. It lights up only when the brain is
+// actually used — the daemon streams every recall and traversal, and the notes involved
+// fire, sending signals down their synapses to their neighbours and out.
+//
+// Everything that scales with the size of the vault happens on the GPU or once, on a
+// change: per frame the CPU writes one time uniform and moves the camera.
 
 import { Engine } from "@babylonjs/core/Engines/engine";
 import { Scene } from "@babylonjs/core/scene";
@@ -10,69 +13,77 @@ import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { PointsCloudSystem } from "@babylonjs/core/Particles/pointsCloudSystem";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { createCamera } from "./camera.js";
-import { createEdgeLayer } from "./edges.js";
-import { createEmphasis, DIM_CORE } from "./emphasis.js";
+import { buildConduction, planRoute, planVolley } from "./cascade.js";
+import { CELL_ALPHA, createEmphasis, HEAT_ALPHA } from "./emphasis.js";
+import { createImpulseLayer } from "./impulses.js";
 import { createLabels } from "./labels.js";
 import { createLegend } from "./legend.js";
-import { watchRecalls } from "./live.js";
+import { watchActivity } from "./live.js";
 import { createPanel } from "./panel.js";
 import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
-import { createSparks } from "./sparks.js";
 import { createSpriteLayer } from "./sprites.js";
+import { createSynapseLayer } from "./synapses.js";
 
-const BACKGROUND = new Color4(1 / 255, 1 / 255, 2 / 255, 1);
+const BACKGROUND = new Color4(2 / 255, 2 / 255, 4 / 255, 1);
 const PICK_INTERVAL_MS = 50;
-const HALO_SCALE = 5;
+/** The flare around a firing cell, as a multiple of the cell's own radius. */
+const FLARE_SCALE = 6;
 /** Below this, after the fly-in has settled, the post-processing steps down once. */
 const LOW_FPS = 40;
 const QUALITY_CHECK_MS = 6000;
+/** How long a fired note keeps its title, and the status line its sentence. */
+const LABEL_HOLD_MS = 4000;
+const STATUS_HOLD_MS = 6000;
+/** Search hits that get a title; past this it is a wall of text, not a label. */
+const MAX_SEARCH_LABELS = 12;
+const NEVER = -1e9;
+
+const VIA = { mcp: "MCP", cli: "CLI", hook: "session hook", ui: "dashboard" };
+const ACTION = { recall: "recall", path: "path", explain: "explain", affected: "affected" };
 
 const SEARCH_ICON =
 	'<svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4.6" stroke="currentColor" stroke-width="1.1"/><path d="M9.5 9.5L13 13" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>';
 
 function createPipeline(scene, camera) {
-	// HDR-style bloom is what makes the neurons read as light sources; FXAA smooths lines;
-	// grain and vignette give the void some texture. One pipeline, GPU-side.
 	const pipeline = new DefaultRenderingPipeline("brainFx", true, scene, [camera]);
-	// Multisampling on the pipeline's own target is what smooths the synapse lines;
-	// FXAA on top catches what MSAA leaves on sprite rims.
+	// Multisampling on the pipeline's own target is what smooths the synapse threads;
+	// FXAA on top catches what MSAA leaves on the cells' rims.
 	pipeline.samples = Math.min(4, scene.getEngine().getCaps().maxMSAASamples ?? 1);
 	pipeline.fxaaEnabled = true;
+	// Bloom is reserved for firing: resting tissue never reaches this threshold, so a
+	// signal is the only thing in the view that throws light.
 	pipeline.bloomEnabled = true;
-	pipeline.bloomThreshold = 0.45;
-	pipeline.bloomWeight = 0.6;
+	pipeline.bloomThreshold = 0.9;
+	pipeline.bloomWeight = 0.7;
 	pipeline.bloomKernel = 64;
 	pipeline.bloomScale = 0.5;
 	pipeline.imageProcessingEnabled = true;
 	pipeline.imageProcessing.vignetteEnabled = true;
-	pipeline.imageProcessing.vignetteWeight = 1.6;
-	pipeline.imageProcessing.contrast = 1.08;
-	pipeline.grainEnabled = true;
-	pipeline.grain.intensity = 3.5;
-	pipeline.grain.animated = true;
+	pipeline.imageProcessing.vignetteWeight = 1.5;
+	pipeline.imageProcessing.contrast = 1.05;
+	// No grain: it is the one thing that would keep the resting picture moving, and over
+	// a near-black ground it buys nothing.
+	pipeline.grainEnabled = false;
 	return {
 		/** A smaller, coarser bloom and no grain: most of the look for a third of the fill cost. */
 		lighten() {
 			pipeline.bloomKernel = 32;
 			pipeline.bloomScale = 0.25;
-			pipeline.grainEnabled = false;
 		},
 	};
 }
 
 function createStarfield(scene) {
-	const stars = new PointsCloudSystem("stars", 1.6, scene);
-	const tintA = Color3.FromHexString("#5b6b9e");
-	const tintB = Color3.FromHexString("#8b95c9");
-	stars.addPoints(1400, (p) => {
+	const stars = new PointsCloudSystem("stars", 1.4, scene);
+	const tint = Color3.FromHexString("#4b5570");
+	stars.addPoints(900, (p) => {
 		const r = 700 + Math.random() * 1200;
 		const theta = Math.random() * Math.PI * 2;
 		const phi = Math.acos(2 * Math.random() - 1);
 		p.position = new Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
-		const c = Math.random() < 0.5 ? tintA : tintB;
-		const jitter = 0.6 * (0.6 + Math.random() * 0.4);
-		p.color = new Color4(c.r * jitter, c.g * jitter, c.b * jitter, 0.5);
+		const jitter = 0.5 + Math.random() * 0.5;
+		p.color = new Color4(tint.r * jitter, tint.g * jitter, tint.b * jitter, 0.3);
 	});
 	stars.buildMeshAsync().then((mesh) => {
 		mesh.isPickable = false;
@@ -80,7 +91,7 @@ function createStarfield(scene) {
 	});
 }
 
-export function createBrainTab(container, handlers = {}) {
+export function createBrainTab(container) {
 	container.classList.add("brain-tab");
 	const canvas = document.createElement("canvas");
 	canvas.className = "brain-canvas";
@@ -93,6 +104,7 @@ export function createBrainTab(container, handlers = {}) {
 		'<div class="brain-stats"></div><div class="brain-legend"></div>' +
 		'<div class="brain-loading"><div class="loader" aria-hidden="true"></div><div class="loading-text">waking the cortex</div></div>';
 	container.appendChild(chrome);
+	const statsEl = chrome.querySelector(".brain-stats");
 
 	const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 	let visible = false;
@@ -104,61 +116,131 @@ export function createBrainTab(container, handlers = {}) {
 	const scene = new Scene(engine);
 	scene.clearColor = BACKGROUND;
 	scene.fogMode = Scene.FOGMODE_EXP2;
-	scene.fogDensity = 0.0004;
+	scene.fogDensity = 0.00045;
 	scene.fogColor = new Color3(BACKGROUND.r, BACKGROUND.g, BACKGROUND.b);
 	scene.skipPointerMovePicking = true;
-	scene.autoClearDepthAndStencil = true;
 	const view = createCamera(scene, canvas, () => visible);
 	const quality = createPipeline(scene, view.camera);
 	createStarfield(scene);
-	// Test hook: the screenshot harness reads the camera through it.
-	canvas.brainView = { camera: view.camera, engine };
+	// Test hook: the harness reads the camera through this, and can play a volley without
+	// a daemon behind it.
+	let frozen = false;
+	canvas.brainView = {
+		camera: view.camera,
+		engine,
+		simulate: (event) => onActivity(event),
+		/** Harness hook: hold the camera still, so a resting frame can be compared. */
+		freeze: (on) => {
+			frozen = on;
+		},
+	};
 
 	// Everything below exists once the graph has loaded.
 	let graph = null;
 	let emphasis = null;
 	let layers = null;
+	let conduction = null;
 	let picker = null;
 	let panel = null;
 	let search = null;
+	let indexByPath = new Map();
 	let radii = [];
+	let excitability = null;
+	let cellFireAt = null;
+	let cellGain = null;
+	let firedLabels = new Set();
+	let labelTimer = null;
+	let statusTimer = null;
+	let restingStatus = "";
 	let loadedAt = 0;
 	let qualityChecked = false;
 	let stopWatching = () => {};
-	let statsReset = null;
+
+	/** Titles are for what the viewer is touching and what just fired, nothing else. */
+    function labelSet() {
+		const wanted = new Set(firedLabels);
+		if (emphasis.state.hovered !== -1) wanted.add(emphasis.state.hovered);
+		if (emphasis.state.selected !== -1) wanted.add(emphasis.state.selected);
+		if (emphasis.state.matches) {
+			let taken = 0;
+			for (const index of emphasis.state.matches) {
+				if (taken++ >= MAX_SEARCH_LABELS) break;
+				wanted.add(index);
+			}
+		}
+		for (const index of wanted) if (!emphasis.nodeVisible(index)) wanted.delete(index);
+		return wanted;
+	}
 
 	function restyle() {
 		if (!layers) return;
 		const n = graph.nodes.length;
-		const coreTints = new Float32Array(n * 4);
-		const coreSizes = new Float32Array(n);
-		const haloTints = new Float32Array(n * 4);
-		const haloSizes = new Float32Array(n);
+		const cellTints = new Float32Array(n * 4);
+		const cellSizes = new Float32Array(n);
+		const flareTints = new Float32Array(n * 4);
+		const flareSizes = new Float32Array(n);
 		for (let i = 0; i < n; i++) {
 			const node = graph.nodes[i];
 			const state = emphasis.nodeState(i);
-			const base = emphasis.tintOf(node);
-			const hidden = state === "hidden";
-			// A note recalled often and recently runs hot: brighter core, wider halo.
-			const heat = node.activation ?? 0;
-			coreSizes[i] = hidden ? 0 : radii[i];
-			haloSizes[i] = hidden ? 0 : radii[i] * HALO_SCALE * (1 + 0.5 * heat);
-			if (state === "dim") {
-				coreTints.set([DIM_CORE[0], DIM_CORE[1], DIM_CORE[2], 1], i * 4);
-				haloTints.set([base[0], base[1], base[2], 0.03], i * 4);
-			} else {
-				const lift = 0.35 * heat;
-				coreTints.set([base[0] + (1 - base[0]) * lift, base[1] + (1 - base[1]) * lift, base[2] + (1 - base[2]) * lift, 1], i * 4);
-				haloTints.set([base[0], base[1], base[2], (state === "hi" ? 0.55 : 0.22) + 0.45 * heat], i * 4);
-			}
+			const tint = emphasis.tintOf(node);
+			if (state === "hidden") continue;
+			const alpha = CELL_ALPHA[state] + (state === "normal" ? HEAT_ALPHA * (node.activation ?? 0) : 0);
+			cellTints.set([tint[0], tint[1], tint[2], alpha], i * 4);
+			cellSizes[i] = radii[i];
+			// The flare carries the lobe's colour; the shader decides whether it is there.
+			flareTints.set([tint[0], tint[1], tint[2], 0.85], i * 4);
+			flareSizes[i] = radii[i] * FLARE_SCALE;
 		}
-		layers.cores.setTints(coreTints);
-		layers.cores.setSizes(coreSizes);
-		layers.halos.setTints(haloTints);
-		layers.halos.setSizes(haloSizes);
-		layers.edges.restyle(emphasis.edgeState, emphasis.tintOf);
-		layers.labels.restyle(emphasis.nodeState);
-		layers.sparks.restyle(emphasis.edgeState);
+		layers.cells.set("tint", cellTints);
+		layers.cells.set("size", cellSizes);
+		layers.flares.set("tint", flareTints);
+		layers.flares.set("size", flareSizes);
+		layers.synapses.restyle(emphasis.edgeState, emphasis.tintOf);
+		layers.labels.show(labelSet());
+	}
+
+	function setStatus(text) {
+		statsEl.textContent = text;
+		clearTimeout(statusTimer);
+		if (text !== restingStatus) statusTimer = setTimeout(() => (statsEl.textContent = restingStatus), STATUS_HOLD_MS);
+	}
+
+	/** Write a planned volley into the layers. One buffer upload each; the GPU runs it. */
+	function play(plan) {
+		if (plan.fires.length === 0) return;
+		for (const fire of plan.fires) {
+			cellFireAt[fire.node] = fire.at;
+			cellGain[fire.node] = fire.gain;
+		}
+		layers.cells.set("fireAt", cellFireAt);
+		layers.cells.set("fireGain", cellGain);
+		layers.flares.set("fireAt", cellFireAt);
+		layers.flares.set("fireGain", cellGain);
+		layers.synapses.conduct(plan.impulses);
+		layers.impulses.fire(plan.impulses);
+
+		// The first few notes to fire name themselves, then the brain goes quiet again.
+		firedLabels = new Set(plan.fires.slice(0, 6).map((fire) => fire.node));
+		layers.labels.show(labelSet());
+		clearTimeout(labelTimer);
+		labelTimer = setTimeout(() => {
+			firedLabels = new Set();
+			layers.labels.show(labelSet());
+		}, LABEL_HOLD_MS);
+	}
+
+	function onActivity(event) {
+		if (!layers || reducedMotion) return;
+		const seeds = (event.paths ?? []).map((path) => indexByPath.get(path)).filter((index) => index !== undefined);
+		const route = (event.route ?? []).map((path) => indexByPath.get(path)).filter((index) => index !== undefined);
+		const now = performance.now() / 1000;
+		const options = { now, passes: emphasis.edgeVisible, excitability, limit: 320 };
+		if (route.length > 1) play(planRoute(conduction, route, options));
+		else if (seeds.length > 0) play(planVolley(conduction, seeds, options));
+		else return;
+		const where = VIA[event.via] ?? "";
+		const what = ACTION[event.type] ?? event.type;
+		setStatus([where, what, event.query].filter(Boolean).join(" · "));
 	}
 
 	function focusOn(index) {
@@ -178,28 +260,49 @@ export function createBrainTab(container, handlers = {}) {
 	function build(data) {
 		graph = data;
 		emphasis = createEmphasis(graph);
+		conduction = buildConduction(graph);
 		const n = graph.nodes.length;
-		radii = graph.nodes.map((node) => 2.2 + Math.sqrt(node.connections + 1) * 0.9);
+		radii = graph.nodes.map((node) => 2.4 + Math.sqrt(node.connections + 1) * 0.95);
+		excitability = Float32Array.from(graph.nodes, (node) => node.activation ?? 0);
+		cellFireAt = new Float32Array(n).fill(NEVER);
+		cellGain = new Float32Array(n).fill(1);
+		indexByPath = new Map(graph.nodes.map((node, i) => [node.id, i]));
 		const positions = new Float32Array(n * 3);
-		const phases = new Float32Array(n);
-		graph.nodes.forEach((node, i) => {
-			positions.set([node.x, node.y, node.z], i * 3);
-			phases[i] = (i % 32) / 5;
+		graph.nodes.forEach((node, i) => positions.set([node.x, node.y, node.z], i * 3));
+
+		const firing = [
+			{ name: "fireAt", size: 1 },
+			{ name: "fireGain", size: 1 },
+		];
+		const cells = createSpriteLayer(scene, {
+			name: "cells",
+			count: n,
+			vertex: "brainCell",
+			fragment: "brainCell",
+			blend: "alpha",
+			attributes: firing,
+			renderingGroup: 1,
 		});
-		const cores = createSpriteLayer(scene, { name: "cores", count: n, vertex: "brainSprite", fragment: "brainCore", additive: false });
-		const halos = createSpriteLayer(scene, { name: "halos", count: n, vertex: "brainSprite", fragment: "brainGlow", additive: true });
-		for (const layer of [cores, halos]) {
-			layer.setPositions(positions);
-			layer.setPhases(phases);
+		const flares = createSpriteLayer(scene, {
+			name: "flares",
+			count: n,
+			vertex: "brainFlare",
+			fragment: "brainGlow",
+			blend: "add",
+			attributes: firing,
+			renderingGroup: 2,
+		});
+		for (const layer of [cells, flares]) {
+			layer.set("position", positions);
+			layer.set("fireAt", cellFireAt);
+			layer.set("fireGain", cellGain);
 		}
-		halos.setPulse(reducedMotion ? 0 : 1);
-		const categoryById = new Map(graph.categories.map((c) => [c.id, c]));
 		layers = {
-			cores,
-			halos,
-			edges: createEdgeLayer(scene, graph),
-			labels: createLabels(scene, graph, radii, (node) => categoryById.get(node.category)?.color ?? "#94a3b8"),
-			sparks: createSparks(scene, graph, emphasis.tintOf),
+			synapses: createSynapseLayer(scene, graph),
+			cells,
+			flares,
+			impulses: createImpulseLayer(scene, graph, emphasis.tintOf),
+			labels: createLabels(scene, graph, radii),
 		};
 		picker = createPicker(scene, engine, view.camera, graph, radii, emphasis.nodeVisible);
 		panel = createPanel(container, graph, { onNavigate: focusOn, onClose: closePanel });
@@ -227,23 +330,10 @@ export function createBrainTab(container, handlers = {}) {
 			},
 		});
 		for (const kind of legend.hiddenKinds) emphasis.state.hiddenKinds.add(kind);
-		chrome.querySelector(".brain-stats").textContent = `${n} notes · ${graph.edges.length} synapses`;
+		restingStatus = `${n.toLocaleString()} notes · ${graph.edges.length.toLocaleString()} synapses`;
+		statsEl.textContent = restingStatus;
 		restyle();
-
-		const indexByPath = new Map(graph.nodes.map((node, i) => [node.id, i]));
-		stopWatching = watchRecalls((event) => {
-			const hit = event.paths.map((path) => indexByPath.get(path)).filter((i) => i !== undefined);
-			if (hit.length === 0) return;
-			const seconds = performance.now() / 1000;
-			layers.cores.flash(hit, seconds);
-			layers.halos.flash(hit, seconds);
-			layers.sparks.ignite(hit, seconds);
-			chrome.querySelector(".brain-stats").textContent = `recalled: ${event.query}`;
-			clearTimeout(statsReset);
-			statsReset = setTimeout(() => {
-				chrome.querySelector(".brain-stats").textContent = `${n} notes · ${graph.edges.length} synapses`;
-			}, 6000);
-		});
+		stopWatching = watchActivity(onActivity);
 
 		// Settle into a three-quarter profile: the brain silhouette reads best there. The
 		// framing radius comes from where most notes are, so one stray note flung to the
@@ -295,16 +385,16 @@ export function createBrainTab(container, handlers = {}) {
 		const dt = engine.getDeltaTime() / 1000;
 		if (layers) {
 			const seconds = now / 1000;
-			layers.cores.setTime(seconds);
-			layers.halos.setTime(seconds);
-			layers.sparks.setTime(reducedMotion ? 0 : seconds);
-			if (!reducedMotion) layers.sparks.tick(now);
+			layers.cells.setTime(seconds);
+			layers.flares.setTime(seconds);
+			layers.impulses.setTime(seconds);
+			layers.synapses.setTime(seconds);
 			if (!qualityChecked && now - loadedAt > QUALITY_CHECK_MS) {
 				qualityChecked = true;
 				if (engine.getFps() < LOW_FPS) quality.lighten();
 			}
 		}
-		const holdStill = emphasis !== null && (emphasis.state.selected !== -1 || emphasis.state.matches !== null);
+		const holdStill = frozen || (emphasis !== null && (emphasis.state.selected !== -1 || emphasis.state.matches !== null));
 		view.update(dt, now, holdStill, reducedMotion);
 	});
 
@@ -321,13 +411,14 @@ export function createBrainTab(container, handlers = {}) {
 	const resize = () => engine.resize();
 	new ResizeObserver(resize).observe(container);
 
+	let pendingOpen = null;
+
 	/** Open a note by vault path, from another tab. Waits for the graph if it is still loading. */
 	function open(path) {
-		const index = graph?.nodes.findIndex((node) => node.id === path) ?? -1;
-		if (index !== -1) focusOn(index);
+		const index = indexByPath.get(path);
+		if (index !== undefined) focusOn(index);
 		else if (!graph) pendingOpen = path;
 	}
-	let pendingOpen = null;
 
 	const controller = {
 		open,

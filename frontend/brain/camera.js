@@ -5,7 +5,9 @@ import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 
 const IDLE_ROTATE_DELAY_MS = 5000;
-const IDLE_ROTATE_SPEED = 0.045; // radians per second
+// A slow turn, a little over five minutes for a full revolution: enough for the eye to
+// read the shape as solid, not enough to be motion the viewer has to ignore.
+const IDLE_ROTATE_SPEED = 0.018; // radians per second
 const FLY_SPEED = 130; // units per second; Shift multiplies
 
 export function createCamera(scene, canvas, isActive) {

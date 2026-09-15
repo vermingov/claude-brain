@@ -35,7 +35,7 @@ import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
-import { subscribe } from "./src/events";
+import { asVia, subscribe } from "./src/events";
 import { overview } from "./src/overview";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
@@ -191,18 +191,19 @@ function textResponse(text: string): Response {
 /** Traversal verbs. Arguments are resolved through recall, so plain English works. */
 async function handleGraphVerb(verb: string, url: URL): Promise<Response> {
 	const q = url.searchParams.get("q") ?? "";
+	const via = asVia(url.searchParams.get("via"));
 	if (verb === "path") {
 		const from = url.searchParams.get("from") ?? "";
 		const to = url.searchParams.get("to") ?? "";
 		if (!from || !to) return jsonResponse({ error: "missing from/to" }, 400);
-		return textResponse(await renderPath(from, to));
+		return textResponse(await renderPath(from, to, via));
 	}
 	if (verb === "map") return textResponse(renderMap(url.searchParams.has("examples")));
 	if (verb === "rebuild") return jsonResponse(rebuildGraph());
 	if (!q) return jsonResponse({ error: "missing q" }, 400);
-	if (verb === "explain") return textResponse(await renderExplain(q));
+	if (verb === "explain") return textResponse(await renderExplain(q, via));
 	if (verb === "affected") {
-		return textResponse(await renderAffected(q, Number(url.searchParams.get("depth") ?? "2") || 2));
+		return textResponse(await renderAffected(q, Number(url.searchParams.get("depth") ?? "2") || 2, via));
 	}
 	return jsonResponse({ error: `unknown graph verb: ${verb}` }, 404);
 }
@@ -675,6 +676,7 @@ const serveOptions = {
 				episodeK: url.searchParams.has("episodes") ? Number(url.searchParams.get("episodes")) || 0 : undefined,
 				full: url.searchParams.has("full"),
 				cwd: url.searchParams.get("cwd") ?? undefined,
+				via: asVia(url.searchParams.get("via")),
 			};
 			if (url.searchParams.get("format") === "md") {
 				return new Response(await recallMarkdown(q, options), {

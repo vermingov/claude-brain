@@ -1,6 +1,6 @@
 // A layer of camera-facing quads in one mesh: one draw call however many there are.
-// Per-instance attributes are stored four times (once per corner) and rewritten only
-// when something changes — a hover, a filter, a reseed — never per frame.
+// Per-instance values are stored four times, once per corner, and written only when
+// something changes — an emphasis change, or a volley of impulses.
 
 import { Constants } from "@babylonjs/core/Engines/constants";
 import { ShaderMaterial } from "@babylonjs/core/Materials/shaderMaterial";
@@ -10,39 +10,40 @@ import { VertexData } from "@babylonjs/core/Meshes/mesh.vertexData";
 import "./shaders.js";
 
 const CORNERS = [-1, -1, 1, -1, 1, 1, -1, 1];
+/** Always present, in every sprite shader. */
+const STANDARD = [
+	{ name: "tint", size: 4 },
+	{ name: "size", size: 1 },
+];
 
 /**
  * @param {object} spec
  * @param {string} spec.name
  * @param {number} spec.count
- * @param {"brainSprite"|"brainSpark"} spec.vertex
- * @param {"brainCore"|"brainGlow"} spec.fragment
- * @param {boolean} spec.additive  glow layers add light and never write depth
- * @param {string[]} [spec.extraAttributes]  per-instance vec3 attributes beyond the standard set
+ * @param {string} spec.vertex  shader name, without the Vertex suffix
+ * @param {string} spec.fragment
+ * @param {"alpha"|"add"} spec.blend
+ * @param {Array<{name: string, size: number}>} [spec.attributes]  extra per-instance values
+ * @param {number} [spec.renderingGroup]  draw order between layers
  */
 export function createSpriteLayer(scene, spec) {
 	const { count } = spec;
+	const perInstance = [...STANDARD, ...(spec.attributes ?? [])];
 	const material = new ShaderMaterial(
 		`${spec.name}Mat`,
 		scene,
 		{ vertex: spec.vertex, fragment: spec.fragment },
 		{
-			attributes: ["position", "corner", "tint", "size", "phase", "flash", ...(spec.extraAttributes ?? [])],
-			uniforms: ["view", "projection", "time", "pulse", "fogDensity", "fogColor"],
+			attributes: ["position", "corner", ...perInstance.map((a) => a.name)],
+			uniforms: ["view", "projection", "time", "fogDensity", "fogColor"],
 			needAlphaBlending: true,
 		},
 	);
-	if (spec.additive) {
-		material.alphaMode = Constants.ALPHA_ADD;
-		material.disableDepthWrite = true;
-	} else {
-		// Opaque discs with a blended rim: keep depth so nearer notes still occlude.
-		material.alphaMode = Constants.ALPHA_COMBINE;
-		material.disableDepthWrite = false;
-	}
+	material.alphaMode = spec.blend === "add" ? Constants.ALPHA_ADD : Constants.ALPHA_COMBINE;
+	// Nothing here is opaque, so nothing writes depth; the layers' draw order decides.
+	material.disableDepthWrite = true;
 	material.backFaceCulling = false;
 	material.setFloat("time", 0);
-	material.setFloat("pulse", 0);
 	material.setFloat("fogDensity", scene.fogDensity);
 	material.setColor3("fogColor", scene.fogColor);
 
@@ -51,6 +52,7 @@ export function createSpriteLayer(scene, spec) {
 	mesh.isPickable = false;
 	mesh.alwaysSelectAsActiveMesh = true;
 	mesh.doNotSyncBoundingInfo = true;
+	if (spec.renderingGroup !== undefined) mesh.renderingGroupId = spec.renderingGroup;
 
 	const corners = new Float32Array(count * 8);
 	const indices = new Uint32Array(count * 6);
@@ -64,56 +66,42 @@ export function createSpriteLayer(scene, spec) {
 	vertexData.indices = indices;
 	vertexData.applyToMesh(mesh, true);
 	mesh.setVerticesData("corner", corners, false, 2);
-	mesh.setVerticesData("tint", new Float32Array(count * 16), true, 4);
-	mesh.setVerticesData("size", new Float32Array(count * 4), true, 1);
-	mesh.setVerticesData("phase", new Float32Array(count * 4), true, 1);
-	const flashes = new Float32Array(count * 4).fill(-1e9);
-	mesh.setVerticesData("flash", flashes, true, 1);
-	for (const name of spec.extraAttributes ?? []) mesh.setVerticesData(name, new Float32Array(count * 12), true, 3);
 
-	/** Write one vec3 per instance into a per-corner buffer. */
-	function writeVec3(kind, values) {
-		const data = new Float32Array(count * 12);
-		for (let i = 0; i < count; i++) {
-			const x = values[i * 3];
-			const y = values[i * 3 + 1];
-			const z = values[i * 3 + 2];
-			for (let c = 0; c < 4; c++) data.set([x, y, z], i * 12 + c * 3);
+	const buffers = new Map();
+	for (const attribute of perInstance) {
+		const data = new Float32Array(count * 4 * attribute.size);
+		buffers.set(attribute.name, { data, size: attribute.size });
+		mesh.setVerticesData(attribute.name, data, true, attribute.size);
+	}
+	const positions = new Float32Array(count * 12);
+
+	/** Per-instance values, expanded across the instance's four corners. */
+	function set(name, values) {
+		if (name === "position") {
+			for (let i = 0; i < count; i++) {
+				const x = values[i * 3];
+				const y = values[i * 3 + 1];
+				const z = values[i * 3 + 2];
+				for (let c = 0; c < 4; c++) positions.set([x, y, z], i * 12 + c * 3);
+			}
+			mesh.updateVerticesData(VertexBuffer.PositionKind, positions);
+			return;
 		}
-		mesh.updateVerticesData(kind, data);
+		const buffer = buffers.get(name);
+		const { data, size } = buffer;
+		for (let i = 0; i < count; i++) {
+			for (let c = 0; c < 4; c++) {
+				for (let k = 0; k < size; k++) data[i * 4 * size + c * size + k] = values[i * size + k];
+			}
+		}
+		mesh.updateVerticesData(name, data);
 	}
 
 	return {
 		mesh,
-		material,
 		count,
-		setPositions: (values) => writeVec3(VertexBuffer.PositionKind, values),
-		setVec3: (kind, values) => writeVec3(kind, values),
-		/** rgba per instance. */
-		setTints(values) {
-			const data = new Float32Array(count * 16);
-			for (let i = 0; i < count; i++) {
-				for (let c = 0; c < 4; c++) data.set(values.subarray(i * 4, i * 4 + 4), i * 16 + c * 4);
-			}
-			mesh.updateVerticesData("tint", data);
-		},
-		setSizes(values) {
-			const data = new Float32Array(count * 4);
-			for (let i = 0; i < count; i++) data.fill(values[i], i * 4, i * 4 + 4);
-			mesh.updateVerticesData("size", data);
-		},
-		setPhases(values) {
-			const data = new Float32Array(count * 4);
-			for (let i = 0; i < count; i++) data.fill(values[i], i * 4, i * 4 + 4);
-			mesh.updateVerticesData("phase", data);
-		},
-		/** Mark instances as flashed at `seconds`; the shader fades them over the next moments. */
-		flash(indexes, seconds) {
-			for (const i of indexes) flashes.fill(seconds, i * 4, i * 4 + 4);
-			mesh.updateVerticesData("flash", flashes);
-		},
+		set,
 		setTime: (seconds) => material.setFloat("time", seconds),
-		setPulse: (amount) => material.setFloat("pulse", amount),
 		dispose() {
 			mesh.dispose();
 			material.dispose();

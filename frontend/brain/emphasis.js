@@ -1,9 +1,13 @@
-// What is lit and what is dimmed: hover, selection, a search, or a hidden lobe or edge
-// kind. Produces the per-node and per-edge state the layers colour themselves from.
+// What is present and what recedes: hover, selection, a search, a hidden lobe or synapse
+// kind. Nothing here glows — emphasis is how solid a cell is, and firing is the only
+// thing in the view that emits light.
 
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 
-export const DIM_CORE = [0x17 / 255, 0x1b / 255, 0x2e / 255];
+/** How solid a cell is at rest. Tissue, not a dot. */
+export const CELL_ALPHA = { normal: 0.2, dim: 0.07, hi: 0.6 };
+/** A note that is recalled often sits slightly denser, without lighting up. */
+export const HEAT_ALPHA = 0.06;
 
 export function createEmphasis(graph) {
 	const { nodes, edges, categories } = graph;
@@ -13,7 +17,7 @@ export function createEmphasis(graph) {
 			return [c.id, [color.r, color.g, color.b]];
 		}),
 	);
-	const fallback = [148 / 255, 163 / 255, 184 / 255];
+	const fallback = [0.58, 0.6, 0.68];
 	const neighbours = nodes.map(() => new Set());
 	for (const e of edges) {
 		neighbours[e.source].add(e.target);
@@ -32,6 +36,10 @@ export function createEmphasis(graph) {
 	const focus = () => (state.hovered !== -1 ? state.hovered : state.selected);
 	const nodeVisible = (i) => !state.hiddenCategories.has(nodes[i].category);
 	const tintOf = (node) => tintByCategory.get(node.category) ?? fallback;
+	const edgeVisible = (i) => {
+		const edge = edges[i];
+		return !state.hiddenKinds.has(edge.kind) && nodeVisible(edge.source) && nodeVisible(edge.target);
+	};
 
 	function nodeState(i) {
 		if (!nodeVisible(i)) return "hidden";
@@ -42,13 +50,13 @@ export function createEmphasis(graph) {
 		return neighbours[f].has(i) ? "hi" : "dim";
 	}
 
-	function edgeState(e) {
-		if (state.hiddenKinds.has(e.kind) || !nodeVisible(e.source) || !nodeVisible(e.target)) return "hidden";
-		if (state.matches) return state.matches.has(e.source) && state.matches.has(e.target) ? "hi" : "dim";
+	function edgeState(edge) {
+		if (state.hiddenKinds.has(edge.kind) || !nodeVisible(edge.source) || !nodeVisible(edge.target)) return "hidden";
+		if (state.matches) return state.matches.has(edge.source) && state.matches.has(edge.target) ? "hi" : "dim";
 		const f = focus();
 		if (f === -1) return "normal";
-		return e.source === f || e.target === f ? "hi" : "dim";
+		return edge.source === f || edge.target === f ? "hi" : "dim";
 	}
 
-	return { state, nodeVisible, tintOf, nodeState, edgeState, neighbours };
+	return { state, nodeVisible, edgeVisible, tintOf, nodeState, edgeState, neighbours };
 }

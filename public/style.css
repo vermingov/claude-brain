@@ -136,12 +136,13 @@ code { font-family: var(--mono); font-size: 0.92em; }
 /* Card: the border draws itself on hover */
 .card {
 	position: relative;
+	overflow: hidden;
 	background: var(--bg-2);
 	border: 1px solid var(--line);
 	border-radius: var(--radius);
 	padding: 18px 20px;
 }
-.card-border { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.card-border { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .card-border line {
 	stroke: var(--accent);
 	stroke-width: 2;
@@ -159,6 +160,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .settings-btn {
 	position: relative;
 	isolation: isolate;
+	flex: none;
 	overflow: hidden;
 	padding: 9px 18px;
 	border-radius: 999px;
@@ -274,6 +276,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .stat-label { margin-top: 4px; color: var(--text-2); }
 .stat-detail { margin-top: 8px; font-size: 12.5px; color: var(--text-3); }
 .home-columns { display: grid; grid-template-columns: 1.15fr 1fr; gap: 44px; }
+.home-column, .home-section, .cluster-grid, .session-list { min-width: 0; }
 .home-section { margin-bottom: 38px; }
 .home-section h2 { margin: 0 0 14px; font-size: 13px; font-weight: 600; color: var(--text-2); }
 
@@ -289,25 +292,26 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .chart-key .bar + .bar { margin-left: 8px; }
 
 .note-list { list-style: none; margin: 0; padding: 0; }
-.note-list li { display: flex; align-items: baseline; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--line); }
-.note-link { flex: 1; min-width: 0; background: none; border: 0; padding: 0; text-align: left; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color 0.15s; }
+.note-list li { display: flex; align-items: baseline; gap: 14px; border-bottom: 1px solid var(--line); }
+.note-link { flex: 1; min-width: 0; background: none; border: 0; padding: 10px 0; text-align: left; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color 0.15s; }
 .note-link:hover { color: var(--accent); }
-.note-meta { color: var(--text-3); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.note-meta { color: var(--text-3); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; padding: 10px 0; }
 
 .theme { margin-bottom: 10px; padding: 14px 16px; }
-.theme-text { margin: 0 0 6px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.theme-meta { margin: 0; font-size: 12.5px; color: var(--text-3); }
+.theme-text { margin: 0 0 6px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.theme-meta { margin: 0; font-size: 12.5px; color: var(--text-3); overflow-wrap: anywhere; }
 
 .session-list { list-style: none; margin: 0; padding: 0; }
 .session-list li { display: grid; grid-template-columns: 70px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .session-when { color: var(--text-3); font-size: 12.5px; padding-top: 3px; white-space: nowrap; }
 .session-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .session-cwd { color: var(--accent); font-size: 12.5px; }
-.session-summary { color: var(--text-2); font-size: 13.5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.session-summary { color: var(--text-2); font-size: 13.5px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
 .cluster-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
 .cluster { padding: 12px 14px; }
 .cluster-label { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cluster { min-width: 0; }
 .cluster-size { margin-top: 2px; font-size: 12.5px; color: var(--text-3); }
 
 /* Brain -------------------------------------------------------------------- */
@@ -358,7 +362,21 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--text-3)); flex: none; display: inline-block; }
 .sr-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sr-lobe { font-size: 12px; color: var(--text-3); flex: none; }
-.brain-stats { position: absolute; left: 18px; bottom: 18px; padding: 8px 14px; border-radius: 999px; background: var(--bg-2); border: 1px solid var(--line); font-size: 13px; color: var(--text-2); }
+.brain-stats {
+	position: absolute;
+	left: 18px;
+	bottom: 18px;
+	max-width: min(52ch, calc(100% - 320px));
+	padding: 8px 14px;
+	border-radius: 999px;
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	font-size: 13px;
+	color: var(--text-2);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
 .brain-legend {
 	position: absolute;
 	right: 18px;
@@ -479,7 +497,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .designs-head h2 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
 .designs-sub { margin: 0 0 18px; color: var(--text-2); max-width: 64ch; }
 .designs-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-.designs-tools .settings-input { width: auto; flex: 1 1 220px; }
+.designs-tools .settings-input { width: auto; flex: 1 1 220px; min-width: 180px; }
 .designs-notices { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 .designs-notice { padding: 10px 14px; border-radius: var(--radius-sm); background: rgba(230, 180, 85, 0.1); color: var(--warn); font-size: 13px; }
 .designs-drop {

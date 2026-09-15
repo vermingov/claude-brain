@@ -1,7 +1,8 @@
-// The brain as it happens: the daemon streams every recall it makes, and the view lights
-// the notes up. Reconnects on its own; the browser's EventSource does that.
+// The brain as it happens: the daemon streams what it is doing — every recall, every
+// traversal — and the view fires the notes involved. Reconnects on its own; that is what
+// EventSource is for.
 
-export function watchRecalls(onRecall) {
+export function watchActivity(onEvent) {
 	const source = new EventSource("/api/events");
 	source.onmessage = (message) => {
 		let event;
@@ -10,7 +11,7 @@ export function watchRecalls(onRecall) {
 		} catch {
 			return;
 		}
-		if (event.type === "recall") onRecall(event);
+		if (event && typeof event.type === "string") onEvent(event);
 	};
 	return () => source.close();
 }

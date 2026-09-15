@@ -1,16 +1,25 @@
-// What the brain is doing right now, for anyone watching: a recall fires an event with
-// the notes it lit up. The dashboard subscribes over server-sent events and flashes them.
-// In-process only; the daemon is the single writer of everything that matters.
+// What the brain is doing right now, for anyone watching. Every recall and every
+// traversal emits one of these; the dashboard subscribes over server-sent events and
+// fires the notes involved. In-process only, and nothing here is persisted: this is the
+// live wire, not a record.
 
-export interface RecallEvent {
-	type: "recall";
+export type ActivityKind = "recall" | "path" | "explain" | "affected";
+/** Where the request came from. The MCP server, the CLI, a session hook, the dashboard. */
+export type Via = "mcp" | "cli" | "hook" | "ui" | "unknown";
+
+const VIA: readonly Via[] = ["mcp", "cli", "hook", "ui", "unknown"];
+
+export interface BrainEvent {
+	type: ActivityKind;
 	ts: number;
-	/** Vault paths of the notes returned. */
-	paths: string[];
+	via: Via;
+	/** What was asked, short enough for a status line. */
 	query: string;
+	/** Vault paths of the notes involved, most relevant first. */
+	paths: string[];
+	/** For a traversal: the ordered route, so a signal can run it hop by hop. */
+	route?: string[];
 }
-
-export type BrainEvent = RecallEvent;
 
 type Listener = (event: BrainEvent) => void;
 
@@ -24,4 +33,9 @@ export function emit(event: BrainEvent): void {
 export function subscribe(listener: Listener): () => void {
 	listeners.add(listener);
 	return () => listeners.delete(listener);
+}
+
+/** Anything off the wire is a string from a caller; only the known sources are honoured. */
+export function asVia(value: unknown): Via {
+	return VIA.includes(value as Via) ? (value as Via) : "unknown";
 }

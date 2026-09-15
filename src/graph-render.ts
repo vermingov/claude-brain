@@ -1,6 +1,7 @@
 // Text rendering for the graph verbs. Kept apart from traverse.ts so the traversal
 // stays pure data — the API returns JSON from the same functions.
 
+import { emit, type Via } from "./events";
 import {
 	affected,
 	communityMap,
@@ -38,7 +39,7 @@ async function resolveOrExplain(query: string): Promise<{ node: NodeRef; note: s
 	};
 }
 
-export async function renderPath(fromQuery: string, toQuery: string): Promise<string> {
+export async function renderPath(fromQuery: string, toQuery: string, via: Via = "unknown"): Promise<string> {
 	const fromResult = await resolveOrExplain(fromQuery);
 	if (typeof fromResult === "string") return fromResult;
 	const toResult = await resolveOrExplain(toQuery);
@@ -49,6 +50,10 @@ export async function renderPath(fromQuery: string, toQuery: string): Promise<st
 	const hops = findPath(from.id, to.id);
 	if (hops === null) return `No path between "${from.title}" and "${to.title}" — they sit in different parts of the vault.`;
 	if (hops.length === 0) return `Same note: ${label(from)}`;
+
+	// The route is the point of this verb, so the view runs a signal down it hop by hop.
+	const route = [from.path, ...hops.map((hop) => hop.to.path)];
+	emit({ type: "path", ts: Date.now(), via, query: `${from.title} → ${to.title}`, paths: [from.path], route });
 
 	const lines = [fromResult.note, toResult.note].filter(Boolean);
 	if (lines.length > 0) lines.push("");
@@ -63,11 +68,18 @@ export async function renderPath(fromQuery: string, toQuery: string): Promise<st
 	return lines.join("\n");
 }
 
-export async function renderExplain(query: string): Promise<string> {
+export async function renderExplain(query: string, via: Via = "unknown"): Promise<string> {
 	const resolved = await resolveOrExplain(query);
 	if (typeof resolved === "string") return resolved;
 	const report = explainNode(resolved.node.id);
 	if (!report) return `No note matches: ${query}`;
+	emit({
+		type: "explain",
+		ts: Date.now(),
+		via,
+		query: report.node.title,
+		paths: [report.node.path, ...report.neighbours.map((n) => n.path)],
+	});
 
 	const lines = [
 		...(resolved.note ? [resolved.note, ""] : []),
@@ -94,12 +106,13 @@ export async function renderExplain(query: string): Promise<string> {
 	return lines.join("\n").trimEnd();
 }
 
-export async function renderAffected(query: string, depth: number): Promise<string> {
+export async function renderAffected(query: string, depth: number, via: Via = "unknown"): Promise<string> {
 	const resolved = await resolveOrExplain(query);
 	if (typeof resolved === "string") return resolved;
 	const { node } = resolved;
 	const hits = affected(node.id, depth);
 	if (hits.length === 0) return `Nothing points at ${node.title}.`;
+	emit({ type: "affected", ts: Date.now(), via, query: node.title, paths: [node.path, ...hits.map((hit) => hit.path)] });
 	const lines = [
 		...(resolved.note ? [resolved.note, ""] : []),
 		`${hits.length} reach ${node.title} (depth ≤ ${depth}, strongest first)`,

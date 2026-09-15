@@ -1,28 +1,28 @@
-// Hub labels: a text plane for the most connected notes only. Each is its own mesh and
-// texture, so the count is capped — past a few dozen they are draw calls that overlap
-// into noise anyway.
+// Titles, on demand. The resting brain carries no text: a label appears for the note
+// under the pointer, the one being read, a search hit, or a note that just fired, and
+// goes away with it. Textures are made on first use and a small pool is kept.
 
 import { DynamicTexture } from "@babylonjs/core/Materials/Textures/dynamicTexture";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { CreatePlane } from "@babylonjs/core/Meshes/Builders/planeBuilder";
 import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
 
-const MAX_LABELS = 60;
-const MIN_CONNECTIONS = 7;
 const FONT_PX = 44;
-const PAD = 18;
-const SCALE = 0.11;
+const PAD = 16;
+const SCALE = 0.1;
+/** Textures kept around; past this the least recently shown is thrown away. */
+const POOL = 48;
 
 function truncate(text, max) {
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
-function makeLabel(scene, node, colorHex, radius) {
-	const text = truncate(node.title, 34);
+function makeLabel(scene, node, radius) {
+	const text = truncate(node.title, 40);
 	const measure = new DynamicTexture("measure", { width: 2, height: 2 }, scene, false);
-	const mctx = measure.getContext();
-	mctx.font = `500 ${FONT_PX}px system-ui, sans-serif`;
-	const width = Math.ceil(mctx.measureText(text).width) + PAD * 2;
+	const context = measure.getContext();
+	context.font = `500 ${FONT_PX}px system-ui, sans-serif`;
+	const width = Math.ceil(context.measureText(text).width) + PAD * 2;
 	measure.dispose();
 	const height = FONT_PX + PAD * 2;
 	const texture = new DynamicTexture(`label:${node.id}`, { width, height }, scene, true);
@@ -31,9 +31,7 @@ function makeLabel(scene, node, colorHex, radius) {
 	ctx.font = `500 ${FONT_PX}px system-ui, sans-serif`;
 	ctx.textBaseline = "middle";
 	ctx.textAlign = "center";
-	ctx.shadowColor = colorHex;
-	ctx.shadowBlur = 18;
-	ctx.fillStyle = "rgba(232,236,248,0.92)";
+	ctx.fillStyle = "rgba(242,237,229,0.95)";
 	ctx.fillText(text, width / 2, height / 2);
 	texture.update();
 	const material = new StandardMaterial(`labelMat:${node.id}`, scene);
@@ -45,27 +43,43 @@ function makeLabel(scene, node, colorHex, radius) {
 	plane.material = material;
 	plane.billboardMode = TransformNode.BILLBOARDMODE_ALL;
 	plane.isPickable = false;
-	plane.position.set(node.x, node.y - (radius + 7), node.z);
+	plane.renderingGroupId = 3;
+	plane.position.set(node.x, node.y - (radius + 6), node.z);
 	return plane;
 }
 
-/** @returns Map of node index → label plane, for the top hubs. */
-export function createLabels(scene, graph, radii, colorOf) {
-	const hubs = graph.nodes
-		.map((node, index) => ({ node, index }))
-		.filter(({ node }) => node.connections >= MIN_CONNECTIONS)
-		.sort((a, b) => b.node.connections - a.node.connections)
-		.slice(0, MAX_LABELS);
-	const planes = new Map(hubs.map(({ node, index }) => [index, makeLabel(scene, node, colorOf(node), radii[index])]));
+export function createLabels(scene, graph, radii) {
+	const live = new Map();
+	let clock = 0;
 
-	/** @param {(index: number) => "hidden"|"dim"|"normal"|"hi"} stateOf */
-	function restyle(stateOf) {
-		for (const [index, plane] of planes) {
-			const state = stateOf(index);
-			plane.setEnabled(state !== "hidden");
-			plane.visibility = state === "dim" ? 0.1 : state === "hi" ? 1 : 0.85;
+	function ensure(index) {
+		let entry = live.get(index);
+		if (!entry) {
+			entry = { plane: makeLabel(scene, graph.nodes[index], radii[index]), usedAt: 0 };
+			live.set(index, entry);
+		}
+		entry.usedAt = clock++;
+		return entry;
+	}
+
+	function evict() {
+		while (live.size > POOL) {
+			let oldest = null;
+			for (const [index, entry] of live) {
+				if (!entry.plane.isEnabled() && (oldest === null || entry.usedAt < live.get(oldest).usedAt)) oldest = index;
+			}
+			if (oldest === null) return;
+			live.get(oldest).plane.dispose(false, true);
+			live.delete(oldest);
 		}
 	}
 
-	return { restyle, dispose: () => planes.forEach((p) => p.dispose(false, true)) };
+	/** Exactly these notes carry a title; everything else loses its. */
+	function show(indexes) {
+		for (const [index, entry] of live) if (!indexes.has(index)) entry.plane.setEnabled(false);
+		for (const index of indexes) ensure(index).plane.setEnabled(true);
+		evict();
+	}
+
+	return { show, dispose: () => live.forEach((entry) => entry.plane.dispose(false, true)) };
 }

@@ -64,6 +64,7 @@ async function cmdRecall(rest: string[]): Promise<void> {
 	if (full) params.set("full", "1");
 	// Where the question is being asked from: notes that helped here before rank higher.
 	params.set("cwd", process.cwd());
+	params.set("via", "cli");
 	const session = sessionIdFromEnv();
 	if (session) params.set("session", session);
 	const res = await api(`/api/recall?${params}`);
@@ -122,6 +123,7 @@ async function cmdGraph(verb: string, rest: string[]): Promise<void> {
 		if (depth !== -1) params.set("depth", rest[depth + 1] ?? "2");
 	}
 	await ensureServer();
+	params.set("via", "cli");
 	const res = await api(`/api/graph/${verb}?${params}`);
 	if (!res) {
 		console.error("claude-brain: graph verbs need the server — try `claude-brain serve`");

@@ -93,7 +93,7 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 	const encoded = recordEpisode({ sessionId, cwd, kind: "prompt", text: clip(text, 600), salience: 1.4 });
 	if (encoded === null) return "";
 
-	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, cwd, excludeSessionId: sessionId });
+	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, cwd, excludeSessionId: sessionId, via: "hook" });
 	if (hits.length === 0) return "";
 	const best = Math.max(...hits.map((h) => h.score));
 	if (best < MIN_SCORE) return "";

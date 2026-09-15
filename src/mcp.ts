@@ -76,6 +76,7 @@ async function text(res: Response | null, what: string): Promise<string> {
 
 async function graphVerb(verb: string, params: URLSearchParams): Promise<string> {
 	await daemon();
+	params.set("via", "mcp");
 	return text(await api(`/api/graph/${verb}?${params}`), verb);
 }
 
@@ -106,6 +107,9 @@ const TOOLS: Tool[] = [
 				format: "md",
 				session: SESSION,
 				cwd: process.cwd(),
+				// The dashboard's brain view lights up what the tools touch; this is how it
+				// knows an MCP tool, rather than a terminal, is doing the asking.
+				via: "mcp",
 			});
 			if (str(args.folder)) params.set("p", str(args.folder));
 			if (int(args.episodes) !== undefined) params.set("episodes", String(int(args.episodes)));
