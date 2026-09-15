@@ -12,13 +12,17 @@
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { createSpriteLayer } from "./sprites.js";
 
-const COUNT = 1600;
+const COUNT = 1200;
 /** One in this many is haze rather than a speck. */
-const HAZE_EVERY = 9;
-const SPECK_SIZE = [0.9, 2.4];
-const HAZE_SIZE = [16, 34];
-const SPECK_ALPHA = [0.1, 0.5];
-const HAZE_ALPHA = [0.012, 0.03];
+const HAZE_EVERY = 7;
+const SPECK_SIZE = [0.8, 2.0];
+/**
+ * Small enough to live in the far half of the cube without ever swelling across the view.
+ * A puff four times this size looks better in a still and is intolerable to fly through.
+ */
+const HAZE_SIZE = [6, 12];
+const SPECK_ALPHA = [0.08, 0.36];
+const HAZE_ALPHA = [0.03, 0.07];
 /** Cold, faintly blue-white — the colour of dust lit by nothing in particular. */
 const TINT = [0.62, 0.68, 0.82];
 

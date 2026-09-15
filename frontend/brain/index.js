@@ -326,13 +326,15 @@ export function createBrainTab(container) {
 			{ name: "fireGain", size: 1 },
 			{ name: "arriveAt", size: 1 },
 		];
+		// How bushy each cell grows: one basal dendrite per few links, clamped in the shader.
+		const branches = Float32Array.from(graph.nodes, (node) => 2 + Math.min(4, Math.round(Math.sqrt(node.connections))));
 		const cells = createSpriteLayer(scene, {
 			name: "cells",
 			count: n,
 			vertex: "brainCell",
 			fragment: "brainCell",
 			blend: "alpha",
-			attributes: firing,
+			attributes: [...firing, { name: "branches", size: 1 }],
 			arrivalRange: reach,
 			renderingGroup: 1,
 		});
@@ -352,6 +354,7 @@ export function createBrainTab(container) {
 			layer.set("fireGain", cellGain);
 			layer.set("arriveAt", cellArriveAt);
 		}
+		cells.set("branches", branches);
 		layers = {
 			dust: createDust(scene, spread[Math.floor(spread.length * 0.95)] ?? 0),
 			synapses: createSynapseLayer(scene, graph, reach),

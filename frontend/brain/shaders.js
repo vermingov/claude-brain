@@ -83,26 +83,52 @@ float popFlash(float born) {
 	return born < 0.0 ? 0.0 : exp(-born * 1.9);
 }`;
 
+/**
+ * How much bigger the drawn cell is than its soma. The soma stays `size` — that is what the
+ * pointer hits and what the layout spaced the notes by — and the arbor reaches out past it.
+ */
+const ARBOR = 3.4;
+
 Effect.ShadersStore.brainCellVertexShader = `
 precision highp float;
+#define ARBOR ${ARBOR}
 attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size;
-attribute float fireAt; attribute float fireGain; attribute float arriveAt;
+attribute float fireAt; attribute float fireGain; attribute float arriveAt; attribute float branches;
 uniform mat4 view; uniform mat4 projection; uniform float time;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
+varying vec2 vUp; varying float vDetail; varying float vBranches; varying float vSeed;
 ${SPIKE}
 ${POP}
 ${ARRIVAL}
 void main() {
 	vTint = tint; vCorner = corner; vDepth = 0.0; vFire = 0.0; vArrive = 0.0;
+	vUp = vec2(0.0, 1.0); vDetail = 0.0; vBranches = branches; vSeed = 0.0;
 	if (size <= 0.0) { ${CULL} return; }
 	float born = time - arriveAt;
 	float pop = popScale(born);
 	if (pop <= 0.001) { ${CULL} return; }
 	float fire = spike(time - fireAt) * fireGain;
-	vec4 viewPos = view * vec4(position + arrivalPush(position, time), 1.0);
-	viewPos.xy += corner * size * pop * (1.0 + 0.5 * fire);
+	vec3 world = position + arrivalPush(position, time);
+	vec4 viewPos = view * vec4(world, 1.0);
+	viewPos.xy += corner * size * ARBOR * pop * (1.0 + 0.5 * fire);
 	gl_Position = projection * viewPos;
 	vDepth = -viewPos.z; vFire = fire; vArrive = popFlash(born);
+
+	// Every note sits on the cortex, so "away from the middle of the brain" is the way a
+	// real pyramidal cell points: apex and apical dendrite toward the surface, basal
+	// dendrites and axon down into the white matter. The whole sheet ends up combed the
+	// same way, which is what a cortex actually looks like.
+	vec3 outward = (view * vec4(normalize(position + vec3(0.0, 0.0, 0.001)), 0.0)).xyz;
+	float lean = length(outward.xy);
+	vUp = lean > 0.001 ? outward.xy / lean : vec2(0.0, 1.0);
+	// Pointing at or away from the camera, the arbor is foreshortened to nearly nothing;
+	// drawing it at full length there would make it swing about as the camera turns.
+	vSeed = lean;
+
+	// Detail falls away with apparent size: a cell a few pixels across gets a soma and
+	// nothing else, which is most of them in the overview and all of the cost.
+	float apparent = size * ARBOR * projection[1][1] / max(-viewPos.z, 1.0);
+	vDetail = clamp((apparent - 0.012) / 0.05, 0.0, 1.0);
 }`;
 
 /**
@@ -110,28 +136,103 @@ void main() {
  * them read as tissue you can see through rather than a field of dots. Firing is the only
  * thing that crosses the bloom threshold.
  */
+/**
+ * A pyramidal cell, drawn procedurally in the quad.
+ *
+ * The shape is the one a Golgi stain shows: a teardrop soma with its apex toward the
+ * cortical surface, one thick apical dendrite rising from that apex and splitting into a
+ * tuft, a spray of shorter basal dendrites from the base, and a single thin axon running
+ * the other way. How many basal dendrites a cell grows is how many notes link to it, so a
+ * hub is visibly a bushier cell and an orphan is a bare soma — the picture says what the
+ * graph says without a legend for it.
+ *
+ * Everything is signed distance, so the processes taper and join smoothly and the whole
+ * arbor antialiases against one pixel width.
+ */
 Effect.ShadersStore.brainCellFragmentShader = `
 precision highp float;
+#define ARBOR ${ARBOR}
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
+varying vec2 vUp; varying float vDetail; varying float vBranches; varying float vSeed;
 ${FOG}
+
+/** Distance to a line that thins from radius r0 at a to radius r1 at b. */
+float process(vec2 p, vec2 a, vec2 b, float r0, float r1) {
+	vec2 pa = p - a;
+	vec2 ba = b - a;
+	float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+	return length(pa - ba * h) - mix(r0, r1, h);
+}
+
+float smin(float a, float b, float k) {
+	float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+	return mix(b, a, h) - k * h * (1.0 - h);
+}
+
 void main() {
-	float d = length(vCorner);
-	// The rim is blended over one screen pixel, so a disc has no staircase edge.
-	float edge = max(fwidth(d), 0.0015);
-	float coverage = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, d);
-	if (coverage <= 0.003) discard;
-	float facing = sqrt(max(1.0 - d * d, 0.0));
-	vec3 normal = vec3(vCorner, facing);
-	float rim = pow(1.0 - facing, 2.2);
+	// Into the cell's own frame: y along the cortical normal, soma radius 1.
+	vec2 right = vec2(vUp.y, -vUp.x);
+	vec2 q = vec2(dot(vCorner, right), dot(vCorner, vUp)) * ARBOR;
+
+	// The soma: a circle pulled into a point at the apex. Squeezing x in proportion to y
+	// above the middle is all a teardrop is.
+	float taper = 1.0 + 0.55 * max(q.y, 0.0);
+	float d = length(vec2(q.x * taper, q.y * 0.92)) - 0.95;
+
+	// Foreshortening: seen end-on there is no length to draw, and a full arbor would swing
+	// around as the camera moved.
+	float reach = vDetail * (0.35 + 0.65 * vSeed);
+	if (reach > 0.02) {
+		// The apical dendrite, thickest of the processes, and its tuft.
+		vec2 apex = vec2(0.0, 0.8);
+		vec2 top = apex + vec2(0.0, 1.85 * reach);
+		d = smin(d, process(q, apex, top, 0.26, 0.1), 0.18);
+		d = smin(d, process(q, top, top + vec2(-0.5, 0.55) * reach, 0.09, 0.03), 0.1);
+		d = smin(d, process(q, top, top + vec2(0.45, 0.6) * reach, 0.09, 0.03), 0.1);
+
+		// Basal dendrites, fanned below the base. One per few links, so the arbor thickens
+		// with the note's place in the graph.
+		vec2 base = vec2(0.0, -0.55);
+		float count = clamp(vBranches, 2.0, 6.0);
+		for (int i = 0; i < 6; i++) {
+			if (float(i) >= count) break;
+			float t = (float(i) + 0.5) / count;
+			float angle = mix(-2.5, -0.65, t);
+			vec2 dir = vec2(cos(angle), sin(angle));
+			// A kink partway along, so they are not a starburst of straight spokes.
+			vec2 mid = base + dir * 0.75 * reach;
+			vec2 tip = mid + normalize(dir + vec2(0.0, -0.45)) * 0.7 * reach;
+			d = smin(d, process(q, base, mid, 0.2, 0.11), 0.14);
+			d = smin(d, process(q, mid, tip, 0.11, 0.02), 0.09);
+		}
+
+		// The axon: one, thin, and longer than anything else, straight down into the white.
+		d = smin(d, process(q, base, base + vec2(0.12, -3.0) * reach, 0.085, 0.045), 0.1);
+	}
+
+	float edge = max(fwidth(d), 0.012);
+	float coverage = 1.0 - smoothstep(-edge, edge, d);
+	if (coverage <= 0.004) discard;
+
+	// The soma is the solid part; the finer the process, the fainter it draws, which is how
+	// these look stained and keeps a thousand arbors from filling the view with lines.
+	float body = 1.0 - smoothstep(-0.95, 0.15, d);
+	float ink = mix(0.42, 1.0, body);
+
+	// Membrane, not a dot: lit across the soma and brightest at its rim. Measured against
+	// the soma's own radius — over the whole arbor the curve flattens out and the cell goes
+	// nearly transparent.
+	float across = clamp(length(q) / 1.05, 0.0, 1.0);
+	float facing = sqrt(max(1.0 - across * across, 0.0));
+	vec3 normal = normalize(vec3(q / 1.05, facing + 0.2));
 	float lambert = 0.45 + 0.55 * max(dot(normal, normalize(vec3(-0.35, 0.55, 0.76))), 0.0);
+	float rim = pow(1.0 - facing, 2.2);
+
 	vec3 resting = vTint.rgb * lambert;
-	// Keeps enough of the lobe's hue to say which part of the brain is working.
 	vec3 firing = mix(vTint.rgb, vec3(1.0), 0.45) * 2.8;
 	vec3 color = mix(resting, firing, clamp(vFire, 0.0, 1.0));
-	// A note that has just landed is solid and over the bloom threshold, so the eye goes
-	// to it before it has read anything else on the screen.
 	color = mix(color, vec3(1.0, 0.96, 0.9) * 3.2, clamp(vArrive, 0.0, 1.0));
-	float alpha = clamp(vTint.a * (0.3 + 0.7 * rim) + vFire * 0.9 + vArrive, 0.0, 1.0) * coverage;
+	float alpha = clamp(vTint.a * (0.45 + 0.8 * rim) * ink + vFire * 0.9 + vArrive, 0.0, 1.0) * coverage;
 	gl_FragColor = vec4(mix(fogColor, color, fogFactor(vDepth)), alpha);
 }`;
 
@@ -175,6 +276,8 @@ precision highp float;
 attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size;
 uniform mat4 view; uniform mat4 projection; uniform float time; uniform vec3 cameraPos; uniform float cell;
 varying vec4 vTint; varying vec2 vCorner;
+/** The most of the view's height one mote may ever take up, before it is faded out. */
+const float MAX_APPARENT = 0.038;
 void main() {
 	vTint = vec4(0.0); vCorner = corner;
 	// Alive when nothing else is: a slow wander, out of phase per mote.
@@ -186,9 +289,14 @@ void main() {
 	// Into the cube that follows the camera.
 	vec3 rel = mod(position + drift - cameraPos + cell * 0.5, cell) - cell * 0.5;
 	float dist = length(rel);
-	// Gone before the cube's edge, so nothing blinks into being at the boundary, and gone
-	// again right in front of the lens, where one mote would fill the screen.
-	float fade = smoothstep(cell * 0.5, cell * 0.34, dist) * smoothstep(0.0, cell * 0.06, dist);
+	// Gone before the cube's edge, so nothing blinks into being at the boundary.
+	float fade = smoothstep(cell * 0.5, cell * 0.34, dist);
+	// And gone well before it is big on screen. Distance alone is the wrong measure: a haze
+	// puff and a speck at the same distance are wildly different amounts of the view, and it
+	// is the ones that swell up in front of the lens that pull the eye off the brain. What
+	// matters is the angle a mote subtends, which is its size over its distance.
+	float apparent = size / max(dist, 1.0);
+	fade *= 1.0 - smoothstep(MAX_APPARENT * 0.55, MAX_APPARENT, apparent);
 	if (fade <= 0.004) { ${CULL} return; }
 	vec4 viewPos = view * vec4(cameraPos + rel, 1.0);
 	viewPos.xy += corner * size;

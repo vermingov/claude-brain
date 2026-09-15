@@ -11,9 +11,10 @@ import "./shaders.js";
 /**
  * How present each kind of synapse is at rest. Explicit links lead; a similarity guess is
  * barely there, which is what lets three thousand of them describe a shape you can see
- * through rather than a ball of wool.
+ * through rather than a ball of wool. Guessed edges outnumber written ones two to one, so
+ * they are held down far enough that the cells, not the wiring, are what the eye lands on.
  */
-export const EDGE_ALPHA = { wikilink: 0.11, cooccur: 0.1, timeline: 0.08, semantic: 0.035, tag: 0.03 };
+export const EDGE_ALPHA = { wikilink: 0.11, cooccur: 0.1, timeline: 0.07, semantic: 0.019, tag: 0.016 };
 const DIM_ALPHA = 0.02;
 const HI_ALPHA = 0.55;
 const TIMELINE_TINT = [0.58, 0.6, 0.68];
