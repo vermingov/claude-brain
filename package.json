@@ -1,6 +1,6 @@
 {
 	"name": "claude-brain",
-	"version": "0.5.1",
+	"version": "0.6.0",
 	"description": "A local second brain for Claude Code: hybrid recall over notes and past sessions, episodic memory, note-graph traversal, design memory, 3D visualisation, cloud sync.",
 	"license": "MIT",
 	"type": "module",
@@ -17,11 +17,11 @@
 	"devDependencies": {
 		"@types/bun": "latest",
 		"typescript": "^5",
-		"@babylonjs/core": "^9.18.0",
-		"d3-force-3d": "^3.0.6"
+		"@babylonjs/core": "^9.18.0"
 	},
 	"dependencies": {
 		"fastembed": "^2.1.0",
-		"sqlite-vec": "^0.1.9"
+		"sqlite-vec": "^0.1.9",
+		"d3-force-3d": "^3.0.6"
 	}
 }

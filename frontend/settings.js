@@ -38,10 +38,27 @@ export function createSettingsTab(container) {
 	}
 
 	function section(title, subtitle) {
-		const s = el("section", "settings-card glass");
+		const s = el("section", "settings-section");
 		s.appendChild(el("h3", null, title));
 		if (subtitle) s.appendChild(el("p", "settings-sub", subtitle));
 		return s;
+	}
+
+	/**
+	 * An on/off control that reads as one: a switch, not a button whose label flips.
+	 * Switch styling adapted from Uiverse (alfoly1988, MIT).
+	 */
+	function toggle(label, checked, onChange) {
+		const wrap = el("label", "switch");
+		const input = el("input");
+		input.type = "checkbox";
+		input.checked = checked;
+		input.onchange = async () => {
+			input.disabled = true;
+			await onChange(input.checked);
+		};
+		wrap.append(input, el("span", "switch-track"), el("span", "switch-label", label));
+		return wrap;
 	}
 
 	function render() {
@@ -58,7 +75,7 @@ export function createSettingsTab(container) {
 	function renderVault() {
 		const s = section(
 			"Brain location",
-			"Your brain is a folder of markdown notes on your disk. Point it at an existing Obsidian vault or any directory — new brains grow from an empty folder too.",
+			"Your brain is a folder of markdown notes on your disk. Point it at an existing Obsidian vault or any directory. A new brain grows from an empty folder too.",
 		);
 
 		if (status.vault) {
@@ -68,7 +85,7 @@ export function createSettingsTab(container) {
 					(status.vaultReady ? "" : '<span class="vault-missing">not accessible right now</span>')),
 			);
 		} else {
-			s.appendChild(el("div", "vault-current warn", '<span class="dot"></span>No vault selected yet — pick one below.'));
+			s.appendChild(el("div", "vault-current warn", '<span class="dot"></span>No vault selected yet. Pick one below.'));
 		}
 
 		const picker = el("div", "vault-picker");
@@ -130,30 +147,30 @@ export function createSettingsTab(container) {
 		if (sync.provider && !sync.remoteConfigured) {
 			s.appendChild(
 				el("div", "sync-hint warn",
-					`Account not connected yet. Run <code>claude-brain sync setup ${sync.provider}</code> in a terminal — ` +
-					"it opens the provider's own sign-in (credentials go to rclone on your machine, nowhere else)."),
+					`Account not connected yet. Run <code>claude-brain sync setup ${sync.provider}</code> in a terminal: ` +
+					"it opens the provider's own sign-in, and the credentials go to rclone on your machine, nowhere else."),
 			);
 		}
 
 		const controls = el("div", "sync-controls");
-		const toggle = el("button", `settings-btn ${sync.enabled ? "primary" : "ghost"}`,
-			sync.enabled ? "Auto-sync on" : "Auto-sync off");
-		toggle.onclick = async () => {
-			await api("/api/sync/config", { enabled: !sync.enabled });
-			await refresh();
-		};
 		const now = el("button", "settings-btn ghost", sync.running ? "Syncing…" : "Sync now");
 		now.disabled = sync.running || !sync.remoteConfigured;
 		now.onclick = async () => {
 			await api("/api/sync/now", {});
 			setTimeout(refresh, 1500);
 		};
-		controls.append(toggle, now);
+		controls.append(
+			toggle("Sync automatically", sync.enabled, async (enabled) => {
+				await api("/api/sync/config", { enabled });
+				await refresh();
+			}),
+			now,
+		);
 		s.appendChild(controls);
 
 		if (sync.lastSync) {
 			s.appendChild(el("div", "settings-sub",
-				`Last sync: ${escapeHtml(sync.lastSync)} — ${sync.lastResult === "ok" ? "ok" : "failed"}`));
+				`Last sync: ${escapeHtml(sync.lastSync)}, ${sync.lastResult === "ok" ? "ok" : "failed"}`));
 		}
 		if (sync.log?.length) {
 			s.appendChild(el("pre", "sync-log", sync.log.map(escapeHtml).join("\n")));
@@ -163,17 +180,25 @@ export function createSettingsTab(container) {
 
 	// --- Claude Code integration --------------------------------------------
 
+	const INTEGRATION_PARTS = [
+		["mcp", "MCP server, so Claude Code calls recall and the other verbs as tools"],
+		["hook", "Session hooks: orient at start, cue memory per prompt, consolidate at end"],
+		["claudeMd", "Recall-first instructions in CLAUDE.md"],
+		["skill", "Recording skill, so sessions write what they learned back into the vault"],
+	];
+
 	function renderIntegration() {
 		const s = section(
-			"Claude Code integration",
-			"Wires the brain into Claude Code: every session recalls relevant notes before working and records what it learned back into your vault at session end.",
+			"Claude Code",
+			"The daemon wires itself in whenever it starts, so this is normally already done. Removing it here is remembered: the daemon stays out until you integrate again.",
 		);
 		const i = status.integration;
-		const all = i.claudeMd && i.hook && i.skill;
-		s.appendChild(el("div", "integration-status",
-			["claudeMd", "hook", "skill"].map((k) =>
-				`<span class="pill ${i[k] ? "ok" : ""}">${{ claudeMd: "instructions", hook: "session hook", skill: "recording skill" }[k]}</span>`,
-			).join("")));
+		const all = INTEGRATION_PARTS.every(([key]) => i[key]);
+		const list = el("ul", "integration-status");
+		for (const [key, label] of INTEGRATION_PARTS) {
+			list.appendChild(el("li", i[key] ? "ok" : "missing", `<span class="mark"></span>${escapeHtml(label)}`));
+		}
+		s.appendChild(list);
 
 		const btn = el("button", `settings-btn ${all ? "ghost" : "primary"}`,
 			all ? "Remove integration" : "Integrate with Claude Code");
@@ -206,36 +231,34 @@ export function createSettingsTab(container) {
 			"Image description",
 			"Screenshots and mockups you add to the design library get read once and turned into " +
 			"notes. The reading is done by the claude CLI already installed on this machine, so " +
-			"your images never leave it — the brain uploads nothing, here or anywhere else.",
+			"your images never leave it. The brain uploads nothing, here or anywhere else.",
 		);
 
-		const toggle = el("button", `settings-btn ${llm.enabled ? "primary" : "ghost"}`,
-			llm.enabled ? "Description on" : "Description off");
-		toggle.onclick = async () => {
-			toggle.disabled = true;
-			const res = await api("/api/config", { llm: { enabled: !llm.enabled } });
-			if (res.error) {
-				toggle.disabled = false;
-				s.appendChild(el("div", "sync-hint warn", escapeHtml(res.error)));
-				return;
-			}
-			await refresh();
-		};
-		s.appendChild(toggle);
+		s.appendChild(
+			toggle("Describe images with my Claude CLI", llm.enabled, async (enabled) => {
+				const res = await api("/api/config", { llm: { enabled } });
+				if (res.error) {
+					s.appendChild(el("div", "sync-hint warn", escapeHtml(res.error)));
+					await refresh();
+					return;
+				}
+				await refresh();
+			}),
+		);
 
 		if (llm.enabled) {
 			if (llm.available) {
 				const who = [llm.account, llm.version && `CLI ${llm.version}`].filter(Boolean).join(" · ");
 				s.appendChild(el("div", "vault-current ok",
-					`<span class="dot"></span>Ready${who ? ` — ${escapeHtml(who)}` : ""}`));
+					`<span class="dot"></span>Ready${who ? `, ${escapeHtml(who)}` : ""}`));
 			} else {
 				s.appendChild(el("div", "sync-hint warn",
 					LLM_TROUBLE[llm.reason] ?? "Claude is not usable right now; images are stored but not described."));
 			}
 		} else {
 			s.appendChild(el("p", "settings-sub",
-				"While this is off, images are still stored and searchable by name and caption — " +
-				"they just have no description attached."));
+				"While this is off, images are still stored and searchable by name and caption. " +
+				"They just have no description attached."));
 		}
 		wrap.appendChild(s);
 	}
@@ -245,11 +268,13 @@ export function createSettingsTab(container) {
 	function renderIndex() {
 		const s = section("Index", null);
 		const idx = status.index;
-		s.appendChild(el("div", "index-stats",
-			`<span class="stat-num">${idx.docs}</span> notes` +
-			`<span class="stat-sep"></span><span class="stat-num">${idx.chunks}</span> sections` +
-			`<span class="stat-sep"></span>${idx.vectors ? `${idx.embedded} embedded` : "keyword-only (embeddings unavailable)"}` +
-			(idx.pendingEmbed ? ` · ${idx.pendingEmbed} pending` : "")));
+		const facts = [
+			`${idx.docs} notes in ${idx.chunks} sections`,
+			idx.vectors ? `${idx.embedded} embedded${idx.pendingEmbed ? `, ${idx.pendingEmbed} pending` : ""}` : "keyword search only, embeddings unavailable",
+			`${idx.episodes} episodes from ${idx.sessions} sessions`,
+			`${idx.edges} edges in ${idx.communities} clusters`,
+		];
+		s.appendChild(el("p", "index-stats", facts.map(escapeHtml).join(" · ")));
 		const re = el("button", "settings-btn ghost", "Reindex now");
 		re.onclick = async () => {
 			re.disabled = true;

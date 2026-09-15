@@ -13,6 +13,7 @@ export interface BrainDb {
 }
 
 let opened: BrainDb | null = null;
+let openedPath: string | null = null;
 
 /**
  * Persistent index in XDG data (survives restarts and vault unmounts).
@@ -23,7 +24,10 @@ let opened: BrainDb | null = null;
  * Both carry access counters, so retrieving a memory strengthens it.
  */
 export function openBrainDb(path?: string): BrainDb {
-	if (opened) return opened;
+	// One connection per process for the daemon, which never names a path. A caller that
+	// names a different file — a test wanting its own index — gets a fresh connection;
+	// the previous one stays valid for whoever still holds it.
+	if (opened && (path === undefined || path === openedPath)) return opened;
 	ensureDirs();
 	const db = new Database(path ?? join(DATA_DIR, "index.sqlite"));
 	db.run("PRAGMA journal_mode = WAL");
@@ -55,6 +59,7 @@ export function openBrainDb(path?: string): BrainDb {
 	backfillDesignSources(db);
 
 	opened = { db, vectors };
+	openedPath = path ?? null;
 	return opened;
 }
 
@@ -137,6 +142,13 @@ function createSemanticTables(db: Database, vectors: boolean): void {
 	db.run(`CREATE TABLE IF NOT EXISTS doc_centroids (
 		doc_id INTEGER PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
 		embedding BLOB NOT NULL
+	)`);
+	/** Where each note sits in the 3D view, computed by the layout worker (graph-positions.ts). */
+	db.run(`CREATE TABLE IF NOT EXISTS doc_layout (
+		doc_id INTEGER PRIMARY KEY REFERENCES docs(id) ON DELETE CASCADE,
+		x REAL NOT NULL,
+		y REAL NOT NULL,
+		z REAL NOT NULL
 	)`);
 	db.run("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 	if (vectors) {

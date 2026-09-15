@@ -1,27 +1,37 @@
-// Vault graph for the 3D view: one node per note, wikilink edges, plus a
-// chronological "timeline" thread through dated notes. Categories are derived from
-// the vault's own top-level folders, so any layout works without configuration.
+// The vault as a graph for the 3D view, straight from the index: one node per note,
+// every edge kind the recall graph knows, the community each note settled into, and
+// the position the layout worker gave it. Nothing here touches the vault on disk except
+// reading the one note a viewer opened — the previous builder re-read every note on each
+// request, twelve hundred file reads per page load, to send a payload that was two thirds
+// excerpt text the page never showed.
 
-import { readFileSync, readdirSync, statSync, type Stats } from "node:fs";
-import { basename, extname, join, relative, sep } from "node:path";
-import { IGNORED_DIR_NAMES, vaultRoot } from "./config";
+import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { stripFrontmatter } from "./chunker";
+import { vaultRoot } from "./config";
+import { lobeOf, ROOT_CATEGORY } from "./graph-layout";
+import { openBrainDb } from "./index-db";
 
 export interface GraphNode {
+	/** Vault-relative path. */
 	id: string;
 	title: string;
 	category: string;
 	tags: string[];
 	date: string | null;
-	status: string | null;
-	excerpt: string;
 	connections: number;
+	community: number | null;
+	x: number;
+	y: number;
+	z: number;
 }
 
-export type EdgeKind = "wikilink" | "timeline";
+export type EdgeKind = "wikilink" | "semantic" | "tag" | "cooccur" | "timeline";
 
+/** Endpoints are indexes into `nodes`: a path per edge would be most of the payload. */
 export interface GraphEdge {
-	source: string;
-	target: string;
+	source: number;
+	target: number;
 	kind: EdgeKind;
 }
 
@@ -29,18 +39,22 @@ export interface CategoryInfo {
 	id: string;
 	label: string;
 	color: string;
-	anchor: { x: number; y: number; z: number };
+}
+
+export interface CommunityInfo {
+	id: number;
+	label: string;
+	size: number;
 }
 
 export interface GraphData {
 	nodes: GraphNode[];
 	edges: GraphEdge[];
 	categories: CategoryInfo[];
+	communities: CommunityInfo[];
 	scannedAt: string;
 	vaultRoot: string;
 }
-
-const ROOT_CATEGORY = "__root__";
 
 const PALETTE = [
 	"#38bdf8",
@@ -57,118 +71,135 @@ const PALETTE = [
 	"#4ade80",
 ];
 
-const CLUSTER_RADIUS = 130;
+const DATE_IN_FILENAME_RE = /(\d{4}-\d{2}-\d{2})/;
 
-/** Evenly spread N points on a sphere (golden-angle spiral) so category lobes don't overlap. */
-function fibonacciSphere(index: number, total: number, radius: number) {
-	if (total <= 1) return { x: 0, y: 0, z: 0 };
-	const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-	const y = 1 - (index / (total - 1)) * 2;
-	const r = Math.sqrt(1 - y * y);
-	const theta = goldenAngle * index;
+function labelFor(category: string): string {
+	return category === ROOT_CATEGORY ? "Root" : category;
+}
+
+interface DocRow {
+	id: number;
+	path: string;
+	title: string;
+	x: number | null;
+	y: number | null;
+	z: number | null;
+	community: number | null;
+}
+
+const DOC_COLUMNS = `d.id, d.path, d.title, l.x, l.y, l.z, c.community
+	FROM docs d
+	LEFT JOIN doc_layout l ON l.doc_id = d.id
+	LEFT JOIN communities c ON c.doc_id = d.id`;
+
+function loadTags(): Map<number, string[]> {
+	const { db } = openBrainDb();
+	const tags = new Map<number, string[]>();
+	for (const row of db.query("SELECT doc_id, tag FROM doc_tags ORDER BY tag").all() as Array<{ doc_id: number; tag: string }>) {
+		const list = tags.get(row.doc_id) ?? [];
+		list.push(row.tag);
+		tags.set(row.doc_id, list);
+	}
+	return tags;
+}
+
+function loadEdges(): Array<{ source: number; target: number; kind: EdgeKind }> {
+	const { db } = openBrainDb();
+	return [
+		...(db.query("SELECT source_doc AS source, target_doc AS target, 'wikilink' AS kind FROM links").all() as Array<{
+			source: number;
+			target: number;
+			kind: EdgeKind;
+		}>),
+		...(db.query("SELECT source_doc AS source, target_doc AS target, kind FROM derived_links").all() as Array<{
+			source: number;
+			target: number;
+			kind: EdgeKind;
+		}>),
+	];
+}
+
+function nodeOf(row: DocRow, tags: string[], connections: number): GraphNode {
 	return {
-		x: Math.cos(theta) * r * radius,
-		y: y * radius,
-		z: Math.sin(theta) * r * radius,
+		id: row.path,
+		title: row.title,
+		category: lobeOf(row.path),
+		tags,
+		date: basename(row.path).match(DATE_IN_FILENAME_RE)?.[1] ?? null,
+		connections,
+		community: row.community,
+		x: row.x ?? 0,
+		y: row.y ?? 0,
+		z: row.z ?? 0,
 	};
 }
 
-/** "01 Journals" → "Journals"; folders keep their own names otherwise. */
-function labelFor(category: string): string {
-	if (category === ROOT_CATEGORY) return "Root";
-	return category.replace(/^\d+[\s._-]+/, "") || category;
+export function buildGraph(): GraphData {
+	const { db } = openBrainDb();
+	const docs = db.query(`SELECT ${DOC_COLUMNS} ORDER BY d.path`).all() as DocRow[];
+	const indexOf = new Map(docs.map((d, i) => [d.id, i]));
+	const edges: GraphEdge[] = [];
+	const connections = new Array<number>(docs.length).fill(0);
+	for (const e of loadEdges()) {
+		const source = indexOf.get(e.source);
+		const target = indexOf.get(e.target);
+		if (source === undefined || target === undefined) continue;
+		edges.push({ source, target, kind: e.kind });
+		connections[source]!++;
+		connections[target]!++;
+	}
+	const tags = loadTags();
+	const nodes = docs.map((d, i) => nodeOf(d, tags.get(d.id) ?? [], connections[i]!));
+
+	// Stable category order: root first, then folders alphabetically — the same order
+	// the layout uses for its anchors.
+	const categoryIds = [...new Set(nodes.map((n) => n.category))].sort((a, b) =>
+		a === ROOT_CATEGORY ? -1 : b === ROOT_CATEGORY ? 1 : a.localeCompare(b),
+	);
+	const categories = categoryIds.map((id, i) => ({ id, label: labelFor(id), color: PALETTE[i % PALETTE.length]! }));
+	const communities = db
+		.query("SELECT community AS id, label, size FROM community_labels ORDER BY size DESC")
+		.all() as CommunityInfo[];
+
+	return { nodes, edges, categories, communities, scannedAt: new Date().toISOString(), vaultRoot: vaultRoot() ?? "" };
 }
 
-function walkMarkdownFiles(dir: string, out: string[]): void {
-	let entries: string[];
+export interface NoteDetail {
+	node: GraphNode;
+	content: string;
+	/** Paths of every note linked to this one, in either direction, by any edge kind. */
+	backlinks: string[];
+}
+
+/** One note for the reader panel: its row, its text, and what it is connected to. */
+export function noteDetail(path: string, root = vaultRoot()): NoteDetail | null {
+	if (!root) return null;
+	const { db } = openBrainDb();
+	const row = db.query(`SELECT ${DOC_COLUMNS} WHERE d.path = ?`).get(path) as DocRow | null;
+	if (!row) return null;
+	let raw: string;
 	try {
-		entries = readdirSync(dir);
+		raw = readFileSync(join(root, path), "utf-8");
 	} catch {
-		return;
+		return null;
 	}
-	for (const entry of entries) {
-		if (IGNORED_DIR_NAMES.has(entry)) continue;
-		const full = join(dir, entry);
-		let stat: Stats;
-		try {
-			stat = statSync(full);
-		} catch {
-			continue;
-		}
-		if (stat.isDirectory()) {
-			walkMarkdownFiles(full, out);
-		} else if (stat.isFile() && extname(entry).toLowerCase() === ".md") {
-			out.push(full);
-		}
-	}
-}
-
-interface ParsedFrontmatter {
-	tags: string[];
-	date: string | null;
-	status: string | null;
-	body: string;
-}
-
-/** Minimal frontmatter reader — tags / date / status only, no YAML dependency. */
-function parseFrontmatter(raw: string): ParsedFrontmatter {
-	const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
-	if (!match) return { tags: [], date: null, status: null, body: raw };
-	const block = match[1] ?? "";
-	const body = raw.slice(match[0].length);
-	let tags: string[] = [];
-	let date: string | null = null;
-	let status: string | null = null;
-	for (const line of block.split(/\r?\n/)) {
-		const tagsMatch = line.match(/^tags:\s*\[(.*)\]\s*$/i);
-		if (tagsMatch) {
-			tags = (tagsMatch[1] ?? "")
-				.split(",")
-				.map((t) => t.trim().replace(/^["']|["']$/g, ""))
-				.filter(Boolean);
-			continue;
-		}
-		const dateMatch = line.match(/^date:\s*(\S+)\s*$/i);
-		if (dateMatch) {
-			date = dateMatch[1] ?? null;
-			continue;
-		}
-		const statusMatch = line.match(/^status:\s*(\S+)\s*$/i);
-		if (statusMatch) status = statusMatch[1] ?? null;
-	}
-	return { tags, date, status, body };
-}
-
-const HEADING_RE = /^#\s+(.+)$/m;
-const DATE_IN_FILENAME_RE = /(\d{4}-\d{2}-\d{2})/;
-const WIKILINK_RE = /\[\[([^\]]+)\]\]/g;
-
-function titleFor(body: string, fileBasename: string): string {
-	const heading = body.match(HEADING_RE);
-	if (heading) return (heading[1] ?? "").trim();
-	return fileBasename.replace(/\.md$/i, "");
-}
-
-function excerptFor(body: string): string {
-	const withoutHeading = body.replace(HEADING_RE, "");
-	const plain = withoutHeading
-		.replace(/\[\[([^\]|]+)\|?[^\]]*\]\]/g, "$1")
-		.replace(/[#*_`>-]/g, " ")
-		.replace(/\s+/g, " ")
-		.trim();
-	return plain.length > 260 ? `${plain.slice(0, 260)}…` : plain;
-}
-
-function toPosix(p: string): string {
-	return p.split(sep).join("/");
+	const other = (table: string) =>
+		`SELECT d.path FROM ${table} k
+		 JOIN docs d ON d.id = CASE WHEN k.source_doc = ? THEN k.target_doc ELSE k.source_doc END
+		 WHERE k.source_doc = ? OR k.target_doc = ?`;
+	const backlinks = (
+		db.query(`${other("links")} UNION ${other("derived_links")}`).all(row.id, row.id, row.id, row.id, row.id, row.id) as Array<{
+			path: string;
+		}>
+	).map((r) => r.path);
+	const tags = (db.query("SELECT tag FROM doc_tags WHERE doc_id = ? ORDER BY tag").all(row.id) as Array<{ tag: string }>).map(
+		(t) => t.tag,
+	);
+	return { node: nodeOf(row, tags, backlinks.length), content: stripFrontmatter(raw).trim(), backlinks };
 }
 
 /** Resolve a `[[link]]` target against the set of known note basenames. */
-export function resolveLink(
-	target: string,
-	byBasename: Map<string, string[]>,
-	fromId: string,
-): string | null {
+export function resolveLink(target: string, byBasename: Map<string, string[]>, fromId: string): string | null {
 	const cleaned = target.split("|")[0]!.split("#")[0]!.trim();
 	if (!cleaned) return null;
 	const key = basename(cleaned).replace(/\.md$/i, "").toLowerCase();
@@ -180,100 +211,4 @@ export function resolveLink(
 	const sameFolder = candidates.find((c) => c.split("/")[0] === fromTop);
 	if (sameFolder) return sameFolder;
 	return [...candidates].sort((a, b) => a.length - b.length)[0]!;
-}
-
-export function buildGraph(): GraphData {
-	const root = vaultRoot();
-	if (!root) {
-		return { nodes: [], edges: [], categories: [], scannedAt: new Date().toISOString(), vaultRoot: "" };
-	}
-
-	const files: string[] = [];
-	walkMarkdownFiles(root, files);
-
-	const nodes: GraphNode[] = [];
-	const bodies = new Map<string, string>();
-	const byBasename = new Map<string, string[]>();
-
-	for (const abs of files) {
-		const relPath = toPosix(relative(root, abs));
-		let raw: string;
-		try {
-			raw = readFileSync(abs, "utf-8");
-		} catch {
-			continue;
-		}
-		const { tags, date, status, body } = parseFrontmatter(raw);
-		const fileBasename = basename(abs);
-		const filenameDate = fileBasename.match(DATE_IN_FILENAME_RE)?.[1] ?? null;
-		const category = relPath.includes("/") ? relPath.split("/")[0]! : ROOT_CATEGORY;
-
-		nodes.push({
-			id: relPath,
-			title: titleFor(body, fileBasename),
-			category,
-			tags,
-			date: date ?? filenameDate,
-			status,
-			excerpt: excerptFor(body),
-			connections: 0,
-		});
-		bodies.set(relPath, body);
-
-		const key = fileBasename.replace(/\.md$/i, "").toLowerCase();
-		const list = byBasename.get(key) ?? [];
-		list.push(relPath);
-		byBasename.set(key, list);
-	}
-
-	// Stable category order: root first, then folders alphabetically.
-	const categoryIds = [...new Set(nodes.map((n) => n.category))].sort((a, b) =>
-		a === ROOT_CATEGORY ? -1 : b === ROOT_CATEGORY ? 1 : a.localeCompare(b),
-	);
-	const categories: CategoryInfo[] = categoryIds.map((id, i) => ({
-		id,
-		label: labelFor(id),
-		color: PALETTE[i % PALETTE.length]!,
-		anchor: fibonacciSphere(i, categoryIds.length, CLUSTER_RADIUS),
-	}));
-
-	const edges: GraphEdge[] = [];
-	const seenPairs = new Set<string>();
-
-	for (const node of nodes) {
-		const body = bodies.get(node.id) ?? "";
-		for (const m of body.matchAll(WIKILINK_RE)) {
-			const targetId = resolveLink(m[1]!, byBasename, node.id);
-			if (!targetId || targetId === node.id) continue;
-			const pairKey = `wikilink:${node.id}->${targetId}`;
-			if (seenPairs.has(pairKey)) continue;
-			seenPairs.add(pairKey);
-			edges.push({ source: node.id, target: targetId, kind: "wikilink" });
-		}
-	}
-
-	// Chronological thread through dated notes — the vault's own timeline.
-	const dated = nodes
-		.filter((n) => n.date && DATE_IN_FILENAME_RE.test(basename(n.id)))
-		.sort((a, b) => (a.date! < b.date! ? -1 : a.date! > b.date! ? 1 : 0));
-	for (let i = 1; i < dated.length; i++) {
-		edges.push({ source: dated[i - 1]!.id, target: dated[i]!.id, kind: "timeline" });
-	}
-
-	const connectionCount = new Map<string, number>();
-	for (const edge of edges) {
-		connectionCount.set(edge.source, (connectionCount.get(edge.source) ?? 0) + 1);
-		connectionCount.set(edge.target, (connectionCount.get(edge.target) ?? 0) + 1);
-	}
-	for (const node of nodes) {
-		node.connections = connectionCount.get(node.id) ?? 0;
-	}
-
-	return {
-		nodes,
-		edges,
-		categories,
-		scannedAt: new Date().toISOString(),
-		vaultRoot: root,
-	};
 }

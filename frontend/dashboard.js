@@ -34,8 +34,8 @@ async function warnIfStale(app) {
 	const bar = document.createElement("div");
 	bar.className = "stale-banner";
 	bar.textContent =
-		`claude-brain ${status.installedVersion} is installed but version ${status.version} is still running — ` +
-		"restart it so the dashboard and the server agree:  systemctl --user restart claude-brain";
+		`claude-brain ${status.installedVersion} is installed but version ${status.version} is still running. ` +
+		"Restart it so the dashboard and the server agree:  systemctl --user restart claude-brain";
 	app.prepend(bar);
 }
 

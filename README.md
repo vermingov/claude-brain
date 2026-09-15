@@ -49,8 +49,13 @@ your own cloud account.
   `--apply` touches the vault and `--undo` reverses it. It never renames, merges or
   deletes, and it refuses outright on a vault whose Obsidian link format would break
   links on a move.
-- **3D knowledge graph** — every note a neuron, links as synapses, folders as
-  lobes, with search, category filters, and an in-graph note reader.
+- **3D knowledge graph** — every note a neuron, every kind of edge a synapse (wikilinks,
+  similarity, shared tags, notes recalled together, the journal timeline), folders as
+  lobes, with search, lobe and synapse filters, and an in-graph note reader. The layout is
+  computed once by the daemon and kept, so the brain looks the same each time you open it
+  and a new note lands beside its lobe; the page draws notes, halos and travelling sparks
+  as GPU-billboarded sprites, one draw call per layer, and stays at the display's frame
+  rate on an integrated GPU with well over a thousand notes.
 - **Always fresh** — a file watcher reindexes seconds after you edit a note.
   Content-hash incremental: only changed notes are re-chunked and re-embedded.
 - **You choose where the brain lives** — point it at an existing Obsidian vault or

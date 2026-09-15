@@ -33,7 +33,8 @@ import {
 } from "./src/design-store";
 import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
-import { buildGraph } from "./src/graph-builder";
+import { buildGraph, noteDetail } from "./src/graph-builder";
+import { ensureLayout } from "./src/graph-positions";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
 import { openBrainDb, resetIndex } from "./src/index-db";
@@ -90,9 +91,6 @@ function serveStatic(fileName: string): Response {
 	});
 }
 
-function stripFrontmatter(raw: string): string {
-	return raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
-}
 
 async function fullStatus() {
 	const cfg = loadConfig();
@@ -627,6 +625,7 @@ const serveOptions = {
 
 		if (url.pathname === "/api/graph") {
 			try {
+				await ensureLayout();
 				return jsonResponse(buildGraph());
 			} catch (err) {
 				return jsonResponse({ error: String(err) }, 500);
@@ -680,20 +679,9 @@ const serveOptions = {
 
 		if (url.pathname === "/api/note") {
 			const noteId = url.searchParams.get("path");
-			const root = vaultRoot();
-			if (!noteId || !root) return jsonResponse({ error: "missing path or vault" }, 400);
-			const graph = buildGraph();
-			const node = graph.nodes.find((n) => n.id === noteId);
-			if (!node) return jsonResponse({ error: "note not found" }, 404);
-			const backlinks = graph.edges
-				.filter((e) => e.target === noteId || e.source === noteId)
-				.map((e) => (e.target === noteId ? e.source : e.target));
-			try {
-				const raw = readFileSync(join(root, noteId), "utf-8");
-				return jsonResponse({ node, content: stripFrontmatter(raw).trim(), backlinks: [...new Set(backlinks)] });
-			} catch (err) {
-				return jsonResponse({ error: String(err) }, 500);
-			}
+			if (!noteId) return jsonResponse({ error: "missing path" }, 400);
+			const detail = noteDetail(noteId);
+			return detail ? jsonResponse(detail) : jsonResponse({ error: "note not found" }, 404);
 		}
 
 		if (url.pathname === "/api/designs" || url.pathname.startsWith("/api/designs/")) {

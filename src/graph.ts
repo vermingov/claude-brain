@@ -5,6 +5,7 @@
 // tags, folder structure, journal chronology — which costs nothing per rebuild and can
 // therefore run on every save instead of once a month.
 
+import { scheduleLayout } from "./graph-positions";
 import { openBrainDb } from "./index-db";
 
 export type DerivedKind = "semantic" | "tag" | "timeline" | "cooccur";
@@ -497,6 +498,8 @@ export function rebuildGraph(): GraphBuildStats {
 	const derived = rebuildDerivedEdges();
 	const communities = detectCommunities();
 	labelCommunities();
+	// New edges move notes; the stored layout follows, warm-started from the old one.
+	scheduleLayout();
 	const { db } = openBrainDb();
 	return {
 		...derived,

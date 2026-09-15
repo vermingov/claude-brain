@@ -55,7 +55,7 @@ const RETRYABLE = new Set(["failed", "unavailable", "disabled", "described", "th
 
 const LLM_REASONS = {
 	disabled: "Image description is off. Turn Claude on in Settings and new images are described by " +
-		"your own CLI on this machine — the brain still uploads nothing anywhere.",
+		"your own CLI on this machine. The brain still uploads nothing anywhere.",
 	"not-installed": "The claude CLI is not installed, so images are stored but not described.",
 	"not-logged-in": "The claude CLI is not signed in, so images are stored but not described.",
 	"too-old": "The installed claude CLI is too old to read images. Images are stored but not described.",
@@ -64,7 +64,7 @@ const LLM_REASONS = {
 /** SaveDesignResult's three refusals, said out loud. */
 const REFUSALS = {
 	"not-an-image": "that is not an image type the brain can read",
-	truncated: "that file is incomplete — re-save it and try again",
+	truncated: "that file is incomplete, re-save it and try again",
 	"too-large": "too large for the design library",
 };
 
@@ -73,7 +73,7 @@ const NO_SPEC = {
 	queued: "Waiting its turn. The description shows up here on its own.",
 	extracting: "Reading the image now.",
 	"needs-render": "The model will not open this file as it stands. Drop it onto this page again and " +
-		"the dashboard will attach a smaller copy — but only if your browser can decode the format. " +
+		"the dashboard will attach a smaller copy, but only if your browser can decode the format. " +
 		"If nothing changes, save it as PNG or JPEG and upload that.",
 	disabled: "Image description is off, so this has only been stored. Turn Claude on in Settings.",
 	unavailable: "The claude CLI is not usable right now, so nothing has been read yet.",
@@ -243,7 +243,7 @@ export function createDesignsTab(container) {
 	const head = el("div", "designs-head");
 	head.appendChild(text("h2", "designs-title", "Design library"));
 	head.appendChild(text("p", "designs-sub",
-		"Screenshots, mockups and references become notes in your vault — described once, then " +
+		"Screenshots, mockups and references become notes in your vault, described once and then " +
 		"recalled like anything else you have written down."));
 
 	const search = el("input", "settings-input designs-search");
@@ -296,7 +296,7 @@ export function createDesignsTab(container) {
 		if (c.rules) bits.push(`${c.rules} rules`);
 		if (c.colors?.length) bits.push(`${c.colors.length} colours`);
 		if (c.frameworks?.length) bits.push(c.frameworks.join(", "));
-		message = `captured ${c.title || value}${bits.length ? ` — ${bits.join(", ")}` : ""}`;
+		message = `captured ${c.title || value}${bits.length ? `: ${bits.join(", ")}` : ""}`;
 		pollStalled = false;
 		await refresh();
 		openDetail(out.id);
@@ -317,7 +317,7 @@ export function createDesignsTab(container) {
 	// A button, not a div: this is the only way to add images without a mouse.
 	const drop = el("button", "designs-drop",
 		"<strong>Drop images here</strong>" +
-		"<span>or paste from the clipboard, or press Enter — PNG, JPEG, WebP, GIF, AVIF</span>");
+		"<span>or paste from the clipboard, or press Enter. PNG, JPEG, WebP, GIF, AVIF</span>");
 	drop.type = "button";
 	drop.onclick = () => picker.click();
 
@@ -437,7 +437,7 @@ export function createDesignsTab(container) {
 		const bitmap = await decode(file);
 		let thumb = null;
 		let render = null;
-		if (!bitmap) pending.note = "this browser could not decode the image — it is stored, but may need a PNG or JPEG copy";
+		if (!bitmap) pending.note = "this browser could not decode the image. It is stored, but may need a PNG or JPEG copy";
 		if (bitmap) {
 			thumb = await scaled(bitmap, THUMB_EDGE, 0.72);
 			if (thumb) {
@@ -448,7 +448,7 @@ export function createDesignsTab(container) {
 				render = await renderCopy(bitmap);
 				// Encode refused (canvas limit, no webp encoder). Saying so here is the only
 				// chance the user gets; the row lands in needs-render either way.
-				if (!render) pending.note = "this browser could not make a smaller copy — save it as PNG or JPEG";
+				if (!render) pending.note = "this browser could not make a smaller copy. Save it as PNG or JPEG";
 			}
 			pending.width = bitmap.width;
 			pending.height = bitmap.height;
@@ -461,7 +461,7 @@ export function createDesignsTab(container) {
 			// The one case where the user's own bytes cannot be kept. Say so rather than
 			// quietly storing something else under the same name.
 			out = await post(render, `${file.name.replace(/\.[^.]+$/, "")}.webp`, { thumb });
-			if (out.ok) message = `${file.name} was too large to keep whole — a downscaled copy was saved instead.`;
+			if (out.ok) message = `${file.name} was too large to keep whole, so a downscaled copy was saved instead.`;
 		}
 
 		if (!out.ok) {
@@ -856,7 +856,7 @@ export function createDesignsTab(container) {
 		if (row.note_path) {
 			inner.appendChild(text("div", "panel-path", row.note_path));
 			if (row.note_missing) {
-				inner.appendChild(text("p", "design-hint", "That note is not in the vault right now — the drive may be unplugged."));
+				inner.appendChild(text("p", "design-hint", "That note is not in the vault right now. The drive may be unplugged."));
 			}
 		}
 		inner.appendChild(detailActions(row));
@@ -885,7 +885,7 @@ export function createDesignsTab(container) {
 			sw.style.background = entry.hex;
 			row.appendChild(sw);
 			row.appendChild(text("code", "design-hex", entry.hex));
-			row.appendChild(text("span", "design-role", [entry.role, entry.note].filter(Boolean).join(" — ")));
+			row.appendChild(text("span", "design-role", [entry.role, entry.note].filter(Boolean).join(", ")));
 			list.appendChild(row);
 		}
 		return list;
