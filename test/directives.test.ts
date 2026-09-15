@@ -67,6 +67,64 @@ describe("what is a standing instruction", () => {
 		expect(rule("never mind that for this one")).toHaveLength(0);
 	});
 
+	test("a pasted transcript is not a set of instructions", () => {
+		// Terminal output, tool markers, a fenced block, a quoted line and an indented
+		// error — every one of them carrying a marker word. None of it is the user talking.
+		const pasted = [
+			"Here is what the other session printed, no idea why it did this:",
+			"",
+			"\u23fa I never opened any of those notes, the brain told me the vault had nothing.",
+			"\u25cf Bash(claude-brain recall \"wine audio\")",
+			"  \u23bf  (weak match) never found a note for this",
+			"",
+			"> always run tsc before you commit anything",
+			"",
+			"\`\`\`",
+			"$ claude-brain rules",
+			"   1  0.57  stated  1x  I never opened any of those notes",
+			"\`\`\`",
+			"",
+			"    ERROR: the daemon never came up, I checked the socket rather than the port",
+			"    \u2502 at line 12",
+			"",
+			"user: never publish this to github",
+			"assistant: understood, I will avoid pushing it",
+		].join("\n");
+		expect(detectDirectives(pasted)).toHaveLength(0);
+	});
+
+	test("the point the user makes about a paste still counts", () => {
+		const pasted = "\u23fa I never opened any of those notes\n> always run tsc\n";
+		expect(rule(`${pasted}\nSo from now on, never trust a weak match.`)).toEqual([
+			"from now on, never trust a weak match.",
+		]);
+		expect(rule(`Never use the staging branch for releases.\n\n${pasted}`)).toEqual([
+			"Never use the staging branch for releases.",
+		]);
+	});
+
+	test("narration about what happened is not an instruction, whatever the verb", () => {
+		// The old guard only knew regular verbs: "never opened" was caught and "never saw"
+		// walked straight through, then the bare "never" filed it as plainly stated.
+		expect(rule("I never saw those notes")).toHaveLength(0);
+		expect(rule("I never ran the command")).toHaveLength(0);
+		expect(rule("it never found the note")).toHaveLength(0);
+		expect(rule("you never told me about the flag")).toHaveLength(0);
+		expect(rule("I checked the logs rather than the database")).toHaveLength(0);
+		// A modal turns the same shape back into a requirement.
+		expect(rule("it should always retry")).toHaveLength(1);
+	});
+
+	test("mangled output is not an instruction", () => {
+		expect(rule("I never opene")).toHaveLength(0);
+		expect(rule("\u001b[32m always \u001b[0m use tabs")).toHaveLength(0);
+		expect(rule("never|||---|||+++ ###")).toHaveLength(0);
+	});
+
+	test("a numbered list is still the user talking", () => {
+		expect(rule("1. always use tabs in this project")).toEqual(["always use tabs in this project"]);
+	});
+
 	test("a description of the world is not an instruction", () => {
 		expect(rule("it always crashes when I open the settings tab")).toHaveLength(0);
 		expect(rule("the build never finishes on this machine")).toHaveLength(0);

@@ -241,6 +241,34 @@ const PAST = /\b(used to|had to|was|were|got|did|happened|crashed|failed|worked)
 const IMPERATIVE =
 	/^(always|never|use|run|write|make|keep|check|ask|avoid|prefer|stop|start|remember|put|add|remove|deploy|commit|test|verify|read|call|treat|build|ship|push|pull|open|close|send|show|give|take|set|do|don'?t)\b/i;
 const QUESTION = /\?\s*$/;
+/**
+ * A sentence that opens with its subject is reporting something, not asking for it: "I
+ * never opened those notes", "the build never finishes", "you never told me". An
+ * instruction opens with the instruction — an imperative, or a marker like "always" or
+ * "from now on" — or it carries a modal that turns the report into a requirement ("it
+ * should always retry"). Without this, any narration with "never" in it became a rule,
+ * and because a bare "never" also reads as plainly stated, it became a full-strength one.
+ */
+const NARRATION =
+	/^(i|we|they|he|she|it|that|this|there|you|the [\p{L}-]+|my [\p{L}-]+|our [\p{L}-]+|its [\p{L}-]+|their [\p{L}-]+)\b/iu;
+/** Escape sequences and the glyphs terminals draw with: nothing a person types by hand. */
+const TERMINAL_NOISE = /[\u0000-\u0008\u000B-\u001F\u007F]|\u001b\[[0-9;]*[A-Za-z]|[│├└─╭╰┌┐┘┤┬┴┼▁▂▃▄▅▆▇█]/;
+/** Below this share of letters, it is output that happens to contain a word, not a sentence. */
+const MIN_LETTER_SHARE = 0.6;
+const MAX_WORD_LENGTH = 30;
+
+/**
+ * Paste that arrived mangled — wrapped mid-word, stripped of spacing, carrying escape
+ * codes. A rule is a sentence someone wrote; this is the residue of a terminal.
+ */
+function looksMangled(sentence: string): boolean {
+	if (TERMINAL_NOISE.test(sentence)) return true;
+	if (sentence.split(/\s+/).some((word) => word.length > MAX_WORD_LENGTH)) return true;
+	const dense = sentence.replace(/\s/g, "");
+	if (dense.length === 0) return true;
+	const letters = dense.replace(/[^\p{L}]/gu, "").length;
+	return letters / dense.length < MIN_LETTER_SHARE;
+}
 /** "in this project", "here", "for this repo": the rule is about where it was given. */
 const LOCAL = /\b(in (this|the) (project|repo|repository|codebase|folder|directory)|for (this|the) (project|repo|repository|codebase)|here)\b/i;
 const NEGATIVE = /\b(never|no longer|no more|don'?t|do not|avoid|stop|without|instead of|rather than)\b/i;
@@ -270,11 +298,49 @@ const MAX_DIRECTIVE_CHARS = 220;
 const CONNECTIVE =
 	/^(also|and|plus|oh|btw|by the way|one more thing|another thing|finally|lastly|then|actually|okay|ok|so|right|hey)\b[,:\s]*/i;
 
+/**
+ * Lines that are not the user talking: a fence, a quote, an indented block, a shell or
+ * transcript line. The scanner reads whatever is in the prompt, and people paste terminal
+ * output and other sessions into prompts constantly — so anything wearing the clothes of
+ * quoted material is dropped before a single sentence is considered.
+ *
+ * Per line rather than "everything after the paste starts", because a paste is usually
+ * followed by the point the user is making about it, and that sentence is exactly the one
+ * worth keeping: "…so never do that again" has to survive the log it comes after.
+ */
+const QUOTED_LINE = /^\s*(\[tool:|(user|assistant|system|human)\s*:)/i;
+/**
+ * The line does not open with a word. Terminals draw with glyphs nobody types — ⏺ ⎿ │ ├ └
+ * — and quotes, shell prompts and diffs all open with punctuation. Prose opens with a
+ * letter, a digit, a list bullet or an ordinary bit of punctuation, so enumerating the
+ * glyphs is the wrong way round: allow what prose starts with and drop the rest.
+ */
+const DECORATIVE_START = /^\s*[^\p{L}\p{N}\s'"“”‘’(\[\-*+]/u;
+/** A column of figures, as a table row prints it — but "1. always use tabs" is a list. */
+const TABLE_ROW = /^\s*\d+(?![.)])\s/;
+const INDENTED_BLOCK = /^(\t| {4,})\S/;
+const FENCE = /^\s*(```|~~~)/;
+
+function spokenText(prompt: string): string {
+	const kept: string[] = [];
+	let fenced = false;
+	for (const line of prompt.split("\n")) {
+		if (FENCE.test(line)) {
+			fenced = !fenced;
+			continue;
+		}
+		if (fenced || QUOTED_LINE.test(line) || DECORATIVE_START.test(line) || TABLE_ROW.test(line)) continue;
+		if (INDENTED_BLOCK.test(line)) continue;
+		// An inline span is a quotation too, and far too short to hold a rule of its own.
+		kept.push(line.replace(/`[^`]*`/g, " "));
+	}
+	return kept.join("\n");
+}
+
 function sentences(prompt: string): string[] {
-	return prompt
-		.replace(/\s+/g, " ")
+	return spokenText(prompt)
 		.split(/(?<=[.!?;])\s+|\n+/)
-		.map((s) => s.trim())
+		.map((s) => s.replace(/\s+/g, " ").trim())
 		.filter(Boolean);
 }
 
@@ -290,8 +356,10 @@ export function detectDirectives(prompt: string): DraftDirective[] {
 		if (TURN_SCOPED.test(sentence)) continue;
 		const bare = IMPERATIVE_PROHIBITION.test(sentence.replace(CONNECTIVE, ""));
 		if (!MARKERS.test(sentence) && !bare) continue;
+		if (looksMangled(sentence)) continue;
 		const modal = MODAL.test(sentence);
 		// "it always crashes" is a complaint; "it should always retry" is a rule.
+		if (NARRATION.test(sentence) && !modal) continue;
 		if (DESCRIPTIVE.test(sentence) && !modal) continue;
 		if (PAST.test(sentence) && !modal) continue;
 		const cues = cuesOf(sentence);
