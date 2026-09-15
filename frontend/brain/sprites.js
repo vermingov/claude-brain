@@ -18,6 +18,7 @@ const STANDARD = [
 
 /**
  * @param {object} spec
+ * @param {number} [spec.arrivalRange]  how far an arrival's shove carries, in layout units
  * @param {string} spec.name
  * @param {number} spec.count
  * @param {string} spec.vertex  shader name, without the Vertex suffix
@@ -35,7 +36,7 @@ export function createSpriteLayer(scene, spec) {
 		{ vertex: spec.vertex, fragment: spec.fragment },
 		{
 			attributes: ["position", "corner", ...perInstance.map((a) => a.name)],
-			uniforms: ["view", "projection", "time", "fogDensity", "fogColor"],
+			uniforms: ["view", "projection", "time", "fogDensity", "fogColor", "arrivals", "arrivalCount", "arrivalRange"],
 			needAlphaBlending: true,
 		},
 	);
@@ -44,6 +45,8 @@ export function createSpriteLayer(scene, spec) {
 	material.disableDepthWrite = true;
 	material.backFaceCulling = false;
 	material.setFloat("time", 0);
+	material.setFloat("arrivalCount", 0);
+	material.setFloat("arrivalRange", spec.arrivalRange ?? 1);
 	material.setFloat("fogDensity", scene.fogDensity);
 	material.setColor3("fogColor", scene.fogColor);
 
@@ -102,6 +105,11 @@ export function createSpriteLayer(scene, spec) {
 		count,
 		set,
 		setTime: (seconds) => material.setFloat("time", seconds),
+		/** Where things have just landed: the shader animates the shove from the clock. */
+		setArrivals(data, count) {
+			material.setArray4("arrivals", data);
+			material.setFloat("arrivalCount", count);
+		},
 		dispose() {
 			mesh.dispose();
 			material.dispose();

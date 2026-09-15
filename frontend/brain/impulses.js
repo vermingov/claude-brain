@@ -57,5 +57,5 @@ export function createImpulseLayer(scene, graph, tintOf) {
 		layer.set("travel", travel);
 	}
 
-	return { fire, setTime: layer.setTime, dispose: layer.dispose };
+	return { fire, setTime: layer.setTime, setArrivals: layer.setArrivals, dispose: layer.dispose };
 }

@@ -19,21 +19,90 @@ float spike(float since) {
 /** Off-screen: a vertex the rasteriser throws away, for an instance with nothing to draw. */
 const CULL = "gl_Position = vec4(2.0, 2.0, 2.0, 1.0);";
 
+/** How many arrivals can be settling at once. Past this the oldest stops being drawn. */
+export const MAX_ARRIVALS = 8;
+
+/**
+ * Room being made for something new.
+ *
+ * A note does not blink into a gap that was already there — it lands, and what is around
+ * it gets out of the way. The shove travels outward as a front rather than moving
+ * everything at once, which is what makes it read as a drop hitting a surface instead of
+ * the whole brain flinching, and it relaxes back with a little overshoot so the tissue
+ * settles rather than snapping.
+ *
+ * Every layer that draws something positioned in the brain runs this on its vertices, so
+ * the cells, their glows, the signals in flight and the synapses between them all move as
+ * one piece. Branchless and bounded: eight iterations of a dozen instructions, in the
+ * vertex stage, where there are a thousand of them and not a million.
+ */
+const ARRIVAL = `
+#define MAX_ARRIVALS ${MAX_ARRIVALS}
+/** xyz where it landed, w when, on the same clock as the time uniform. */
+uniform vec4 arrivals[MAX_ARRIVALS];
+uniform float arrivalCount;
+/** How far the shove carries, in layout units; scales with the brain. */
+uniform float arrivalRange;
+
+const float ARRIVAL_LIFE = 1.8;
+const float ARRIVAL_SPEED = 210.0;
+const float ARRIVAL_WIDTH = 60.0;
+const float ARRIVAL_AMPLITUDE = 17.0;
+
+vec3 arrivalPush(vec3 world, float now) {
+	vec3 shift = vec3(0.0);
+	for (int i = 0; i < MAX_ARRIVALS; i++) {
+		vec4 a = arrivals[i];
+		float live = step(float(i), arrivalCount - 0.5);
+		float age = now - a.w;
+		live *= step(0.0, age) * step(age, ARRIVAL_LIFE);
+		vec3 away = world - a.xyz;
+		float dist = max(length(away), 0.001);
+		// The crest of the wave, passing outward.
+		float crest = exp(-pow((dist - age * ARRIVAL_SPEED) / ARRIVAL_WIDTH, 2.0));
+		// Near things move most, and everything past the range is left alone.
+		float reach = max(1.0 - dist / arrivalRange, 0.0);
+		// Overshoot, then settle: the sine turns the push back on itself once.
+		float settle = exp(-age * 2.2) * cos(age * 5.0);
+		shift += (away / dist) * (ARRIVAL_AMPLITUDE * crest * reach * reach * settle * live);
+	}
+	return shift;
+}`;
+
+/** Landing: nothing, then a fast swell past its own size, then a wobble down to it. */
+const POP = `
+const float POP_TIME = 0.42;
+float popScale(float born) {
+	if (born < 0.0) return 0.0;
+	float t = clamp(born / POP_TIME, 0.0, 1.0);
+	float grow = 1.0 - pow(1.0 - t, 3.0);
+	return grow * (1.0 + 0.45 * exp(-born * 6.0) * sin(born * 22.0));
+}
+/** White-hot on landing, and still visibly lit a second later. */
+float popFlash(float born) {
+	return born < 0.0 ? 0.0 : exp(-born * 1.9);
+}`;
+
 Effect.ShadersStore.brainCellVertexShader = `
 precision highp float;
 attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size;
-attribute float fireAt; attribute float fireGain;
+attribute float fireAt; attribute float fireGain; attribute float arriveAt;
 uniform mat4 view; uniform mat4 projection; uniform float time;
-varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire;
+varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
 ${SPIKE}
+${POP}
+${ARRIVAL}
 void main() {
-	vTint = tint; vCorner = corner; vDepth = 0.0; vFire = 0.0;
+	vTint = tint; vCorner = corner; vDepth = 0.0; vFire = 0.0; vArrive = 0.0;
 	if (size <= 0.0) { ${CULL} return; }
+	float born = time - arriveAt;
+	float pop = popScale(born);
+	if (pop <= 0.001) { ${CULL} return; }
 	float fire = spike(time - fireAt) * fireGain;
-	vec4 viewPos = view * vec4(position, 1.0);
-	viewPos.xy += corner * size * (1.0 + 0.5 * fire);
+	vec4 viewPos = view * vec4(position + arrivalPush(position, time), 1.0);
+	viewPos.xy += corner * size * pop * (1.0 + 0.5 * fire);
 	gl_Position = projection * viewPos;
-	vDepth = -viewPos.z; vFire = fire;
+	vDepth = -viewPos.z; vFire = fire; vArrive = popFlash(born);
 }`;
 
 /**
@@ -43,7 +112,7 @@ void main() {
  */
 Effect.ShadersStore.brainCellFragmentShader = `
 precision highp float;
-varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire;
+varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
 ${FOG}
 void main() {
 	float d = length(vCorner);
@@ -59,7 +128,10 @@ void main() {
 	// Keeps enough of the lobe's hue to say which part of the brain is working.
 	vec3 firing = mix(vTint.rgb, vec3(1.0), 0.45) * 2.8;
 	vec3 color = mix(resting, firing, clamp(vFire, 0.0, 1.0));
-	float alpha = clamp(vTint.a * (0.3 + 0.7 * rim) + vFire * 0.9, 0.0, 1.0) * coverage;
+	// A note that has just landed is solid and over the bloom threshold, so the eye goes
+	// to it before it has read anything else on the screen.
+	color = mix(color, vec3(1.0, 0.96, 0.9) * 3.2, clamp(vArrive, 0.0, 1.0));
+	float alpha = clamp(vTint.a * (0.3 + 0.7 * rim) + vFire * 0.9 + vArrive, 0.0, 1.0) * coverage;
 	gl_FragColor = vec4(mix(fogColor, color, fogFactor(vDepth)), alpha);
 }`;
 
@@ -67,18 +139,22 @@ void main() {
 Effect.ShadersStore.brainFlareVertexShader = `
 precision highp float;
 attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size;
-attribute float fireAt; attribute float fireGain;
+attribute float fireAt; attribute float fireGain; attribute float arriveAt;
 uniform mat4 view; uniform mat4 projection; uniform float time;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth;
 ${SPIKE}
+${POP}
+${ARRIVAL}
 void main() {
 	vTint = vec4(0.0); vCorner = corner; vDepth = 0.0;
 	float fire = spike(time - fireAt) * fireGain;
-	if (fire <= 0.004 || size <= 0.0) { ${CULL} return; }
-	vec4 viewPos = view * vec4(position, 1.0);
-	viewPos.xy += corner * size * (0.45 + 0.55 * fire);
+	float flash = popFlash(time - arriveAt);
+	float glow = max(fire, flash);
+	if (glow <= 0.004 || size <= 0.0) { ${CULL} return; }
+	vec4 viewPos = view * vec4(position + arrivalPush(position, time), 1.0);
+	viewPos.xy += corner * size * (0.45 + 0.55 * glow);
 	gl_Position = projection * viewPos;
-	vTint = vec4(tint.rgb, tint.a * fire); vDepth = -viewPos.z;
+	vTint = vec4(mix(tint.rgb, vec3(1.0, 0.96, 0.9), flash), tint.a * glow); vDepth = -viewPos.z;
 }`;
 
 /** A signal riding one synapse: alive between fireAt and fireAt + travel, then gone. */
@@ -88,12 +164,14 @@ attribute vec3 position; attribute vec3 target; attribute vec2 corner; attribute
 attribute float size; attribute float fireAt; attribute float travel;
 uniform mat4 view; uniform mat4 projection; uniform float time;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth;
+${ARRIVAL}
 void main() {
 	vTint = vec4(0.0); vCorner = corner; vDepth = 0.0;
 	float t = (time - fireAt) / max(travel, 0.001);
 	if (t < 0.0 || t > 1.0) { ${CULL} return; }
 	float envelope = sin(t * 3.14159265);
-	vec4 viewPos = view * vec4(mix(position, target, t), 1.0);
+	vec3 along = mix(position, target, t);
+	vec4 viewPos = view * vec4(along + arrivalPush(along, time), 1.0);
 	viewPos.xy += corner * size * (0.55 + 0.45 * envelope);
 	gl_Position = projection * viewPos;
 	vTint = vec4(tint.rgb, tint.a * envelope); vDepth = -viewPos.z;
@@ -120,8 +198,9 @@ attribute vec3 position; attribute vec4 color; attribute float along;
 attribute float fireAt; attribute float travel;
 uniform mat4 worldViewProjection; uniform float time;
 varying vec4 vColor; varying float vAlong; varying float vT;
+${ARRIVAL}
 void main() {
-	gl_Position = worldViewProjection * vec4(position, 1.0);
+	gl_Position = worldViewProjection * vec4(position + arrivalPush(position, time), 1.0);
 	vColor = color;
 	// Measure along the direction of travel, so a backwards impulse needs no extra data.
 	vAlong = travel >= 0.0 ? along : 1.0 - along;

@@ -24,6 +24,7 @@ import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
 import { createSpriteLayer } from "./sprites.js";
 import { createSynapseLayer } from "./synapses.js";
+import { arrivalRange, createArrivals } from "./arrivals.js";
 
 const BACKGROUND = new Color4(2 / 255, 2 / 255, 4 / 255, 1);
 const PICK_INTERVAL_MS = 50;
@@ -133,6 +134,13 @@ export function createBrainTab(container) {
 		/** Harness hooks: where a note lands on screen, and what the pointer would hit there. */
 		project: (index) => projectNode(index),
 		pickAt: (x, y) => picker?.pick(x, y) ?? -1,
+		/** Harness hook: play an arrival without waiting for the vault to change. */
+		land: (indices) => layers && land(indices),
+		/** Harness hook: one note's place in the brain, for aiming the camera at it. */
+		nodeAt: (index) => {
+			const node = graph?.nodes[index];
+			return node ? { x: node.x, y: node.y, z: node.z, connections: node.connections } : null;
+		},
 	};
 
 	// Everything below exists once the graph has loaded.
@@ -148,6 +156,8 @@ export function createBrainTab(container) {
 	let excitability = null;
 	let cellFireAt = null;
 	let cellGain = null;
+	let cellArriveAt = null;
+	let arrivals = null;
 	let firedLabels = new Set();
 	let labelTimer = null;
 	let statusTimer = null;
@@ -248,6 +258,23 @@ export function createBrainTab(container) {
 		}, LABEL_HOLD_MS);
 	}
 
+	/**
+	 * New notes arriving. Each one pops into place and shoves what is around it aside, and
+	 * then fires the way anything else does, so the cells it is related to answer it. The
+	 * shove is the shader's business: all that is handed over is where and when.
+	 */
+	function land(indices) {
+		const now = performance.now() / 1000;
+		for (const index of indices) {
+			cellArriveAt[index] = now;
+			arrivals.add(graph.nodes[index], now);
+		}
+		layers.cells.set("arriveAt", cellArriveAt);
+		layers.flares.set("arriveAt", cellArriveAt);
+		play(planVolley(conduction, indices.slice(0, 8), { now, passes: emphasis.edgeVisible, limit: 120 }));
+		setStatus(`${indices.length} new note${indices.length === 1 ? "" : "s"} in the vault`);
+	}
+
 	function onActivity(event) {
 		if (event.type === "graph") {
 			void refreshGraph();
@@ -301,6 +328,11 @@ export function createBrainTab(container) {
 		excitability = Float32Array.from(graph.nodes, (node) => node.activation ?? 0);
 		cellFireAt = new Float32Array(n).fill(NEVER);
 		cellGain = new Float32Array(n).fill(1);
+		// Nothing has landed yet: a note that was already here must not pop on first sight.
+		cellArriveAt = new Float32Array(n).fill(NEVER);
+		arrivals = createArrivals();
+		const spread = [...graph.nodes.map((node) => Math.hypot(node.x, node.y, node.z))].sort((a, b) => a - b);
+		const reach = arrivalRange(spread[Math.floor(spread.length * 0.95)] ?? 0);
 		indexByPath = new Map(graph.nodes.map((node, i) => [node.id, i]));
 		const positions = new Float32Array(n * 3);
 		graph.nodes.forEach((node, i) => positions.set([node.x, node.y, node.z], i * 3));
@@ -308,6 +340,7 @@ export function createBrainTab(container) {
 		const firing = [
 			{ name: "fireAt", size: 1 },
 			{ name: "fireGain", size: 1 },
+			{ name: "arriveAt", size: 1 },
 		];
 		const cells = createSpriteLayer(scene, {
 			name: "cells",
@@ -316,6 +349,7 @@ export function createBrainTab(container) {
 			fragment: "brainCell",
 			blend: "alpha",
 			attributes: firing,
+			arrivalRange: reach,
 			renderingGroup: 1,
 		});
 		const flares = createSpriteLayer(scene, {
@@ -325,15 +359,17 @@ export function createBrainTab(container) {
 			fragment: "brainGlow",
 			blend: "add",
 			attributes: firing,
+			arrivalRange: reach,
 			renderingGroup: 2,
 		});
 		for (const layer of [cells, flares]) {
 			layer.set("position", positions);
 			layer.set("fireAt", cellFireAt);
 			layer.set("fireGain", cellGain);
+			layer.set("arriveAt", cellArriveAt);
 		}
 		layers = {
-			synapses: createSynapseLayer(scene, graph),
+			synapses: createSynapseLayer(scene, graph, reach),
 			cells,
 			flares,
 			impulses: createImpulseLayer(scene, graph, emphasis.tintOf),
@@ -375,14 +411,11 @@ export function createBrainTab(container) {
 		}
 		restyle();
 
-		// A note that was not here a moment ago fires as it arrives, so the vault changing
-		// is something you watch happen rather than something you find later.
+		// A note that was not here a moment ago lands as you watch, so the vault changing is
+		// something you see happen rather than something you find later.
 		if (previous) {
 			const arrived = graph.nodes.map((node, i) => (previous.has(node.id) ? -1 : i)).filter((i) => i !== -1);
-			if (arrived.length > 0 && !reducedMotion) {
-				play(planVolley(conduction, arrived.slice(0, 8), { now: performance.now() / 1000, passes: emphasis.edgeVisible, limit: 120 }));
-				setStatus(`${arrived.length} new note${arrived.length === 1 ? "" : "s"} in the vault`);
-			}
+			if (arrived.length > 0 && !reducedMotion) land(arrived);
 		}
 	}
 
@@ -458,6 +491,13 @@ export function createBrainTab(container) {
 			layers.flares.setTime(seconds);
 			layers.impulses.setTime(seconds);
 			layers.synapses.setTime(seconds);
+			// One small uniform, and only while something is still settling.
+			const settling = arrivals.pack(seconds);
+			if (settling) {
+				for (const layer of [layers.cells, layers.flares, layers.impulses, layers.synapses]) {
+					layer.setArrivals(settling.data, settling.count);
+				}
+			}
 			if (!qualityChecked && now - loadedAt > QUALITY_CHECK_MS) {
 				qualityChecked = true;
 				if (engine.getFps() < LOW_FPS) quality.lighten();

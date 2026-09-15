@@ -19,7 +19,7 @@ const HI_ALPHA = 0.55;
 const TIMELINE_TINT = [0.58, 0.6, 0.68];
 const NEVER = -1e9;
 
-export function createSynapseLayer(scene, graph) {
+export function createSynapseLayer(scene, graph, arrivalReach = 1) {
 	const { nodes, edges } = graph;
 	const count = edges.length;
 	const positions = new Float32Array(count * 6);
@@ -42,13 +42,15 @@ export function createSynapseLayer(scene, graph) {
 		{ vertex: "brainSynapse", fragment: "brainSynapse" },
 		{
 			attributes: ["position", "color", "along", "fireAt", "travel"],
-			uniforms: ["worldViewProjection", "time"],
+			uniforms: ["worldViewProjection", "time", "arrivals", "arrivalCount", "arrivalRange"],
 			needAlphaBlending: true,
 		},
 	);
 	material.alphaMode = Constants.ALPHA_COMBINE;
 	material.disableDepthWrite = true;
 	material.fillMode = Constants.MATERIAL_LineListDrawMode;
+	material.setFloat("arrivalCount", 0);
+	material.setFloat("arrivalRange", arrivalReach);
 
 	const mesh = new Mesh("synapses", scene);
 	mesh.material = material;
@@ -106,6 +108,10 @@ export function createSynapseLayer(scene, graph) {
 		restyle,
 		conduct,
 		setTime: (seconds) => material.setFloat("time", seconds),
+		setArrivals(data, count) {
+			material.setArray4("arrivals", data);
+			material.setFloat("arrivalCount", count);
+		},
 		dispose() {
 			mesh.dispose();
 			material.dispose();
