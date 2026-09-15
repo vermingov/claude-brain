@@ -36,6 +36,7 @@ const MIN_PROMPT_CHARS = 25;
 const MIN_ERROR_CHARS = 30;
 /** One thrashing session shouldn't fill episodic memory with its own flailing. */
 const MAX_ERRORS_PER_SESSION = 12;
+const MAX_OUTCOMES_PER_SESSION = 6;
 const SYNTHETIC_PREFIXES = [
 	"Caveat:",
 	"[Request interrupted",
@@ -142,6 +143,32 @@ export function mineTranscript(file: string): MinedSession | null {
 	const pendingTools = new Map<string, ToolCall>();
 	let lastPrompt = "";
 	let errorCount = 0;
+	// Failures waiting for a resolution: the same command running clean later is one.
+	const failed = new Map<string, { detail: string }>();
+	let editedSince: string[] = [];
+	let outcomeCount = 0;
+
+	/**
+	 * A failure that a later run of the same command survived is the most reusable trace
+	 * a session leaves — the problem *and* the fact that it was solved, with the files
+	 * touched in between as the pointer to how. Without this an error looked the same
+	 * whether it was fixed in the next turn or never.
+	 */
+	const resolveFailure = (call: ToolCall | undefined, ts: number): void => {
+		if (!call || call.name !== "Bash" || outcomeCount >= MAX_OUTCOMES_PER_SESSION) return;
+		const failure = failed.get(call.target);
+		if (!failure) return;
+		failed.delete(call.target);
+		outcomeCount++;
+		const edits = editedSince.slice(-4).map((f) => f.split("/").slice(-2).join("/"));
+		editedSince = [];
+		episodes.push({
+			kind: "outcome",
+			ts,
+			text: `resolved: ${failure.detail} — ${clip(call.target, 100)} then succeeded${edits.length > 0 ? ` after editing ${edits.join(", ")}` : ""}`,
+			salience: 2,
+		});
+	};
 
 	const collectUserTurn = (content: unknown, ts: number): void => {
 		const text = userText(content);
@@ -154,13 +181,21 @@ export function mineTranscript(file: string): MinedSession | null {
 			lastPrompt = text;
 		}
 		for (const block of blocksOf(content)) {
-			if (block.type !== "tool_result" || !block.is_error) continue;
+			if (block.type !== "tool_result") continue;
+			const call = block.tool_use_id ? pendingTools.get(block.tool_use_id) : undefined;
+			if (!block.is_error) {
+				resolveFailure(call, ts);
+				continue;
+			}
 			if (errorCount >= MAX_ERRORS_PER_SESSION) continue;
 			const detail = (typeof block.content === "string" ? block.content : (block.content?.[0]?.text ?? "")).trim();
 			if (detail.length < MIN_ERROR_CHARS || HARNESS_ERROR.test(detail)) continue;
 			if (!REAL_FAILURE.test(detail)) continue;
-			const call = block.tool_use_id ? pendingTools.get(block.tool_use_id) : undefined;
 			errorCount++;
+			if (call?.name === "Bash") {
+				failed.set(call.target, { detail: clip(detail, 160) });
+				editedSince = [];
+			}
 			episodes.push({
 				kind: "error",
 				ts,
@@ -179,6 +214,7 @@ export function mineTranscript(file: string): MinedSession | null {
 			pendingTools.set(block.id, { name: block.name, target });
 			if (block.name === "Edit" || block.name === "Write" || block.name === "NotebookEdit") {
 				filesTouched.add(target);
+				if (failed.size > 0) editedSince.push(target);
 			}
 		}
 	};

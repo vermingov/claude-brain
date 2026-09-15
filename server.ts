@@ -98,6 +98,9 @@ async function fullStatus() {
 	const cfg = loadConfig();
 	const installed = readInstalledVersion();
 	return {
+		// The one field a port-eviction check may trust: a fork of this code answers with
+		// the same shape but never with this name.
+		product: "claude-brain",
 		index: indexStatus(),
 		vault: cfg.vault,
 		vaultReady: vaultReady(),
@@ -546,6 +549,13 @@ async function evictStaleInstance(port: number): Promise<boolean> {
 		console.error(`[port] ${port} answers, but not like a claude-brain — not touching it`);
 		return false;
 	}
+	// The two keys above are not proof: the daemon this project was forked from answers
+	// with both, on this very port, and reports no version. Only a claude-brain names
+	// itself (0.5+) or reports a version (0.3.1+); anything else is somebody's server.
+	if ((theirs as { product?: unknown }).product !== "claude-brain" && typeof theirs.version !== "string") {
+		console.error(`[port] ${port} answers like a claude-brain fork, not a claude-brain — not touching it`);
+		return false;
+	}
 	const theirVersion = theirs.version ?? null;
 	if (compareVersions(theirVersion, RUNNING_VERSION) >= 0) {
 		console.error(
@@ -565,7 +575,15 @@ async function evictStaleInstance(port: number): Promise<boolean> {
 	} catch {
 		/* raced with its exit */
 	}
-	if (!cmdline.includes("server.ts") && !cmdline.includes("claude-brain")) {
+	let workdir = "";
+	try {
+		workdir = readlinkSync(`/proc/${pid}/cwd`);
+	} catch {
+		/* raced with its exit */
+	}
+	// "server.ts" alone is not identity — the fork runs one too. Ours runs from a
+	// claude-brain directory, installed or checked out.
+	if (!cmdline.includes("claude-brain") && !workdir.includes("claude-brain")) {
 		console.error(`[port] pid ${pid} holds ${port} but does not look like a claude-brain — not touching it`);
 		return false;
 	}
@@ -624,6 +642,7 @@ const serveOptions = {
 				sessionId: url.searchParams.get("session") ?? undefined,
 				episodeK: url.searchParams.has("episodes") ? Number(url.searchParams.get("episodes")) || 0 : undefined,
 				full: url.searchParams.has("full"),
+				cwd: url.searchParams.get("cwd") ?? undefined,
 			};
 			if (url.searchParams.get("format") === "md") {
 				return new Response(await recallMarkdown(q, options), {

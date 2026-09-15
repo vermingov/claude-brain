@@ -7,42 +7,19 @@
 //   claude-brain sync setup <provider> connect dropbox | gdrive | mega (interactive)
 //   claude-brain sync now              run one sync pass
 //   claude-brain integrate [--remove]  wire into / unwire from Claude Code
+//   claude-brain mcp                   MCP server over stdio — what Claude Code runs
 //   claude-brain context               tiny digest for the SessionStart hook
 //   claude-brain status                index + sync + integration state
 //   claude-brain serve                 run the server in the foreground
 
-import { existsSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { loadConfig } from "../src/config";
+import { resolve } from "node:path";
+import { captureNote } from "../src/capture";
+import { api, baseUrl, ensureServer as startServer, postJson } from "../src/daemon";
 
-const cfg = loadConfig();
-const BASE = `http://localhost:${cfg.port}`;
-
-async function api(path: string, init?: RequestInit): Promise<Response | null> {
-	try {
-		const res = await fetch(`${BASE}${path}`, { signal: AbortSignal.timeout(8000), ...init });
-		return res.ok ? res : null;
-	} catch {
-		return null;
-	}
-}
-
-async function serverUp(): Promise<boolean> {
-	return (await api("/api/status")) !== null;
-}
+const BASE = baseUrl();
 
 async function ensureServer(): Promise<void> {
-	if (await serverUp()) return;
-	const proc = Bun.spawn(["bun", join(import.meta.dir, "..", "server.ts")], {
-		stdout: "ignore",
-		stderr: "ignore",
-		stdin: "ignore",
-	});
-	proc.unref();
-	for (let i = 0; i < 40; i++) {
-		await Bun.sleep(250);
-		if (await serverUp()) return;
-	}
+	if (await startServer()) return;
 	console.error("server failed to start — try `claude-brain serve` to see why");
 	process.exit(1);
 }
@@ -62,13 +39,6 @@ function sessionIdFromEnv(): string | undefined {
 	return process.env.CLAUDE_CODE_SESSION_ID || undefined;
 }
 
-function postJson(path: string, body: unknown): Promise<Response | null> {
-	return api(path, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-	});
-}
 
 async function cmdRecall(rest: string[]): Promise<void> {
 	let prefix: string | undefined;
@@ -92,6 +62,8 @@ async function cmdRecall(rest: string[]): Promise<void> {
 	if (prefix) params.set("p", prefix);
 	if (episodes !== undefined) params.set("episodes", episodes);
 	if (full) params.set("full", "1");
+	// Where the question is being asked from: notes that helped here before rank higher.
+	params.set("cwd", process.cwd());
 	const session = sessionIdFromEnv();
 	if (session) params.set("session", session);
 	const res = await api(`/api/recall?${params}`);
@@ -405,19 +377,12 @@ async function cmdNote(rest: string[]): Promise<void> {
 		console.error('claude-brain note "<text>" [-f <subfolder>]');
 		process.exit(1);
 	}
-	const { vaultReady, vaultRoot } = await import("../src/config");
-	const root = vaultRoot();
-	if (!root || !vaultReady()) {
-		console.error("no vault selected — run `claude-brain` and pick one in Settings");
+	const result = await captureNote(text, folder);
+	if (!result.ok) {
+		console.error(result.reason);
 		process.exit(1);
 	}
-	const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "");
-	const dir = join(root, folder.replace(/^\/+|\.\./g, ""));
-	mkdirSync(dir, { recursive: true });
-	let path = join(dir, `${stamp}.md`);
-	for (let i = 2; existsSync(path); i++) path = join(dir, `${stamp} (${i}).md`);
-	await Bun.write(path, `# Inbox ${stamp}\n\n${text}\n`);
-	console.log(`captured: ${path}`);
+	console.log(`captured: ${result.path}`);
 	await api("/api/reindex", { method: "POST" });
 }
 
@@ -472,7 +437,10 @@ async function cmdIntegrate(rest: string[]): Promise<void> {
 	const status = rest[0] === "--remove" ? await mod.unintegrate() : await mod.integrate();
 	console.log(JSON.stringify(status));
 	if (rest[0] !== "--remove") {
-		console.log("Claude Code wired: recall-first instructions, SessionStart hook, recording skill.");
+		console.log(
+			"Claude Code wired: MCP server (tools recall/remember/note/path/explain/affected/map), session hooks, " +
+				"recall-first instructions, recording skill. Restart Claude Code to load the MCP server.",
+		);
 	}
 }
 
@@ -499,6 +467,9 @@ switch (cmd) {
 		break;
 	case "serve":
 		await import("../server.ts");
+		break;
+	case "mcp":
+		await (await import("../src/mcp")).serveMcp();
 		break;
 	case "recall":
 	case "search":
@@ -576,11 +547,14 @@ switch (cmd) {
   claude-brain reorganize --undo [<run-id>]
   claude-brain reorganize --list
 
+ claude code
+  claude-brain integrate [--remove]  wire into Claude Code: MCP server, session hooks, instructions
+  claude-brain mcp                   serve the brain as MCP tools over stdio (Claude Code runs this)
+
  upkeep
   claude-brain vault <path>          choose where your brain lives
   claude-brain sync setup <provider> connect dropbox | gdrive | mega
   claude-brain sync now              sync to the cloud now
-  claude-brain integrate [--remove]  wire into Claude Code
   claude-brain consolidate [days]    mine session logs, abstract, forget
   claude-brain status | reindex | serve | context`);
 		process.exit(cmd ? 1 : 0);

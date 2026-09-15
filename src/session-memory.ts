@@ -19,6 +19,7 @@ import {
 	recordEpisode,
 } from "./episodic";
 import { clearPriming, indexStatus } from "./hybrid-search";
+import { getMeta, openBrainDb } from "./index-db";
 import { ago, recall } from "./recall";
 import { findTranscript, mineTranscript } from "./transcript";
 
@@ -58,6 +59,7 @@ export interface DigestOptions {
 export function digest({ sessionId, cwd }: DigestOptions): string {
 	ensureSession(sessionId, cwd);
 	const status = indexStatus();
+	const proposals = Number(getMeta(openBrainDb().db, "proposals") ?? "0") || 0;
 	const lines = [
 		`brain: ${status.docs} notes · ${status.episodes} episodes · ${status.communities} clusters` +
 			` — \`claude-brain recall "<q>"\`, \`claude-brain path/explain/affected/map\``,
@@ -65,6 +67,9 @@ export function digest({ sessionId, cwd }: DigestOptions): string {
 	for (const session of recentSessions(cwd, 2, sessionId)) {
 		if (!session.summary) continue;
 		lines.push(`last here (${ago(session.ended ?? session.started)}): ${clip(session.summary, 220)}`);
+	}
+	if (proposals > 0) {
+		lines.push(`${proposals} theme${proposals === 1 ? "" : "s"} recurring across sessions — \`claude-brain consolidate\` lists them`);
 	}
 	return lines.join("\n");
 }
@@ -88,7 +93,7 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 	const encoded = recordEpisode({ sessionId, cwd, kind: "prompt", text: clip(text, 600), salience: 1.4 });
 	if (encoded === null) return "";
 
-	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, excludeSessionId: sessionId });
+	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, cwd, excludeSessionId: sessionId });
 	if (hits.length === 0) return "";
 	const best = Math.max(...hits.map((h) => h.score));
 	if (best < MIN_SCORE) return "";

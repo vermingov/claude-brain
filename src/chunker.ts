@@ -28,9 +28,35 @@ export function stripFrontmatter(raw: string): string {
 	return raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
 }
 
+/** A title that is only a capture stamp, a date, or a "(2)" copy of one — no cue in it. */
+export const TIMESTAMP_TITLE = /^(inbox\s+)?\d{4}-\d{2}-\d{2}(\s+\d{4,6})?(\s+\(\d+\))?$/i;
+
+function firstMeaningfulLine(body: string, from: number): string {
+	for (const raw of body.slice(from).split(/\r?\n/)) {
+		const line = raw.replace(/^#+\s*/, "").replace(/[*_`>]/g, "").trim();
+		if (line.length < 4 || line.startsWith("---") || line.startsWith("![")) continue;
+		return line.length > 90 ? `${line.slice(0, 87).trimEnd()}…` : line;
+	}
+	return "";
+}
+
+/**
+ * The H1, else the filename — unless that is a timestamp. The title is the strongest
+ * field in the index (FTS weight 3, and prefixed into every chunk embedding), and a
+ * quick capture titled by its clock puts noise exactly there. Its first real line says
+ * what it is about; a bare date (a journal) keeps the date in front so the day itself
+ * stays findable.
+ */
 export function titleOf(body: string, fallback: string): string {
 	const h = body.match(/^#\s+(.+)$/m);
-	return h?.[1] ? h[1].trim() : fallback;
+	const title = h?.[1] ? h[1].trim() : fallback;
+	if (!TIMESTAMP_TITLE.test(title)) return title;
+	const line = firstMeaningfulLine(body, h ? (h.index ?? 0) + h[0].length : 0);
+	if (!line) return title;
+	// Only a bare date is worth keeping: that is a journal day. A clock time or a "(2)"
+	// is capture bookkeeping and says nothing about the note.
+	const journal = /^\d{4}-\d{2}-\d{2}$/.test(title);
+	return journal ? `${title} ${line}` : line;
 }
 
 /**

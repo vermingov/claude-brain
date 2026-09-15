@@ -13,7 +13,8 @@
 
 import { forgetWeakEpisodes, type ForgetStats } from "./activation";
 import { embedPendingEpisodes, ingestTranscripts } from "./episodic";
-import { openBrainDb } from "./index-db";
+import { scheduleGraphRebuild } from "./graph";
+import { openBrainDb, setMeta } from "./index-db";
 
 /**
  * L2 distance under which two normalised MiniLM embeddings count as the same idea.
@@ -139,11 +140,17 @@ export function consolidate(sinceDays = 14): ConsolidationReport {
 	// Autocheckpoint recycles WAL pages but never shrinks the file; embedding passes had
 	// left it at 5 MB. Truncating here is safe — the server is the only writer.
 	db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+	const proposals = findRecurring();
+	// Counted into the SessionStart digest, where someone will actually see it; the
+	// SessionEnd hook's stderr is read by nobody.
+	setMeta(db, "proposals", String(proposals.length));
+	// Recalls accumulated since the last rebuild may have earned new co-recall edges.
+	scheduleGraphRebuild();
 	return {
 		ingestedSessions: ingested.sessions,
 		ingestedEpisodes: ingested.episodes,
 		pendingEmbed: (db.query("SELECT count(*) AS n FROM episodes WHERE embedded = 0").get() as { n: number }).n,
 		forgotten,
-		proposals: findRecurring(),
+		proposals,
 	};
 }

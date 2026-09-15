@@ -57,7 +57,25 @@ export function recordEpisode(input: EpisodeInput): number | null {
 		| null;
 	if (!row) return null;
 	db.query("INSERT INTO episodes_fts (rowid, text) VALUES (?, ?)").run(row.id, text);
+	scheduleEpisodeEmbed();
 	return row.id;
+}
+
+let embedTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * A trace is searchable by meaning as soon as it is stored, not at the next consolidation
+ * pass hours later. Debounced, because a transcript ingest records hundreds in one go;
+ * unref'd, so a short-lived CLI process that wrote directly can still exit — the daemon
+ * picks the row up on its next pass.
+ */
+function scheduleEpisodeEmbed(): void {
+	if (embedTimer) return;
+	embedTimer = setTimeout(() => {
+		embedTimer = null;
+		void embedPendingEpisodes();
+	}, 250);
+	embedTimer.unref?.();
 }
 
 export function endSession(sessionId: string, summary?: string, ended = Date.now()): void {

@@ -4,11 +4,12 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join, relative, sep } from "node:path";
-import { chunkNote, stripFrontmatter, titleOf } from "./chunker";
+import type { Database } from "bun:sqlite";
+import { chunkNote, stripFrontmatter, TIMESTAMP_TITLE, titleOf } from "./chunker";
 import { embedTexts } from "./embedder";
 import { refreshCentroids, scheduleGraphRebuild } from "./graph";
 import { resolveLink } from "./graph-builder";
-import { openBrainDb, setMeta } from "./index-db";
+import { getMeta, openBrainDb, setMeta } from "./index-db";
 import { parseLinks, parseTags } from "./relations";
 import { IGNORED_DIR_NAMES, vaultReady, vaultRoot } from "./config";
 
@@ -169,6 +170,7 @@ async function runReindex(): Promise<IndexStats> {
 
 	const files: VaultFile[] = [];
 	walkVault(root, root, files);
+	retitleUnderNewRule(db);
 
 	const known = new Map<string, KnownDoc>();
 	for (const row of db.query("SELECT id, path, hash, mtime, size FROM docs").all() as Array<
@@ -269,6 +271,29 @@ async function runReindex(): Promise<IndexStats> {
 	Object.assign(stats, countStats());
 	if (vectors) void embedPending();
 	return stats;
+}
+
+/** Bumped when chunker.titleOf changes what it derives from an unchanged file. */
+const TITLE_RULE = "2";
+
+/**
+ * A title derived under an older rule is stale in the index even though the file has not
+ * changed, and the incremental path never revisits an unchanged file. Once per rule
+ * version, the notes whose stored title the new rule would reject are pushed back
+ * through it: hash and mtime cleared, so the next loop re-reads, re-chunks and re-embeds
+ * them. Their access counters live on the docs row and survive.
+ */
+function retitleUnderNewRule(db: Database): void {
+	if (getMeta(db, "title_rule") === TITLE_RULE) return;
+	const stale = (db.query("SELECT id, title FROM docs").all() as Array<{ id: number; title: string }>).filter((d) =>
+		TIMESTAMP_TITLE.test(d.title),
+	);
+	db.transaction(() => {
+		const bust = db.query("UPDATE docs SET hash = '', mtime = 0 WHERE id = ?");
+		for (const d of stale) bust.run(d.id);
+		setMeta(db, "title_rule", TITLE_RULE);
+	})();
+	if (stale.length > 0) console.log(`[index] re-titling ${stale.length} timestamp-titled notes`);
 }
 
 interface LinkResolver {

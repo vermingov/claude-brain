@@ -9,19 +9,30 @@ your own cloud account.
 
 ## Features
 
+- **MCP server** — `claude-brain integrate` registers the brain as an MCP server, so
+  Claude Code calls `recall`, `remember`, `note`, `path`, `explain`, `affected`, `map`,
+  `status` and `consolidate` as tools: one JSON line each way, no shell, no process
+  start. The CLI does the same things from a terminal.
 - **Hybrid recall** — BM25 full-text (SQLite FTS5) + local semantic embeddings
   (all-MiniLM-L6-v2 via ONNX, 384-dim, sqlite-vec) fused with reciprocal-rank fusion,
-  graph ranking boosts, best-section-per-note pooling. ~100 ms queries, finds notes by
+  graph ranking boosts, best-section-per-note pooling. ~15 ms queries, finds notes by
   meaning ("laptop battery drains fast" → your power-tuning note). Results are trimmed
-  to the lines that answer the question, not the whole section.
+  to the lines that answer the question, not the whole section. A misspelt cue is
+  corrected against the vault's own vocabulary, copies of the same note collapse into
+  one hit, and a result that matches nothing well says so instead of bluffing.
 - **Episodic memory** — the brain also remembers *what happened*, not just what you
   wrote down. Past sessions are mined from Claude Code's own transcripts, so recall
   answers "have we hit this before" alongside "what do we know". Nothing episodic is
   written to your vault; it lives in the local index only.
 - **Memory that behaves like memory** — retrieving a note strengthens it, unused
-  traces decay on a power-law curve, and recall spreads one hop along your links to
-  surface the neighbouring note you didn't ask for. Recurring themes across separate
-  sessions get flagged as candidates worth writing down.
+  traces decay on a power-law curve, and recall spreads one hop along every kind of
+  association — wikilinks, similarity, tags, notes that keep being recalled together —
+  to surface the neighbouring note you didn't ask for. A note remembers when another
+  session last used it, ranks a little higher in the directory it helped in before, and
+  a session's working memory follows the thread of its questions until the topic
+  changes. A failure that a later run survived is stored as an outcome, with the files
+  edited in between. Recurring themes across separate sessions get flagged as
+  candidates worth writing down.
 - **Note graph you can traverse** — `path` between two notes, `explain` a note's
   neighbourhood, `affected` for everything pointing at it, `map` for the whole vault
   as named clusters. Links are typed from context (`caused_by`, `fixed_by`,
@@ -47,10 +58,10 @@ your own cloud account.
 - **Cloud sync** — one-way mirror to your own **Dropbox**, **Google Drive**, or
   **MEGA** (via rclone; credentials stay in rclone on your machine). Dated remote
   trash folder protects against accidental deletions.
-- **Claude Code integration** — one click wires it in: recall-first instructions,
-  hooks that orient at session start, quietly cue relevant memory as you work, and
-  consolidate at session end, plus a recording skill so sessions save what they
-  learned as new notes.
+- **Claude Code integration** — one click wires it in: the MCP server, recall-first
+  instructions, hooks that orient at session start, quietly cue relevant memory as you
+  work, and consolidate at session end, plus a recording skill so sessions save what
+  they learned as new notes.
 
 ## Install
 
@@ -65,7 +76,10 @@ claude-brain                 # opens the brain UI in your browser
 ```
 
 First run: pick your vault location in **Settings** (detected Obsidian vaults are
-suggested), then click **Integrate with Claude Code**. Optional cloud sync:
+suggested), then click **Integrate with Claude Code** (or run `claude-brain integrate`).
+That registers the MCP server in `~/.claude.json` at user scope, installs the session
+hooks, and adds the recall-first instructions; restart Claude Code once to load the
+tools. Optional cloud sync:
 
 ```bash
 claude-brain sync setup dropbox   # or: gdrive, mega
@@ -97,7 +111,8 @@ claude-brain reorganize --undo [<run-id>]
 claude-brain vault <path>          choose where your brain lives
 claude-brain sync setup <provider> connect dropbox | gdrive | mega
 claude-brain sync now              sync to the cloud now
-claude-brain integrate [--remove]  wire into / out of Claude Code
+claude-brain integrate [--remove]  wire into / out of Claude Code (MCP, hooks, instructions)
+claude-brain mcp                   the MCP server over stdio — Claude Code runs this itself
 claude-brain consolidate [days]    mine session logs, abstract, forget
 claude-brain status                index + sync + integration state
 claude-brain serve                 run the server in the foreground

@@ -1,6 +1,7 @@
 // Retrieval across both memory systems. Lexical (FTS5 BM25) and semantic (vector)
 // rankings are fused with reciprocal-rank fusion, then reweighted by how strong each
-// trace is (activation.ts), extended along associations (spreading.ts), and finally
+// trace is (activation.ts), by where it was useful before (recalls), extended along
+// associations (spreading.ts), collapsed to one hit per piece of knowledge, and finally
 // strengthened by the act of being recalled.
 //
 // Ordering matters: relevance decides the candidate set, memory strength only reorders
@@ -9,9 +10,11 @@
 
 import { activationBoost, strengthen } from "./activation";
 import { embedQuery } from "./embedder";
-import { openBrainDb } from "./index-db";
+import { EDGE_WEIGHT } from "./graph";
+import { EMBED_DIM, openBrainDb } from "./index-db";
 import { focusSnippet } from "./snippet";
 import { spreadActivation } from "./spreading";
+import { correctTerms } from "./vocab";
 
 export interface RecallHit {
 	kind: "note" | "episode";
@@ -27,6 +30,12 @@ export interface RecallHit {
 	via?: string;
 	/** Already surfaced earlier in this session — its text is still in context. */
 	seen?: boolean;
+	/** Other notes holding the same text, folded into this hit. */
+	copies?: number;
+	/** When and where an earlier session last retrieved this note. */
+	lastUsed?: { ts: number; cwd: string };
+	/** The cue actually searched, when a misspelt term was snapped to the vault's vocabulary. */
+	corrected?: string;
 }
 
 export interface RecallOptions {
@@ -36,6 +45,8 @@ export interface RecallOptions {
 	pathPrefix?: string;
 	/** Live session id — enables working-memory priming and is required for priming to persist. */
 	sessionId?: string;
+	/** Where the caller is working. Notes that helped here before rank a little higher. */
+	cwd?: string;
 	/**
 	 * Drop episodes from this session. What just happened is still in the context
 	 * window; replaying it back as "memory" is an echo, not a recollection.
@@ -54,8 +65,10 @@ interface Candidate {
 	title: string;
 	heading: string;
 	text: string;
+	hash: string;
 	score: number;
 	via?: string;
+	copies?: number;
 }
 
 interface EpisodeCandidate {
@@ -93,13 +106,57 @@ const EPISODE_SNIPPET_CHARS = 200;
 /** Episodes are raw and repetitive next to a curated note; they earn less trust. */
 const EPISODE_WEIGHT = 0.8;
 
-function ftsQuery(query: string, mode: "and" | "or"): string {
-	const terms = query
-		.toLowerCase()
-		.split(/[^\p{L}\p{N}]+/u)
-		.filter((t) => t.length > 1 && t.length < 40)
-		.map((t) => `"${t}"`);
-	return terms.join(mode === "and" ? " " : " OR ");
+/**
+ * Lexical cue budget. A pasted log is hundreds of distinct tokens; every one of them
+ * becomes an OR branch, and FTS5 pays per branch. Measured: 316 unique terms cost 29 ms,
+ * 24 cost 4 ms — and the same six words repeated sixty times, undeduplicated, cost 2.6 s.
+ */
+const MAX_TERMS = 32;
+/** An all-terms match is only plausible for a short cue; above this the pass never hits
+ *  and merely delays the OR fallback it always ends in. */
+const AND_MAX_TERMS = 8;
+/** Below this many lexical rows the cue is probably misspelt, and worth one correction. */
+const LEXICAL_FLOOR = 3;
+/** Two notes whose centroids sit this close are copies, not neighbours. */
+const DUPLICATE_COSINE = 0.95;
+/** Context-dependent memory: a note that helped in this directory before, in another session. */
+const CONTEXT_BOOST = 1.04;
+/** An episode from the day the cue names beats a better-worded one from the wrong month. */
+const TEMPORAL_BOOST = 1.3;
+/**
+ * Below this the ranker is returning its least-bad option for a cue that names nothing
+ * the vault knows. Measured: confident cues land 0.136–0.207, vague ones 0.088–0.107.
+ */
+export const WEAK_SCORE = 0.095;
+
+const STOPWORDS = new Set(
+	("the a an and or of for to in on with is are was were be been it its this that then than how why what when " +
+		"not no you your we our my i me use used using do does did dont doesnt cant wont can could would should will " +
+		"just also from into out only about have has had").split(" "),
+);
+
+/** Distinct search terms of a cue, in order of first appearance, within the budget. */
+export function queryTerms(query: string): string[] {
+	const seen = new Set<string>();
+	const terms: string[] = [];
+	for (const term of query.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+		if (term.length < 2 || term.length >= 40 || seen.has(term)) continue;
+		seen.add(term);
+		terms.push(term);
+	}
+	if (terms.length <= MAX_TERMS) return terms;
+	// Over budget means a pasted log. The words that carry the ask are the content words;
+	// function words and bare numbers go first, then the tail is cut.
+	const content = terms.filter((term) => !STOPWORDS.has(term) && !/^\d+$/.test(term));
+	return (content.length > 0 ? content : terms).slice(0, MAX_TERMS);
+}
+
+function ftsMatch(terms: string[], mode: "and" | "or"): string {
+	return terms.map((term) => `"${term}"`).join(mode === "and" ? " " : " OR ");
+}
+
+function normalizePrefix(prefix: string): string {
+	return prefix.replace(/^\/+|\/+$/g, "").toLowerCase();
 }
 
 /**
@@ -112,21 +169,14 @@ function ftsQuery(query: string, mode: "and" | "or"): string {
  * lowercase comparison, and the prefix is escaped because a folder may legitimately
  * contain `_`.
  */
-function normalizePrefix(prefix: string): string {
-	return prefix.replace(/^\/+|\/+$/g, "").toLowerCase();
-}
-
 function likePrefix(prefix: string): string {
 	return `${prefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
 /** BM25 over one FTS table. Falls back from all-terms to any-term when too few match. */
-function lexicalRanks(
-	table: string,
-	columnWeights: number[],
-	query: string,
-	pathPrefix?: string,
-): Map<number, number> {
+function lexicalRanks(table: string, columnWeights: number[], terms: string[], pathPrefix?: string): Map<number, number> {
+	const ranks = new Map<number, number>();
+	if (terms.length === 0) return ranks;
 	const { db } = openBrainDb();
 	const weights = columnWeights.join(", ");
 	// Only chunks rows have a doc, and therefore a path, to scope by.
@@ -148,12 +198,11 @@ function lexicalRanks(
 			return [];
 		}
 	};
-	let rows = search(ftsQuery(query, "and"));
+	let rows = terms.length <= AND_MAX_TERMS ? search(ftsMatch(terms, "and")) : [];
 	if (rows.length < 5) {
 		const seen = new Set(rows.map((r) => r.rowid));
-		rows = rows.concat(search(ftsQuery(query, "or")).filter((r) => !seen.has(r.rowid)));
+		rows = rows.concat(search(ftsMatch(terms, "or")).filter((r) => !seen.has(r.rowid)));
 	}
-	const ranks = new Map<number, number>();
 	rows.slice(0, CANDIDATES).forEach((r, i) => ranks.set(r.rowid, i));
 	return ranks;
 }
@@ -207,24 +256,52 @@ function fuse(rankLists: Map<number, number>[]): Map<number, number> {
 	return fused;
 }
 
-// Working memory: a running average of what this session has been asking about, blended
+function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
+	let dot = 0;
+	for (let i = 0; i < a.length; i++) dot += a[i]! * b[i]!;
+	return dot;
+}
+
+// Working memory: a running trace of what this session has been asking about, blended
 // into each new query so consecutive recalls stay on topic — the reason a follow-up
-// question needs less context than the first one did.
+// question needs less context than the first one did. Persisted on the session row so a
+// daemon restart mid-session doesn't lose the thread; cached here so the common case
+// never reads it back.
 const PRIMING_WEIGHT = 0.15;
-/** Sessions that ended without a SessionEnd hook would otherwise leak their vector. */
+/**
+ * Below this the new query is about something else, and attention moves on: a topic
+ * switch starts a fresh trace instead of being pulled toward the previous one.
+ */
+const TOPIC_SWITCH_COSINE = 0.25;
 const MAX_PRIMED_SESSIONS = 64;
-const primed = new Map<string, number[]>();
+const primed = new Map<string, Float32Array>();
+
+function loadContext(sessionId: string): Float32Array | null {
+	const cached = primed.get(sessionId);
+	if (cached) return cached;
+	const { db } = openBrainDb();
+	const row = db.query("SELECT context FROM sessions WHERE id = ?").get(sessionId) as { context: Uint8Array | null } | null;
+	if (!row?.context || row.context.byteLength !== EMBED_DIM * 4) return null;
+	const vec = new Float32Array(row.context.buffer.slice(row.context.byteOffset, row.context.byteOffset + row.context.byteLength));
+	primed.set(sessionId, vec);
+	return vec;
+}
+
+function saveContext(sessionId: string, trace: Float32Array): void {
+	primed.set(sessionId, trace);
+	if (primed.size > MAX_PRIMED_SESSIONS) primed.delete(primed.keys().next().value as string);
+	const { db } = openBrainDb();
+	// A bare CLI call has no session row; nothing to persist against, nothing lost.
+	db.query("UPDATE sessions SET context = ? WHERE id = ?").run(new Uint8Array(trace.buffer), sessionId);
+}
 
 function primeQuery(sessionId: string | undefined, vector: number[] | null): number[] | null {
-	if (!vector) return vector;
-	if (!sessionId) return vector;
-	const context = primed.get(sessionId);
-	const next = context
-		? vector.map((v, i) => (1 - PRIMING_WEIGHT) * v + PRIMING_WEIGHT * (context[i] ?? 0))
-		: vector;
-	// Keep the context vector as a decaying trace of the session's queries.
-	primed.set(sessionId, context ? context.map((c, i) => 0.6 * c + 0.4 * (vector[i] ?? 0)) : [...vector]);
-	if (primed.size > MAX_PRIMED_SESSIONS) primed.delete(primed.keys().next().value as string);
+	if (!vector || !sessionId) return vector;
+	const context = loadContext(sessionId);
+	const continuing = context !== null && cosine(vector, context) >= TOPIC_SWITCH_COSINE;
+	const next = continuing ? vector.map((v, i) => (1 - PRIMING_WEIGHT) * v + PRIMING_WEIGHT * context![i]!) : vector;
+	// Keep the trace as a decaying average of the thread's queries.
+	saveContext(sessionId, continuing ? Float32Array.from(vector, (v, i) => 0.6 * context![i]! + 0.4 * v) : Float32Array.from(vector));
 	const norm = Math.hypot(...next) || 1;
 	return next.map((v) => v / norm);
 }
@@ -233,13 +310,19 @@ export function clearPriming(sessionId: string): void {
 	primed.delete(sessionId);
 }
 
+function sessionCwd(sessionId: string): string | undefined {
+	const { db } = openBrainDb();
+	const row = db.query("SELECT cwd FROM sessions WHERE id = ?").get(sessionId) as { cwd: string } | null;
+	return row?.cwd || undefined;
+}
+
 function hydrateChunks(fused: Map<number, number>): Candidate[] {
 	const { db } = openBrainDb();
 	const ids = [...fused.keys()];
 	if (ids.length === 0) return [];
 	const rows = db
 		.query(
-			`SELECT c.id AS chunkId, d.id AS docId, d.path, d.title, c.heading, c.text,
+			`SELECT c.id AS chunkId, d.id AS docId, d.path, d.title, d.hash, c.heading, c.text,
 			        d.access_count, d.last_access, d.mtime
 			 FROM chunks c JOIN docs d ON d.id = c.doc_id
 			 WHERE c.id IN (${ids.map(() => "?").join(",")})`,
@@ -254,6 +337,7 @@ function hydrateChunks(fused: Map<number, number>): Candidate[] {
 		title: r.title,
 		heading: r.heading,
 		text: r.text,
+		hash: r.hash,
 		score:
 			(fused.get(r.chunkId) ?? 0) *
 			activationBoost({ accessCount: r.access_count, lastAccess: r.last_access, created: r.mtime }),
@@ -295,28 +379,33 @@ function hydrateEpisodes(fused: Map<number, number>): EpisodeCandidate[] {
 }
 
 /**
- * Co-citation signal: a candidate wikilinked to other candidates is likely the hub the
- * query is actually about. Multiplicative, so it scales with the fused score instead of
- * swamping it.
+ * Co-citation signal: a candidate connected to other candidates is likely the hub the
+ * query is actually about. Every edge kind counts, weighted as the graph weights it — a
+ * wikilink fully, a similarity edge by its discounted cosine. Multiplicative, so it scales
+ * with the fused score instead of swamping it.
  */
 function applyGraphBoost(candidates: Candidate[]): void {
 	const { db } = openBrainDb();
 	const docIds = [...new Set(candidates.map((c) => c.docId))];
 	if (docIds.length < 2) return;
-	const placeholders = docIds.map(() => "?").join(",");
+	const list = docIds.map(() => "?").join(",");
 	const rows = db
 		.query(
-			`SELECT source_doc, target_doc FROM links
-			 WHERE source_doc IN (${placeholders}) AND target_doc IN (${placeholders})`,
+			`SELECT source_doc AS a, target_doc AS b, 'wikilink' AS kind, 1.0 AS w FROM links
+			 WHERE source_doc IN (${list}) AND target_doc IN (${list})
+			 UNION ALL
+			 SELECT source_doc, target_doc, kind, weight FROM derived_links
+			 WHERE source_doc IN (${list}) AND target_doc IN (${list})`,
 		)
-		.all(...docIds, ...docIds) as Array<{ source_doc: number; target_doc: number }>;
-	const neighbors = new Map<number, Set<number>>();
-	for (const { source_doc, target_doc } of rows) {
-		(neighbors.get(source_doc) ?? neighbors.set(source_doc, new Set()).get(source_doc)!).add(target_doc);
-		(neighbors.get(target_doc) ?? neighbors.set(target_doc, new Set()).get(target_doc)!).add(source_doc);
+		.all(...docIds, ...docIds, ...docIds, ...docIds) as Array<{ a: number; b: number; kind: string; w: number }>;
+	const attachment = new Map<number, number>();
+	for (const row of rows) {
+		const weight = row.kind === "wikilink" ? EDGE_WEIGHT.wikilink! : row.kind === "semantic" ? EDGE_WEIGHT.semantic! * row.w : row.w;
+		attachment.set(row.a, (attachment.get(row.a) ?? 0) + weight);
+		attachment.set(row.b, (attachment.get(row.b) ?? 0) + weight);
 	}
 	for (const c of candidates) {
-		const n = neighbors.get(c.docId)?.size ?? 0;
+		const n = attachment.get(c.docId) ?? 0;
 		if (n > 0) c.score *= 1 + Math.min(n * 0.05, 0.15);
 	}
 }
@@ -338,6 +427,71 @@ function poolByDoc(candidates: Candidate[]): Candidate[] {
 	}));
 }
 
+/** Lower is more deliberately filed: a topic folder beats the inbox, an original beats a "(2)". */
+function canonicalRank(path: string): number {
+	const inbox = /(^|\/)inbox\//i.test(path) ? 1000 : 0;
+	const copy = /\(\d+\)\.md$/.test(path) ? 100 : 0;
+	return inbox + copy + path.length / 100;
+}
+
+/**
+ * One hit per piece of knowledge, not per copy of it. A capture filed into a topic folder
+ * and left in the inbox, a journal entry pasted into a note — the vault holds the same
+ * text several times over, and each copy would take a slot in the answer. Exact copies
+ * share a content hash; near-copies share a centroid. The most deliberately filed copy
+ * represents the group, at the group's best score.
+ */
+function collapseDuplicates(pooled: Candidate[]): Candidate[] {
+	if (pooled.length < 2) return pooled;
+	const { db, vectors } = openBrainDb();
+	const centroids = new Map<number, Float32Array>();
+	if (vectors) {
+		const ids = pooled.map((c) => c.docId);
+		const rows = db
+			.query(`SELECT doc_id, embedding FROM doc_centroids WHERE doc_id IN (${ids.map(() => "?").join(",")})`)
+			.all(...ids) as Array<{ doc_id: number; embedding: Uint8Array }>;
+		for (const row of rows) {
+			centroids.set(row.doc_id, new Float32Array(row.embedding.buffer, row.embedding.byteOffset, EMBED_DIM));
+		}
+	}
+	const groups: Candidate[][] = [];
+	for (const c of pooled) {
+		const group = groups.find((g) => {
+			const rep = g[0]!;
+			if (rep.hash === c.hash) return true;
+			const a = centroids.get(rep.docId);
+			const b = centroids.get(c.docId);
+			return a !== undefined && b !== undefined && cosine(a, b) >= DUPLICATE_COSINE;
+		});
+		if (group) group.push(c);
+		else groups.push([c]);
+	}
+	return groups.map((g) => {
+		if (g.length === 1) return g[0]!;
+		const keeper = [...g].sort((x, y) => canonicalRank(x.path) - canonicalRank(y.path) || y.score - x.score)[0]!;
+		return { ...keeper, score: Math.max(...g.map((m) => m.score)), copies: g.length - 1 };
+	});
+}
+
+/**
+ * Context-dependent memory: what was useful in this place before is likelier to be the
+ * thing wanted here now. Small, multiplicative, and only from *other* sessions — the
+ * current one already carries its working memory in the priming trace.
+ */
+function applyContextBoost(candidates: Candidate[], cwd: string | undefined, sessionId: string | undefined): void {
+	if (!cwd || candidates.length === 0) return;
+	const { db } = openBrainDb();
+	const ids = candidates.map((c) => c.docId);
+	const rows = db
+		.query(
+			`SELECT DISTINCT doc_id FROM recalls WHERE cwd = ? AND session_id <> ?
+			 AND doc_id IN (${ids.map(() => "?").join(",")})`,
+		)
+		.all(cwd, sessionId ?? "", ...ids) as Array<{ doc_id: number }>;
+	const familiar = new Set(rows.map((r) => r.doc_id));
+	for (const c of candidates) if (familiar.has(c.docId)) c.score *= CONTEXT_BOOST;
+}
+
 /** Pull in notes that matched nothing but sit one association away from a strong match. */
 function addAssociations(pooled: Candidate[], limit: number, pathPrefix?: string): Candidate[] {
 	if (pooled.length === 0 || limit <= 0) return pooled;
@@ -352,7 +506,7 @@ function addAssociations(pooled: Candidate[], limit: number, pathPrefix?: string
 	// that was never matched on content.
 	const rows = db
 		.query(
-			`SELECT d.id AS docId, d.path, d.title, c.id AS chunkId, c.heading, c.text
+			`SELECT d.id AS docId, d.path, d.title, d.hash, c.id AS chunkId, c.heading, c.text
 			 FROM docs d JOIN chunks c ON c.doc_id = d.id AND c.pos = 0
 			 WHERE d.id IN (${ids.map(() => "?").join(",")})`,
 		)
@@ -385,6 +539,53 @@ function diversifyEpisodes(candidates: EpisodeCandidate[], k: number): EpisodeCa
 	return out;
 }
 
+export interface TimeWindow {
+	since: number;
+	until: number;
+}
+
+const DAY = 86_400_000;
+
+function startOfDay(ts: number): number {
+	const d = new Date(ts);
+	d.setHours(0, 0, 0, 0);
+	return d.getTime();
+}
+
+/**
+ * When the cue says *when*, the episodic store can answer by time as well as by content —
+ * "what broke yesterday" is mostly a date, barely a topic. Deliberately literal: only the
+ * phrases people actually type, never a guess.
+ */
+export function temporalWindow(query: string, now = Date.now()): TimeWindow | null {
+	const q = query.toLowerCase();
+	const today = startOfDay(now);
+	if (/\btoday\b/.test(q)) return { since: today, until: now };
+	if (/\byesterday\b/.test(q)) return { since: today - DAY, until: today };
+	const ago = q.match(/\b(\d+)\s+(day|week|month)s?\s+ago\b/);
+	if (ago) {
+		const unit = ago[2] === "day" ? DAY : ago[2] === "week" ? 7 * DAY : 30 * DAY;
+		const at = now - Number(ago[1]) * unit;
+		return { since: at - unit, until: at + unit };
+	}
+	if (/\b(this|past) week\b/.test(q)) return { since: now - 7 * DAY, until: now };
+	if (/\blast week\b/.test(q)) return { since: now - 14 * DAY, until: now };
+	if (/\b(this|past|last) month\b/.test(q)) return { since: now - 45 * DAY, until: now };
+	if (/\b(recently|the other day|earlier this week)\b/.test(q)) return { since: now - 14 * DAY, until: now };
+	return null;
+}
+
+/** Episodes inside a window, newest first — time itself as a ranker, fused like the others. */
+function temporalRanks(window: TimeWindow): Map<number, number> {
+	const { db } = openBrainDb();
+	const rows = db
+		.query("SELECT id FROM episodes WHERE ts BETWEEN ? AND ? ORDER BY salience DESC, ts DESC LIMIT ?")
+		.all(window.since, window.until, CANDIDATES) as Array<{ id: number }>;
+	const ranks = new Map<number, number>();
+	rows.forEach((r, i) => ranks.set(r.id, i));
+	return ranks;
+}
+
 /**
  * The solution section of each doc, found across *all* its chunks — the point is that it
  * usually lives in a chunk other than the one that matched.
@@ -412,6 +613,34 @@ function solutionsFor(docIds: number[]): Map<number, string> {
 	return out;
 }
 
+/** The binding written on every reinforced recall: this session used these notes, here. */
+function recordRecalls(sessionId: string, cwd: string, docIds: number[], now = Date.now()): void {
+	if (docIds.length === 0) return;
+	const { db } = openBrainDb();
+	const insert = db.query(
+		`INSERT INTO recalls (session_id, doc_id, cwd, ts) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(session_id, doc_id) DO UPDATE SET ts = excluded.ts, cwd = excluded.cwd`,
+	);
+	db.transaction(() => {
+		for (const docId of docIds) insert.run(sessionId, docId, cwd, now);
+	})();
+}
+
+/** When another session last retrieved each note, and from where. */
+function lastUsedFor(docIds: number[], sessionId: string | undefined): Map<number, { ts: number; cwd: string }> {
+	const out = new Map<number, { ts: number; cwd: string }>();
+	if (docIds.length === 0) return out;
+	const { db } = openBrainDb();
+	const rows = db
+		.query(
+			`SELECT doc_id, ts, cwd FROM recalls WHERE session_id <> ?
+			 AND doc_id IN (${docIds.map(() => "?").join(",")}) ORDER BY ts DESC`,
+		)
+		.all(sessionId ?? "", ...docIds) as Array<{ doc_id: number; ts: number; cwd: string }>;
+	for (const row of rows) if (!out.has(row.doc_id)) out.set(row.doc_id, { ts: row.ts, cwd: row.cwd });
+	return out;
+}
+
 function clip(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
@@ -419,47 +648,69 @@ function clip(text: string, max: number): string {
 export async function hybridRecall(query: string, options: RecallOptions = {}): Promise<RecallHit[]> {
 	const k = options.k ?? 6;
 	const episodeK = options.episodeK ?? Math.max(1, Math.round(k / 3));
+	const prefix = options.pathPrefix ? normalizePrefix(options.pathPrefix) : undefined;
+	const cwd = options.cwd ?? (options.sessionId ? sessionCwd(options.sessionId) : undefined);
+
+	// Lexical first: it is synchronous, and it decides whether the cue needs spelling help.
+	let terms = queryTerms(query);
+	let corrected: string[] | undefined;
+	let noteLexical = lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], terms, prefix);
+	if (noteLexical.size < LEXICAL_FLOOR && terms.length > 0) {
+		const fixed = correctTerms(terms);
+		if (fixed) {
+			const retry = lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], fixed, prefix);
+			if (retry.size > noteLexical.size) {
+				terms = fixed;
+				corrected = fixed;
+				noteLexical = retry;
+			}
+		}
+	}
+	// The vector arm sees the original wording: subword overlap already tolerates a typo
+	// there, and a list of stems is a worse sentence than a misspelt one.
 	const vector = primeQuery(options.sessionId, await embedQuery(query));
 
-	const prefix = options.pathPrefix ? normalizePrefix(options.pathPrefix) : undefined;
-	const noteFused = fuse([
-		lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], query, prefix),
-		vectorRanks("vec_chunks", "chunk_id", vector, prefix),
-	]);
-	let notes = hydrateChunks(noteFused);
+	let notes = hydrateChunks(fuse([noteLexical, vectorRanks("vec_chunks", "chunk_id", vector, prefix)]));
 	// Safety net only: both rankers already scoped in SQL, so this is a no-op unless a
 	// path changed between the ranking queries and hydration.
 	if (prefix) notes = notes.filter((c) => c.path.toLowerCase().startsWith(prefix));
 	applyGraphBoost(notes);
-	const pooled = poolByDoc(notes).sort((a, b) => b.score - a.score);
+	const pooled = collapseDuplicates(poolByDoc(notes));
+	applyContextBoost(pooled, cwd, options.sessionId);
+	pooled.sort((a, b) => b.score - a.score);
 	const topNotes = addAssociations(pooled.slice(0, k), Math.max(1, Math.round(k / 4)), prefix)
 		.sort((a, b) => b.score - a.score)
 		.slice(0, k);
 
-	const episodes =
-		episodeK > 0 && !options.pathPrefix
-			? diversifyEpisodes(
-					hydrateEpisodes(
-						fuse([
-							lexicalRanks("episodes_fts", [1.0], query),
-							vectorRanks("vec_episodes", "episode_id", vector),
-						]),
-					).filter((e) => e.sessionId !== options.excludeSessionId),
-					episodeK,
-				)
-			: [];
+	let episodes: EpisodeCandidate[] = [];
+	if (episodeK > 0 && !options.pathPrefix) {
+		const window = temporalWindow(query);
+		const rankLists = [lexicalRanks("episodes_fts", [1.0], terms), vectorRanks("vec_episodes", "episode_id", vector)];
+		if (window) rankLists.push(temporalRanks(window));
+		let pool = hydrateEpisodes(fuse(rankLists)).filter((e) => e.sessionId !== options.excludeSessionId);
+		if (window) {
+			const inside = pool.filter((e) => e.ts >= window.since && e.ts <= window.until);
+			if (inside.length > 0) pool = inside.map((e) => ({ ...e, score: e.score * TEMPORAL_BOOST }));
+		}
+		episodes = diversifyEpisodes(pool, episodeK);
+	}
 
 	if (options.reinforce !== false) {
 		strengthen(
 			topNotes.map((n) => n.docId),
 			episodes.map((e) => e.id),
 		);
+		if (options.sessionId) recordRecalls(options.sessionId, cwd ?? "", topNotes.map((n) => n.docId));
 	}
+	const lastUsed = lastUsedFor(topNotes.map((n) => n.docId), options.sessionId);
 
 	const budget = options.full ? FULL_SNIPPET_CHARS : SNIPPET_CHARS;
 	const solutions = options.full ? new Map<number, string>() : solutionsFor(topNotes.map((c) => c.docId));
+	// Corrected stems still steer the snippet: its line scorer matches on prefixes.
+	const snippetCue = corrected ? `${query} ${corrected.join(" ")}` : query;
+	const correctedCue = corrected?.join(" ");
 	const noteHits: RecallHit[] = topNotes.map((c) => {
-		const focused = focusSnippet(c.text, query, budget);
+		const focused = focusSnippet(c.text, snippetCue, budget);
 		const solution = solutions.get(c.docId);
 		// Skip when the matched chunk already is the fix, or already carries its opening —
 		// repeating it would spend the budget saying the same thing twice.
@@ -472,6 +723,9 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 			score: Number(c.score.toFixed(4)),
 			snippet: already ? focused : `${focused}\n\nFix — ${clip(solution, SOLUTION_CHARS)}`,
 			via: c.via,
+			copies: c.copies,
+			lastUsed: lastUsed.get(c.docId),
+			corrected: correctedCue,
 		};
 	});
 	const episodeHits: RecallHit[] = episodes.map((e) => ({
@@ -482,6 +736,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 		score: Number(e.score.toFixed(4)),
 		snippet: clip(e.text, EPISODE_SNIPPET_CHARS),
 		when: e.ts,
+		corrected: correctedCue,
 	}));
 	return [...noteHits, ...episodeHits];
 }
@@ -494,6 +749,7 @@ export interface IndexStatus {
 	episodes: number;
 	sessions: number;
 	pendingEpisodeEmbed: number;
+	recalls: number;
 	edges: number;
 	communities: number;
 	vectors: boolean;
@@ -511,6 +767,7 @@ export function indexStatus(): IndexStatus {
 		episodes: one("SELECT count(*) AS n FROM episodes"),
 		sessions: one("SELECT count(*) AS n FROM sessions"),
 		pendingEpisodeEmbed: one("SELECT count(*) AS n FROM episodes WHERE embedded = 0"),
+		recalls: one("SELECT count(*) AS n FROM recalls"),
 		edges: one("SELECT (SELECT count(*) FROM links) + (SELECT count(*) FROM derived_links) AS n"),
 		communities: one("SELECT count(*) AS n FROM community_labels"),
 		vectors,

@@ -84,6 +84,9 @@ function createSemanticTables(db: Database, vectors: boolean): void {
 	db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 		title, heading, text, tokenize = 'porter unicode61'
 	)`);
+	// The index's own vocabulary, read for spelling correction: a cue that matches no
+	// stored term is snapped to the nearest one the vault actually uses (vocab.ts).
+	db.run("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row')");
 	db.run(`CREATE TABLE IF NOT EXISTS links (
 		source_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
 		target_doc INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
@@ -154,6 +157,22 @@ function createEpisodicTables(db: Database, vectors: boolean): void {
 		consolidated INTEGER NOT NULL DEFAULT 0
 	)`);
 	db.run("CREATE INDEX IF NOT EXISTS sessions_cwd ON sessions(cwd, started DESC)");
+
+	/**
+	 * Which notes a session actually retrieved: the binding between an episode and the
+	 * knowledge it used. It is what lets a note say "last used fixing X", lets a note
+	 * that helped in this directory before rank a little higher here, and lets two notes
+	 * that keep being recalled together grow an edge (graph.ts, kind `cooccur`).
+	 */
+	db.run(`CREATE TABLE IF NOT EXISTS recalls (
+		session_id TEXT NOT NULL,
+		doc_id INTEGER NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+		cwd TEXT NOT NULL DEFAULT '',
+		ts INTEGER NOT NULL,
+		PRIMARY KEY (session_id, doc_id)
+	)`);
+	db.run("CREATE INDEX IF NOT EXISTS recalls_doc ON recalls(doc_id)");
+	db.run("CREATE INDEX IF NOT EXISTS recalls_cwd ON recalls(cwd, doc_id)");
 
 	// kind is the coarse event taxonomy shared by the hooks and the transcript miner:
 	// prompt | decision | outcome | error | preference | summary.
@@ -388,6 +407,11 @@ function migrate(db: Database): void {
 	const docCols = columns("docs");
 	if (!docCols.has("access_count")) db.run("ALTER TABLE docs ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0");
 	if (!docCols.has("last_access")) db.run("ALTER TABLE docs ADD COLUMN last_access INTEGER NOT NULL DEFAULT 0");
+
+	// Working memory persisted per session, so a daemon restart mid-session doesn't
+	// forget what the session has been asking about.
+	const sessionCols = columns("sessions");
+	if (!sessionCols.has("context")) db.run("ALTER TABLE sessions ADD COLUMN context BLOB");
 
 	const linkCols = columns("links");
 	if (!linkCols.has("relation")) db.run("ALTER TABLE links ADD COLUMN relation TEXT NOT NULL DEFAULT 'references'");

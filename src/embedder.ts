@@ -203,10 +203,40 @@ export async function embedTexts(texts: string[]): Promise<number[][] | null> {
 	return result;
 }
 
+/**
+ * A query is a question, and a question is short. The hook hands the whole prompt in,
+ * pasted log included; 512 tokens of that cost 54 ms against 3.5 ms for the question
+ * itself, and MiniLM was trained on far shorter inputs anyway.
+ */
+const QUERY_MAX_TOKENS = 256;
+const QUERY_CACHE_SIZE = 128;
+/** The prompt hook and an explicit recall in the same turn often embed the same text. */
+const queryCache = new Map<string, number[]>();
+
+function truncate(encoding: Encoding, max: number): Encoding {
+	const ids = encoding.getIds();
+	if (ids.length <= max) return encoding;
+	// Keep the closing [SEP]: the model expects the sequence to end with it.
+	const cut = <T>(row: T[]) => [...row.slice(0, max - 1), row[row.length - 1]!];
+	const shortIds = cut(ids);
+	const mask = cut(encoding.getAttentionMask());
+	const types = cut(encoding.getTypeIds());
+	return { getIds: () => shortIds, getAttentionMask: () => mask, getTypeIds: () => types };
+}
+
 export async function embedQuery(query: string): Promise<number[] | null> {
+	const cached = queryCache.get(query);
+	if (cached) {
+		queryCache.delete(query);
+		queryCache.set(query, cached);
+		return cached;
+	}
 	const model = await load();
 	if (!model) return null;
-	const encoding = await model.tokenizer.encode(`${QUERY_PREFIX}${query}`);
+	const encoding = truncate(await model.tokenizer.encode(`${QUERY_PREFIX}${query}`), QUERY_MAX_TOKENS);
 	const [vector] = await runBatch(model, [encoding]);
-	return vector ?? null;
+	if (!vector) return null;
+	queryCache.set(query, vector);
+	if (queryCache.size > QUERY_CACHE_SIZE) queryCache.delete(queryCache.keys().next().value as string);
+	return vector;
 }

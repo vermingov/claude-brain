@@ -7,15 +7,21 @@
 
 import { openBrainDb } from "./index-db";
 
-export type DerivedKind = "semantic" | "tag" | "timeline";
+export type DerivedKind = "semantic" | "tag" | "timeline" | "cooccur";
 
 /** How much each edge kind counts when clustering and when routing a path. */
 export const EDGE_WEIGHT: Record<string, number> = {
 	wikilink: 1,
 	semantic: 0.6,
 	tag: 0.5,
+	cooccur: 0.4,
 	timeline: 0.2,
 };
+
+/** Sessions in which two notes must have been recalled together before that is an edge. */
+const COOCCUR_MIN_SESSIONS = 3;
+/** Communities smaller than this are folded into a neighbour rather than named. */
+const MIN_COMMUNITY = 4;
 
 /** Cosine floor for a similarity edge. Below this, MiniLM pairs notes that merely share a register. */
 const SEMANTIC_MIN_COSINE = 0.62;
@@ -179,10 +185,28 @@ function timelineEdges(docs: DocRow[]): Array<[number, number, string]> {
 	return out;
 }
 
+/**
+ * Notes that keep being retrieved together. Two memories used in the same act, across
+ * separate sessions, are associated whether or not anyone wrote the link — what fires
+ * together wires together. Three sessions, so a single day's work can't mint an edge.
+ */
+function cooccurEdges(): Array<[number, number, number]> {
+	const { db } = openBrainDb();
+	const rows = db
+		.query(
+			`SELECT a.doc_id AS a, b.doc_id AS b, count(DISTINCT a.session_id) AS n
+			 FROM recalls a JOIN recalls b ON b.session_id = a.session_id AND b.doc_id > a.doc_id
+			 GROUP BY a.doc_id, b.doc_id HAVING n >= ?`,
+		)
+		.all(COOCCUR_MIN_SESSIONS) as Array<{ a: number; b: number; n: number }>;
+	return rows.map((r) => [r.a, r.b, r.n]);
+}
+
 export interface DerivedStats {
 	semantic: number;
 	tag: number;
 	timeline: number;
+	cooccur: number;
 }
 
 /**
@@ -199,6 +223,7 @@ export function rebuildDerivedEdges(): DerivedStats {
 	const semantic = semanticEdges();
 	const tag = tagEdges();
 	const timeline = timelineEdges(docs);
+	const cooccur = cooccurEdges();
 
 	db.transaction(() => {
 		db.run("DELETE FROM derived_links");
@@ -208,9 +233,10 @@ export function rebuildDerivedEdges(): DerivedStats {
 		for (const [a, b, score] of semantic) insert.run(a, b, "semantic", score, `cosine ${score.toFixed(3)}`);
 		for (const [a, b, t, weight] of tag) insert.run(a, b, "tag", weight, t);
 		for (const [a, b, date] of timeline) insert.run(a, b, "timeline", EDGE_WEIGHT.timeline!, date);
+		for (const [a, b, n] of cooccur) insert.run(a, b, "cooccur", EDGE_WEIGHT.cooccur!, `recalled together in ${n} sessions`);
 	})();
 
-	return { semantic: semantic.length, tag: tag.length, timeline: timeline.length };
+	return { semantic: semantic.length, tag: tag.length, timeline: timeline.length, cooccur: cooccur.length };
 }
 
 export interface WeightedEdge {
@@ -320,6 +346,7 @@ export function detectCommunities(): number {
 		}
 		if (moved === 0) break;
 	}
+	absorbSmallCommunities(label, adj);
 
 	// Renumber to dense 0..n-1, largest community first, so ids are stable and readable.
 	const members = new Map<number, number[]>();
@@ -338,6 +365,48 @@ export function detectCommunities(): number {
 		});
 	})();
 	return ranked.length;
+}
+
+/**
+ * Label propagation leaves a long tail of two- and three-note communities once the vault
+ * is large: a pair joined by one similarity edge and nothing else settles as its own
+ * group. On a 1200-note vault that was 135 of 257 communities — not clusters anyone would
+ * name. Each is folded into the neighbouring community it is most strongly attached to.
+ * Notes with no edges at all stay alone: an isolate has nowhere to go, and pretending
+ * otherwise would invent structure.
+ */
+function absorbSmallCommunities(label: Map<number, number>, adj: Map<number, WeightedEdge[]>): void {
+	const members = new Map<number, number[]>();
+	for (const [id, l] of label) {
+		const list = members.get(l) ?? [];
+		list.push(id);
+		members.set(l, list);
+	}
+	// Smallest first, so a pair can join a triple that then joins something real.
+	const small = [...members.entries()]
+		.filter(([, ids]) => ids.length < MIN_COMMUNITY)
+		.sort((a, b) => a[1].length - b[1].length);
+	for (const [own, ids] of small) {
+		const pull = new Map<number, number>();
+		for (const id of ids) {
+			for (const e of adj.get(id) ?? []) {
+				const other = label.get(e.other)!;
+				if (other !== own) pull.set(other, (pull.get(other) ?? 0) + e.weight);
+			}
+		}
+		let best = -1;
+		let bestWeight = 0;
+		for (const [l, w] of pull) {
+			if (w > bestWeight || (w === bestWeight && l < best)) {
+				best = l;
+				bestWeight = w;
+			}
+		}
+		if (best === -1) continue;
+		for (const id of ids) label.set(id, best);
+		members.get(best)!.push(...ids);
+		members.set(own, []);
+	}
 }
 
 const STOPWORDS = new Set(
@@ -417,7 +486,7 @@ export function scheduleGraphRebuild(): void {
 		rebuildTimer = null;
 		const stats = rebuildGraph();
 		console.log(
-			`[graph] ${stats.wikilinks} links + ${stats.semantic} semantic + ${stats.tag} tag → ${stats.communities} communities`,
+			`[graph] ${stats.wikilinks} links + ${stats.semantic} semantic + ${stats.tag} tag + ${stats.cooccur} co-recall → ${stats.communities} communities`,
 		);
 	}, REBUILD_DEBOUNCE_MS);
 	rebuildTimer.unref?.();

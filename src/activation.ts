@@ -72,11 +72,18 @@ export function strengthen(docIds: number[], episodeIds: number[], now = Date.no
 	})();
 }
 
-/** Activation below which an unrehearsed episode is no longer worth storing. */
-const FORGET_THRESHOLD = -1.2;
-/** Kinds that survive on their own merit: a stated preference or a hard-won fix stays
- *  useful long after the session that produced it is irrelevant. */
-const DURABLE_KINDS = new Set(["preference", "decision", "summary"]);
+/**
+ * Activation below which an unrehearsed episode is no longer worth storing.
+ *
+ * With DECAY 0.35 the curve is shallow, so the threshold sets the horizon: at -0.8 a
+ * never-recalled prompt (salience 1.4) crosses it after ~25 days and a tool failure
+ * (1.8) after ~50. The previous -1.2 put those at 80 and 165 days — in practice nothing
+ * was ever forgotten, and the episodic store only grew.
+ */
+const FORGET_THRESHOLD = -0.8;
+/** Kinds that survive on their own merit: a stated preference, a decision, or what
+ *  finally fixed a failure stays useful long after the session that produced it. */
+const DURABLE_KINDS = new Set(["preference", "decision", "summary", "outcome"]);
 const MIN_AGE_DAYS = 21;
 
 export interface ForgetStats {
