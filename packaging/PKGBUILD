@@ -8,7 +8,7 @@ pkgdesc="A local second brain for Claude Code, served as an MCP server: hybrid r
 # lazy `await import("fastembed")` in src/embedder.ts throws and the brain silently
 # degrades to BM25-only — worse than not shipping. Re-add when upstream does.
 arch=('x86_64')
-url="https://github.com/basement-interactive/claude-brain"
+url="https://github.com/vermingov/claude-brain"
 license=('MIT')
 depends=('bun' 'rclone' 'xdg-utils')
 optdepends=('claude-code: LLM-assisted vault reorganisation and design descriptions')
@@ -19,7 +19,7 @@ optdepends=('claude-code: LLM-assisted vault reorganisation and design descripti
 options=('!strip' '!debug')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('c75c4e90955e3e93d86b73464e295dba704f08995a68947ca7d9cab01ac70993')
+sha256sums=('b6b9e2a2e2105edc235180270a417ac1de56f01aba68f7b4a15030f233a3ccd8')
 
 build() {
 	cd "$pkgname-$pkgver"
