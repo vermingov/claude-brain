@@ -10,7 +10,6 @@ import { Engine } from "@babylonjs/core/Engines/engine";
 import { Scene } from "@babylonjs/core/scene";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
-import { PointsCloudSystem } from "@babylonjs/core/Particles/pointsCloudSystem";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { createCamera } from "./camera.js";
 import { buildConduction, planRoute, planVolley } from "./cascade.js";
@@ -24,9 +23,11 @@ import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
 import { createSpriteLayer } from "./sprites.js";
 import { createSynapseLayer } from "./synapses.js";
+import { createDust } from "./dust.js";
 import { arrivalRange, createArrivals } from "./arrivals.js";
 
-const BACKGROUND = new Color4(2 / 255, 2 / 255, 4 / 255, 1);
+/** Outer space: no blue in it, so distance fades to nothing rather than to a colour. */
+const BACKGROUND = new Color4(0, 0, 0, 1);
 const PICK_INTERVAL_MS = 50;
 /** The flare around a firing cell, as a multiple of the cell's own radius. */
 const FLARE_SCALE = 6;
@@ -75,23 +76,6 @@ function createPipeline(scene, camera) {
 	};
 }
 
-function createStarfield(scene) {
-	const stars = new PointsCloudSystem("stars", 1.4, scene);
-	const tint = Color3.FromHexString("#4b5570");
-	stars.addPoints(900, (p) => {
-		const r = 700 + Math.random() * 1200;
-		const theta = Math.random() * Math.PI * 2;
-		const phi = Math.acos(2 * Math.random() - 1);
-		p.position = new Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
-		const jitter = 0.5 + Math.random() * 0.5;
-		p.color = new Color4(tint.r * jitter, tint.g * jitter, tint.b * jitter, 0.3);
-	});
-	stars.buildMeshAsync().then((mesh) => {
-		mesh.isPickable = false;
-		if (mesh.material) mesh.material.fogEnabled = false;
-	});
-}
-
 export function createBrainTab(container) {
 	container.classList.add("brain-tab");
 	const canvas = document.createElement("canvas");
@@ -122,7 +106,7 @@ export function createBrainTab(container) {
 	scene.skipPointerMovePicking = true;
 	const view = createCamera(scene, canvas, () => visible);
 	const quality = createPipeline(scene, view.camera);
-	createStarfield(scene);
+
 	// Test hook: the harness reads the camera through this, and can play a volley without
 	// a daemon behind it.
 	canvas.brainView = {
@@ -369,6 +353,7 @@ export function createBrainTab(container) {
 			layer.set("arriveAt", cellArriveAt);
 		}
 		layers = {
+			dust: createDust(scene, spread[Math.floor(spread.length * 0.95)] ?? 0),
 			synapses: createSynapseLayer(scene, graph, reach),
 			cells,
 			flares,
@@ -491,6 +476,8 @@ export function createBrainTab(container) {
 			layers.flares.setTime(seconds);
 			layers.impulses.setTime(seconds);
 			layers.synapses.setTime(seconds);
+			layers.dust.setTime(seconds);
+			layers.dust.follow(view.camera.globalPosition);
 			// One small uniform, and only while something is still settling.
 			const settling = arrivals.pack(seconds);
 			if (settling) {

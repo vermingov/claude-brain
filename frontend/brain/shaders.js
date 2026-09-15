@@ -157,6 +157,58 @@ void main() {
 	vTint = vec4(mix(tint.rgb, vec3(1.0, 0.96, 0.9), flash), tint.a * glow); vDepth = -viewPos.z;
 }`;
 
+/**
+ * Dust hanging in the space the brain sits in.
+ *
+ * The motes live in one cube that travels with the camera, wrapped into it by a modulo, so
+ * there is always dust wherever you fly and a couple of thousand of them cover an infinite
+ * volume. They are placed in world space, not on the screen, which is the whole point: fly
+ * with WASD and the near ones sweep past while the far ones barely shift, and that parallax
+ * is what tells you that you are moving rather than that the brain is turning.
+ *
+ * A slow drift keeps them alive when the camera is still. The big faint ones are the haze:
+ * at a few percent alpha, added rather than blended, they read as depth in the medium
+ * rather than as objects.
+ */
+Effect.ShadersStore.brainDustVertexShader = `
+precision highp float;
+attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size;
+uniform mat4 view; uniform mat4 projection; uniform float time; uniform vec3 cameraPos; uniform float cell;
+varying vec4 vTint; varying vec2 vCorner;
+void main() {
+	vTint = vec4(0.0); vCorner = corner;
+	// Alive when nothing else is: a slow wander, out of phase per mote.
+	vec3 drift = vec3(
+		sin(time * 0.13 + position.y * 0.011),
+		cos(time * 0.11 + position.z * 0.013),
+		sin(time * 0.15 + position.x * 0.009)
+	) * 19.0;
+	// Into the cube that follows the camera.
+	vec3 rel = mod(position + drift - cameraPos + cell * 0.5, cell) - cell * 0.5;
+	float dist = length(rel);
+	// Gone before the cube's edge, so nothing blinks into being at the boundary, and gone
+	// again right in front of the lens, where one mote would fill the screen.
+	float fade = smoothstep(cell * 0.5, cell * 0.34, dist) * smoothstep(0.0, cell * 0.06, dist);
+	if (fade <= 0.004) { ${CULL} return; }
+	vec4 viewPos = view * vec4(cameraPos + rel, 1.0);
+	viewPos.xy += corner * size;
+	gl_Position = projection * viewPos;
+	// The drift is far too slow to see over a second, which is right for dust and wrong for
+	// telling you the picture is live. A slow shimmer, out of phase per mote, does that
+	// without turning the dust into weather.
+	float twinkle = 0.72 + 0.28 * sin(time * 0.8 + position.x * 0.07 + position.z * 0.05);
+	vTint = vec4(tint.rgb, tint.a * fade * twinkle);
+}`;
+
+/** A mote: soft, round, and never a hard-edged dot. */
+Effect.ShadersStore.brainDustFragmentShader = `
+precision highp float;
+varying vec4 vTint; varying vec2 vCorner;
+void main() {
+	float a = smoothstep(1.0, 0.0, length(vCorner));
+	gl_FragColor = vec4(vTint.rgb * (a * a * vTint.a), 1.0);
+}`;
+
 /** A signal riding one synapse: alive between fireAt and fireAt + travel, then gone. */
 Effect.ShadersStore.brainImpulseVertexShader = `
 precision highp float;

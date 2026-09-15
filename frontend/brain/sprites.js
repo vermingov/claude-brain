@@ -18,6 +18,7 @@ const STANDARD = [
 
 /**
  * @param {object} spec
+ * @param {string[]} [spec.uniforms]  extra uniform names this layer's shader takes
  * @param {number} [spec.arrivalRange]  how far an arrival's shove carries, in layout units
  * @param {string} spec.name
  * @param {number} spec.count
@@ -36,7 +37,17 @@ export function createSpriteLayer(scene, spec) {
 		{ vertex: spec.vertex, fragment: spec.fragment },
 		{
 			attributes: ["position", "corner", ...perInstance.map((a) => a.name)],
-			uniforms: ["view", "projection", "time", "fogDensity", "fogColor", "arrivals", "arrivalCount", "arrivalRange"],
+			uniforms: [
+				"view",
+				"projection",
+				"time",
+				"fogDensity",
+				"fogColor",
+				"arrivals",
+				"arrivalCount",
+				"arrivalRange",
+				...(spec.uniforms ?? []),
+			],
 			needAlphaBlending: true,
 		},
 	);
@@ -105,6 +116,8 @@ export function createSpriteLayer(scene, spec) {
 		count,
 		set,
 		setTime: (seconds) => material.setFloat("time", seconds),
+		setFloat: (name, value) => material.setFloat(name, value),
+		setVector3: (name, value) => material.setVector3(name, value),
 		/** Where things have just landed: the shader animates the shove from the clock. */
 		setArrivals(data, count) {
 			material.setArray4("arrivals", data);
