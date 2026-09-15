@@ -9,12 +9,21 @@ import { join } from "node:path";
 import { loadConfig, saveConfig } from "./config";
 import { getMeta, openBrainDb, setMeta } from "./index-db";
 
-const CLAUDE_DIR = join(homedir(), ".claude");
-const CLAUDE_MD = join(CLAUDE_DIR, "CLAUDE.md");
-const SETTINGS = join(CLAUDE_DIR, "settings.json");
-const SKILL_DIR = join(CLAUDE_DIR, "skills", "claude-brain");
+/**
+ * Resolved per call, from $HOME first. os.homedir() is fixed at process start in Bun and
+ * ignores a later change to process.env.HOME — which is how a test that redirected HOME
+ * in-process once rewrote a developer's real ~/.claude. Reading the variable makes the
+ * redirect real, for tests and for anyone running the daemon with HOME pointed elsewhere.
+ */
+function home(): string {
+	return process.env.HOME || homedir();
+}
+const claudeDir = () => join(home(), ".claude");
+const claudeMd = () => join(claudeDir(), "CLAUDE.md");
+const settingsPath = () => join(claudeDir(), "settings.json");
+const skillDir = () => join(claudeDir(), "skills", "claude-brain");
 /** User-scope MCP servers live here, the file `claude mcp add --scope user` writes. */
-const CLAUDE_JSON = join(homedir(), ".claude.json");
+const claudeJson = () => join(home(), ".claude.json");
 const MCP_NAME = "claude-brain";
 
 const BLOCK_BEGIN = "<!-- claude-brain:begin -->";
@@ -150,7 +159,7 @@ function mcpEntry(): Record<string, unknown> {
 function readClaudeJson(): Record<string, unknown> | null {
 	let raw: string;
 	try {
-		raw = readFileSync(CLAUDE_JSON, "utf-8");
+		raw = readFileSync(claudeJson(), "utf-8");
 	} catch {
 		return {};
 	}
@@ -177,11 +186,11 @@ async function registerMcp(): Promise<void> {
 	if (root === null) {
 		// Everything else in that file is Claude Code's state; a clobber would cost far more
 		// than a missing tool. Say so and leave it.
-		console.error(`${CLAUDE_JSON} is not valid JSON — MCP server not registered. Fix the file, then re-run integrate.`);
+		console.error(`${claudeJson()} is not valid JSON — MCP server not registered. Fix the file, then re-run integrate.`);
 		return;
 	}
 	const servers = { ...mcpServersOf(root), [MCP_NAME]: mcpEntry() };
-	await Bun.write(CLAUDE_JSON, `${JSON.stringify({ ...root, mcpServers: servers }, null, 2)}\n`);
+	await Bun.write(claudeJson(), `${JSON.stringify({ ...root, mcpServers: servers }, null, 2)}\n`);
 }
 
 async function unregisterMcp(): Promise<void> {
@@ -190,35 +199,35 @@ async function unregisterMcp(): Promise<void> {
 	const servers = mcpServersOf(root);
 	if (!(MCP_NAME in servers)) return;
 	const { [MCP_NAME]: _ours, ...rest } = servers;
-	await Bun.write(CLAUDE_JSON, `${JSON.stringify({ ...root, mcpServers: rest }, null, 2)}\n`);
+	await Bun.write(claudeJson(), `${JSON.stringify({ ...root, mcpServers: rest }, null, 2)}\n`);
 }
 
 export function integrationStatus(): IntegrationStatus {
 	let md = false;
 	try {
-		md = readFileSync(CLAUDE_MD, "utf-8").includes(BLOCK_BEGIN);
+		md = readFileSync(claudeMd(), "utf-8").includes(BLOCK_BEGIN);
 	} catch {
 		/* no CLAUDE.md yet */
 	}
 	let hook = false;
 	try {
-		hook = JSON.stringify(JSON.parse(readFileSync(SETTINGS, "utf-8"))).includes(HOOK_COMMAND);
+		hook = JSON.stringify(JSON.parse(readFileSync(settingsPath(), "utf-8"))).includes(HOOK_COMMAND);
 	} catch {
 		/* no settings yet */
 	}
-	return { claudeMd: md, hook, skill: existsSync(join(SKILL_DIR, "SKILL.md")), mcp: mcpRegistered() };
+	return { claudeMd: md, hook, skill: existsSync(join(skillDir(), "SKILL.md")), mcp: mcpRegistered() };
 }
 
 type HookEntry = { type: string; command: string; timeout?: number };
 type HookMatcher = { matcher?: string; hooks: HookEntry[] };
 
 export async function integrate(): Promise<IntegrationStatus> {
-	mkdirSync(CLAUDE_DIR, { recursive: true });
+	mkdirSync(claudeDir(), { recursive: true });
 
 	// CLAUDE.md: replace an existing fenced block, else append.
 	let md = "";
 	try {
-		md = readFileSync(CLAUDE_MD, "utf-8");
+		md = readFileSync(claudeMd(), "utf-8");
 	} catch {
 		/* fresh file */
 	}
@@ -226,12 +235,12 @@ export async function integrate(): Promise<IntegrationStatus> {
 	const next = blockRe.test(md)
 		? md.replace(blockRe, `${claudeMdBlock()}\n`)
 		: `${md.trimEnd()}\n\n${claudeMdBlock()}\n`.trimStart();
-	await Bun.write(CLAUDE_MD, next);
+	await Bun.write(claudeMd(), next);
 
 	// settings.json: merge a SessionStart hook, preserving everything else.
 	let settings: Record<string, unknown> = {};
 	try {
-		settings = JSON.parse(readFileSync(SETTINGS, "utf-8"));
+		settings = JSON.parse(readFileSync(settingsPath(), "utf-8"));
 	} catch {
 		/* fresh file */
 	}
@@ -255,14 +264,14 @@ export async function integrate(): Promise<IntegrationStatus> {
 	}
 	if (changed) {
 		settings.hooks = hooks;
-		await Bun.write(SETTINGS, `${JSON.stringify(settings, null, 2)}\n`);
+		await Bun.write(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`);
 	}
 
 	await registerMcp();
 
 	// Skill: recording protocol.
-	mkdirSync(SKILL_DIR, { recursive: true });
-	await Bun.write(join(SKILL_DIR, "SKILL.md"), skillMd());
+	mkdirSync(skillDir(), { recursive: true });
+	await Bun.write(join(skillDir(), "SKILL.md"), skillMd());
 
 	// An explicit integrate re-arms the automatic one after a `--remove`.
 	await saveConfig({ autoIntegrate: true });
@@ -280,7 +289,7 @@ export async function integrate(): Promise<IntegrationStatus> {
  */
 export async function autoIntegrate(version: string | null): Promise<IntegrationStatus | null> {
 	if (!loadConfig().autoIntegrate) return null;
-	if (!existsSync(CLAUDE_DIR)) return null;
+	if (!existsSync(claudeDir())) return null;
 	const { db } = openBrainDb();
 	const status = integrationStatus();
 	const complete = status.claudeMd && status.hook && status.skill && status.mcp;
@@ -292,14 +301,14 @@ export async function autoIntegrate(version: string | null): Promise<Integration
 
 export async function unintegrate(): Promise<IntegrationStatus> {
 	try {
-		const md = readFileSync(CLAUDE_MD, "utf-8");
+		const md = readFileSync(claudeMd(), "utf-8");
 		const cleaned = md.replace(new RegExp(`\\n?${BLOCK_BEGIN}[\\s\\S]*?${BLOCK_END}\\n?`), "\n").trimEnd();
-		await Bun.write(CLAUDE_MD, cleaned ? `${cleaned}\n` : "");
+		await Bun.write(claudeMd(), cleaned ? `${cleaned}\n` : "");
 	} catch {
 		/* nothing to clean */
 	}
 	try {
-		const settings = JSON.parse(readFileSync(SETTINGS, "utf-8")) as Record<string, unknown>;
+		const settings = JSON.parse(readFileSync(settingsPath(), "utf-8")) as Record<string, unknown>;
 		const hooks = (settings.hooks ?? {}) as Record<string, HookMatcher[]>;
 		const ours = new Set([...HOOKS.map((h) => h.command), LEGACY_HOOK_COMMAND]);
 		for (const event of new Set([...HOOKS.map((h) => h.event), "SessionStart"])) {
@@ -312,12 +321,12 @@ export async function unintegrate(): Promise<IntegrationStatus> {
 			else hooks[event] = pruned;
 		}
 		settings.hooks = hooks;
-		await Bun.write(SETTINGS, `${JSON.stringify(settings, null, 2)}\n`);
+		await Bun.write(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`);
 	} catch {
 		/* nothing to clean */
 	}
 	await unregisterMcp();
-	rmSync(SKILL_DIR, { recursive: true, force: true });
+	rmSync(skillDir(), { recursive: true, force: true });
 	// Removal is a decision: the daemon must not quietly wire everything back on its next start.
 	await saveConfig({ autoIntegrate: false });
 	return integrationStatus();
