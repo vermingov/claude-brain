@@ -58,10 +58,12 @@ your own cloud account.
 - **Cloud sync** — one-way mirror to your own **Dropbox**, **Google Drive**, or
   **MEGA** (via rclone; credentials stay in rclone on your machine). Dated remote
   trash folder protects against accidental deletions.
-- **Claude Code integration** — one click wires it in: the MCP server, recall-first
-  instructions, hooks that orient at session start, quietly cue relevant memory as you
-  work, and consolidate at session end, plus a recording skill so sessions save what
-  they learned as new notes.
+- **Claude Code integration, automatic** — the daemon wires itself in when it starts:
+  the MCP server, recall-first instructions, hooks that orient at session start,
+  quietly cue relevant memory as you work, and consolidate at session end, plus a
+  recording skill so sessions save what they learned as new notes. Upgrading the
+  package restarts the daemon, which brings all of that up to date; nothing to click.
+  `claude-brain integrate --remove` unwires it and stays unwired.
 
 ## Install
 
@@ -76,10 +78,10 @@ claude-brain                 # opens the brain UI in your browser
 ```
 
 First run: pick your vault location in **Settings** (detected Obsidian vaults are
-suggested), then click **Integrate with Claude Code** (or run `claude-brain integrate`).
-That registers the MCP server in `~/.claude.json` at user scope, installs the session
-hooks, and adds the recall-first instructions; restart Claude Code once to load the
-tools. Optional cloud sync:
+suggested). The Claude Code side is already done — the daemon registered the MCP
+server in `~/.claude.json` at user scope, installed the session hooks and added the
+recall-first instructions the moment it started; restart Claude Code once to load the
+tools. (`claude-brain integrate` does the same by hand.) Optional cloud sync:
 
 ```bash
 claude-brain sync setup dropbox   # or: gdrive, mega

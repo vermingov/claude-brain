@@ -6,7 +6,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config";
+import { loadConfig, saveConfig } from "./config";
+import { getMeta, openBrainDb, setMeta } from "./index-db";
 
 const CLAUDE_DIR = join(homedir(), ".claude");
 const CLAUDE_MD = join(CLAUDE_DIR, "CLAUDE.md");
@@ -263,7 +264,30 @@ export async function integrate(): Promise<IntegrationStatus> {
 	mkdirSync(SKILL_DIR, { recursive: true });
 	await Bun.write(join(SKILL_DIR, "SKILL.md"), skillMd());
 
+	// An explicit integrate re-arms the automatic one after a `--remove`.
+	await saveConfig({ autoIntegrate: true });
 	return integrationStatus();
+}
+
+/**
+ * The daemon wires Claude Code itself, so neither an upgrade nor a first start needs a
+ * step from the user: the package restarts the service, the service sees a version it
+ * has not integrated yet, and the MCP server, hooks, instructions and skill are brought
+ * up to date together. It runs as the user, which is why this lives here and not in the
+ * package's install script. Skipped when Claude Code has never run on this machine (no
+ * ~/.claude to wire into), and after `integrate --remove` — a decision that holds until
+ * the user runs `integrate` again.
+ */
+export async function autoIntegrate(version: string | null): Promise<IntegrationStatus | null> {
+	if (!loadConfig().autoIntegrate) return null;
+	if (!existsSync(CLAUDE_DIR)) return null;
+	const { db } = openBrainDb();
+	const status = integrationStatus();
+	const complete = status.claudeMd && status.hook && status.skill && status.mcp;
+	if (complete && getMeta(db, "integrated_version") === (version ?? "")) return null;
+	const next = await integrate();
+	setMeta(db, "integrated_version", version ?? "");
+	return next;
 }
 
 export async function unintegrate(): Promise<IntegrationStatus> {
@@ -294,6 +318,8 @@ export async function unintegrate(): Promise<IntegrationStatus> {
 	}
 	await unregisterMcp();
 	rmSync(SKILL_DIR, { recursive: true, force: true });
+	// Removal is a decision: the daemon must not quietly wire everything back on its next start.
+	await saveConfig({ autoIntegrate: false });
 	return integrationStatus();
 }
 

@@ -38,7 +38,7 @@ import { renderAffected, renderExplain, renderMap, renderPath } from "./src/grap
 import { indexStatus } from "./src/hybrid-search";
 import { openBrainDb, resetIndex } from "./src/index-db";
 import { reindex } from "./src/indexer";
-import { integrate, integrationStatus, unintegrate } from "./src/integrate";
+import { autoIntegrate, integrate, integrationStatus, unintegrate } from "./src/integrate";
 import { recall, recallMarkdown } from "./src/recall";
 import { digest, finishSession, prime } from "./src/session-memory";
 import type { EpisodeKind } from "./src/transcript";
@@ -765,6 +765,15 @@ const server = await listen();
 console.log(`claude-brain serving on http://localhost:${server.port}`);
 startWatcher();
 startSyncSchedule();
+// Wire Claude Code on any start that has something to wire — a fresh install, or the
+// first boot after an upgrade. Fire-and-forget; the server is up either way.
+void autoIntegrate(RUNNING_VERSION).then((status) => {
+	if (!status) return;
+	console.log(
+		`[integrate] Claude Code wired: mcp ${status.mcp}, hooks ${status.hook}, skill ${status.skill}, ` +
+			"instructions " + `${status.claudeMd} — restart Claude Code to load the MCP tools`,
+	);
+});
 
 // Drain any episodes captured while the server was down, then keep consolidating in
 // the background so a long-running daemon doesn't accumulate unabstracted history.

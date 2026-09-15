@@ -36,6 +36,8 @@ export interface BrainConfig {
 	sync: SyncConfig;
 	llm: LlmConfig;
 	designs: DesignsConfig;
+	/** The daemon wires Claude Code on start; `integrate --remove` turns this off. */
+	autoIntegrate: boolean;
 }
 
 const XDG_CONFIG = process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
@@ -57,6 +59,7 @@ const DEFAULTS: BrainConfig = {
 	sync: { provider: null, enabled: false, intervalMinutes: 30, remoteFolder: "ClaudeBrain" },
 	llm: { enabled: false, model: "haiku", dailyBudgetUsd: 2, binaryPath: null },
 	designs: { folder: "Design Library", autoExtract: true, copyImages: true },
+	autoIntegrate: true,
 };
 
 let current: BrainConfig | null = null;
