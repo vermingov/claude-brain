@@ -40,6 +40,24 @@ export function ago(ts: number, now = Date.now()): string {
 	return `${Math.round(delta / (30 * DAY))}mo ago`;
 }
 
+/**
+ * Say what kind of not-knowing this is. A cue the vault has no word for is a different
+ * answer from one it half covers, and both are different from a ranker that simply had
+ * nothing convincing — presenting all three the same way is how a search engine ends up
+ * sounding certain about a subject it has never seen.
+ */
+function caveat(hit: RecallHit, count: number): string {
+	const missing = hit.unknown ?? [];
+	const quoted = missing.map((word) => `"${word}"`).join(", ");
+	if (missing.length === 0) {
+		return `(weak match — nothing here answers this well; ${count === 1 ? "this is" : "these are"} the closest, not the vault's position)`;
+	}
+	if (hit.score < 0.1 && missing.length > 1) {
+		return `(no coverage — the vault has no note containing ${quoted}. What follows matched on the other words only.)`;
+	}
+	return `(partial match — no note here contains ${quoted}; what follows is about the rest of the question)`;
+}
+
 function noteHeader(h: RecallHit, index: number, now: number): string {
 	const where = h.heading && h.heading !== h.title ? `${h.title} › ${h.heading}` : h.title;
 	const via = h.via ? ` — recalled via ${h.via}` : "";
@@ -65,7 +83,8 @@ export function renderHits(hits: RecallHit[], query: string, now = Date.now()): 
 	const sections: string[] = [];
 	const corrected = hits.find((h) => h.corrected)?.corrected;
 	if (corrected) sections.push(`(searched as: ${corrected})`);
-	if (notes.some((h) => h.weak)) sections.push("(weak match — the vault may not cover this; treat these as guesses)");
+	const weak = notes.find((h) => h.weak);
+	if (weak) sections.push(caveat(weak, notes.length));
 	if (notes.length > 0) {
 		sections.push(
 			notes

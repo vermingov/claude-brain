@@ -21,7 +21,7 @@ import {
 import { clearPriming, indexStatus } from "./hybrid-search";
 import { getMeta, openBrainDb } from "./index-db";
 import { ago, recall } from "./recall";
-import { findTranscript, mineTranscript } from "./transcript";
+import { findTranscript, isSynthetic, mineTranscript } from "./transcript";
 
 /**
  * Injection threshold, calibrated against labelled prompts rather than guessed.
@@ -86,7 +86,7 @@ export interface PrimeOptions {
  */
 export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<string> {
 	const text = prompt.trim();
-	if (text.length < 25) return "";
+	if (text.length < 25 || isSynthetic(text)) return "";
 	ensureSession(sessionId, cwd);
 	// A null id means this exact prompt is already stored for this session — the user
 	// is repeating themselves, and so would the recall.
@@ -95,6 +95,9 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 
 	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, cwd, excludeSessionId: sessionId, via: "hook" });
 	if (hits.length === 0) return "";
+	// Whatever it scored: if the vault has no word for what was asked, it has nothing to
+	// offer, and injecting its best guess on every turn is how a brain becomes noise.
+	if (hits.some((hit) => hit.weak)) return "";
 	const best = Math.max(...hits.map((h) => h.score));
 	if (best < MIN_SCORE) return "";
 

@@ -35,7 +35,10 @@ import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
+import { findEpisodes, forgetEpisode } from "./src/episodic";
 import { asVia, subscribe } from "./src/events";
+import { guardToolCall } from "./src/guard";
+import { appendJournal, readNote } from "./src/vault-io";
 import { overview } from "./src/overview";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
@@ -43,6 +46,7 @@ import { openBrainDb, resetIndex } from "./src/index-db";
 import { reindex } from "./src/indexer";
 import { autoIntegrate, integrate, integrationStatus, unintegrate } from "./src/integrate";
 import { recall, recallMarkdown } from "./src/recall";
+import { noteServed, servedPaths } from "./src/hybrid-search";
 import { digest, finishSession, prime } from "./src/session-memory";
 import type { EpisodeKind } from "./src/transcript";
 import { configureSync, startSyncSchedule, syncNow, syncStatus } from "./src/sync";
@@ -716,7 +720,51 @@ const serveOptions = {
 			const noteId = url.searchParams.get("path");
 			if (!noteId) return jsonResponse({ error: "missing path" }, 400);
 			const detail = noteDetail(noteId);
-			return detail ? jsonResponse(detail) : jsonResponse({ error: "note not found" }, 404);
+			if (!detail) return jsonResponse({ error: "note not found" }, 404);
+			const session = url.searchParams.get("session");
+			if (session) noteServed(session, url.searchParams.get("cwd") ?? "", detail.node.id);
+			return jsonResponse(detail);
+		}
+
+		// The guard behind the PreToolUse hook: may this tool call touch the vault?
+		if (url.pathname === "/api/guard" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const str = (v: unknown) => (typeof v === "string" ? v : "");
+			const sessionId = str(body.sessionId);
+			return jsonResponse(
+				guardToolCall({
+					tool: str(body.tool),
+					input: (body.input ?? {}) as Record<string, unknown>,
+					vault: vaultRoot() ?? "",
+					served: servedPaths(sessionId),
+					isDirectory: (absolute) => {
+						try {
+							return statSync(absolute).isDirectory();
+						} catch {
+							return false;
+						}
+					},
+				}),
+			);
+		}
+
+		if (url.pathname === "/api/journal" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const str = (v: unknown) => (typeof v === "string" ? v : "");
+			return jsonResponse(await appendJournal(str(body.text), str(body.heading)));
+		}
+
+		if (url.pathname === "/api/episodes") {
+			const q = url.searchParams.get("q") ?? "";
+			if (!q.trim()) return jsonResponse({ error: "missing q" }, 400);
+			return jsonResponse({ episodes: findEpisodes(q, Number(url.searchParams.get("k") ?? "8") || 8) });
+		}
+
+		if (url.pathname === "/api/episodes/forget" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const id = typeof body.id === "number" ? body.id : Number(body.id);
+			if (!Number.isInteger(id)) return jsonResponse({ error: "missing id" }, 400);
+			return jsonResponse({ forgotten: forgetEpisode(id) });
 		}
 
 		if (url.pathname === "/api/designs" || url.pathname.startsWith("/api/designs/")) {

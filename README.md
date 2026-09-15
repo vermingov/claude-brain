@@ -9,17 +9,26 @@ your own cloud account.
 
 ## Features
 
-- **MCP server** — `claude-brain integrate` registers the brain as an MCP server, so
-  Claude Code calls `recall`, `remember`, `note`, `path`, `explain`, `affected`, `map`,
-  `status` and `consolidate` as tools: one JSON line each way, no shell, no process
-  start. The CLI does the same things from a terminal.
+- **MCP server, and the only way in** — `claude-brain integrate` registers the brain as
+  an MCP server: `recall` searches, `read` opens one note, `journal` writes the day's log,
+  `note` captures, `remember` keeps a constraint, `forget` retracts a memory that turned
+  out wrong, and `path` / `explain` / `affected` / `map` answer questions about structure.
+  A guard hook refuses `grep`, `glob` and directory listings inside the vault, and says
+  which call to make instead — searching by filename skips the embeddings and the graph,
+  leaves no record of what was retrieved, and reads far more than the answer. Writing to
+  the vault stays open; so does everything outside it. The CLI does the same things from
+  a terminal.
 - **Hybrid recall** — BM25 full-text (SQLite FTS5) + local semantic embeddings
   (all-MiniLM-L6-v2 via ONNX, 384-dim, sqlite-vec) fused with reciprocal-rank fusion,
   graph ranking boosts, best-section-per-note pooling. ~15 ms queries, finds notes by
   meaning ("laptop battery drains fast" → your power-tuning note). Results are trimmed
   to the lines that answer the question, not the whole section. A misspelt cue is
   corrected against the vault's own vocabulary, copies of the same note collapse into
-  one hit, and a result that matches nothing well says so instead of bluffing.
+  one hit, and a result that matches nothing well says so instead of bluffing — including
+  the case that looks most convincing, where a question about something the vault has
+  never heard of scores well because its other words are the vault's own jargon. Recall
+  names the words no note contains, and the always-on prompt hook stays quiet when they
+  are the words that carried the question.
 - **Episodic memory** — the brain also remembers *what happened*, not just what you
   wrote down. Past sessions are mined from Claude Code's own transcripts, so recall
   answers "have we hit this before" alongside "what do we know". Nothing episodic is

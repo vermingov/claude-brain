@@ -266,3 +266,54 @@ export function markInjected(sessionId: string, refs: string[], now = Date.now()
 }
 
 export type { DraftEpisode, EpisodeKind, MinedSession };
+
+export interface EpisodeMatch {
+	id: number;
+	kind: string;
+	ts: number;
+	text: string;
+	sessionId: string;
+}
+
+/**
+ * Episodes matching a phrase, newest first. For retracting something the brain recorded
+ * wrongly: you cannot correct a memory you cannot find.
+ */
+export function findEpisodes(query: string, limit = 8): EpisodeMatch[] {
+	const { db } = openBrainDb();
+	const terms = query
+		.toLowerCase()
+		.split(/[^\p{L}\p{N}]+/u)
+		.filter((t) => t.length > 1)
+		.map((t) => `"${t}"`);
+	if (terms.length === 0) return [];
+	const search = (match: string) => {
+		try {
+			return db
+				.query(
+					`SELECT e.id, e.kind, e.ts, e.text, e.session_id AS sessionId FROM episodes_fts f
+					 JOIN episodes e ON e.id = f.rowid WHERE episodes_fts MATCH ? ORDER BY e.ts DESC LIMIT ?`,
+				)
+				.all(match, limit) as EpisodeMatch[];
+		} catch {
+			return [];
+		}
+	};
+	// Retracting a memory means finding the one memory, so every word has to be in it
+	// before any word will do.
+	const all = search(terms.join(" "));
+	return all.length > 0 ? all : search(terms.join(" OR "));
+}
+
+/** Remove one episode and everything that indexes it. Returns false if it was already gone. */
+export function forgetEpisode(id: number): boolean {
+	const { db, vectors } = openBrainDb();
+	const row = db.query("SELECT 1 FROM episodes WHERE id = ?").get(id);
+	if (!row) return false;
+	db.transaction(() => {
+		db.query("DELETE FROM episodes_fts WHERE rowid = ?").run(id);
+		if (vectors) db.query("DELETE FROM vec_episodes WHERE episode_id = ?").run(id);
+		db.query("DELETE FROM episodes WHERE id = ?").run(id);
+	})();
+	return true;
+}

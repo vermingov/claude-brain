@@ -316,6 +316,43 @@ async function cmdDesign(rest: string[]): Promise<void> {
 	process.exit(1);
 }
 
+/**
+ * Retract something the brain recorded wrongly. Two steps on purpose: a query lists what
+ * matches with its ids, an id deletes that one. Only episodic memory — the vault is the
+ * user\'s and nothing here touches it.
+ */
+async function cmdForget(rest: string[]): Promise<void> {
+	const idIndex = rest.indexOf("--id");
+	if (idIndex !== -1) {
+		const id = Number(rest[idIndex + 1]);
+		if (!Number.isInteger(id)) {
+			console.error("claude-brain forget --id <number>");
+			process.exit(1);
+		}
+		await ensureServer();
+		const res = await postJson("/api/episodes/forget", { id });
+		const out = res ? ((await res.json()) as { forgotten: boolean }) : { forgotten: false };
+		console.log(out.forgotten ? `forgotten: episode ${id}` : `episode ${id} was already gone`);
+		return;
+	}
+	const query = rest.join(" ").trim();
+	if (!query) {
+		console.error('claude-brain forget "<what the wrong memory says>"   then: claude-brain forget --id <id>');
+		process.exit(1);
+	}
+	await ensureServer();
+	const res = await api(`/api/episodes?q=${encodeURIComponent(query)}`);
+	const out = res ? ((await res.json()) as { episodes: Array<{ id: number; kind: string; ts: number; text: string }> }) : { episodes: [] };
+	if (out.episodes.length === 0) {
+		console.log(`no memory matches: ${query}`);
+		return;
+	}
+	for (const episode of out.episodes) {
+		console.log(`${String(episode.id).padStart(6)}  [${episode.kind}, ${new Date(episode.ts).toISOString().slice(0, 10)}] ${episode.text.slice(0, 120)}`);
+	}
+	console.log("\ndrop one with:  claude-brain forget --id <id>");
+}
+
 async function cmdConsolidate(rest: string[]): Promise<void> {
 	const days = Number(rest[0] ?? "30") || 30;
 	const res = await postJson(`/api/consolidate?days=${days}`, {});
@@ -331,6 +368,29 @@ interface HookPayload {
 	session_id?: string;
 	cwd?: string;
 	prompt?: string;
+	tool_name?: string;
+	tool_input?: Record<string, unknown>;
+}
+
+/**
+ * The guard, as Claude Code's PreToolUse hook. Printing nothing lets the call through, so
+ * every failure — no daemon, no vault, a timeout — is an allow. A brain that can block
+ * the session it is trying to help is worse than no brain.
+ */
+async function guardToolCall(payload: HookPayload, sessionId: string, cwd: string): Promise<void> {
+	const res = await postJson("/api/guard", { tool: payload.tool_name ?? "", input: payload.tool_input ?? {}, sessionId, cwd });
+	if (!res) return;
+	const decision = (await res.json()) as { allow?: boolean; reason?: string };
+	if (decision.allow !== false || !decision.reason) return;
+	console.log(
+		JSON.stringify({
+			hookSpecificOutput: {
+				hookEventName: "PreToolUse",
+				permissionDecision: "deny",
+				permissionDecisionReason: decision.reason,
+			},
+		}),
+	);
 }
 
 /**
@@ -347,6 +407,11 @@ async function cmdHook(event: string): Promise<void> {
 	}
 	const sessionId = payload.session_id ?? sessionIdFromEnv() ?? "";
 	const cwd = payload.cwd ?? process.cwd();
+	// The guard runs before the session has a row of its own, so it does not wait for one.
+	if (event === "pre-tool") {
+		await guardToolCall(payload, sessionId, cwd);
+		return;
+	}
 	if (!sessionId) return;
 
 	if (event === "session-start") {
@@ -495,6 +560,9 @@ switch (cmd) {
 	case "design":
 		await cmdDesign(rest);
 		break;
+	case "forget":
+		await cmdForget(rest);
+		break;
 	case "consolidate":
 		await cmdConsolidate(rest);
 		break;
@@ -529,6 +597,8 @@ switch (cmd) {
   claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
   claude-brain remember "<text>" [-k decision|preference|outcome]
                                      store a durable fact in episodic memory
+  claude-brain forget "<text>" | --id <id>
+                                     retract a memory the brain got wrong
 
  structure
   claude-brain path "<from>" "<to>"  how two notes connect

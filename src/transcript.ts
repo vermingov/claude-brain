@@ -61,8 +61,14 @@ function clip(text: string, max = MAX_TEXT): string {
 	return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
-function isSynthetic(text: string): boolean {
-	return MACHINERY_TAG.test(text) || SYNTHETIC_PREFIXES.some((p) => text.startsWith(p));
+/**
+ * Not a human asking for something: a slash command, a hook's own output, a task
+ * notification, an interrupted-request marker. The transcript miner has always skipped
+ * these; the live prompt hook must skip the same ones, or every notification the harness
+ * sends becomes a memory of the user saying it.
+ */
+export function isSynthetic(text: string): boolean {
+	return MACHINERY_TAG.test(text.trimStart()) || SYNTHETIC_PREFIXES.some((p) => text.startsWith(p));
 }
 
 /** User turns arrive either as a bare string or as content blocks mixed with tool results. */

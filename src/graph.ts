@@ -149,6 +149,35 @@ function semanticEdges(): Array<[number, number, number]> {
 	return out;
 }
 
+/**
+ * A note nothing connects to is a note the graph cannot answer for: it has no path to
+ * anything, `affected` never reaches it, and spreading activation never arrives. Quick
+ * captures land that way — written in a hurry, wikilinked to nothing, and too unlike
+ * anything else to clear the similarity floor. Each one gets its single best match
+ * anyway, at whatever cosine it managed, so every note is reachable from somewhere.
+ */
+function rescueIsolated(docs: DocRow[], edges: Array<[number, number, number]>, connected: Set<number>): Array<[number, number, number]> {
+	const centroids = [...docCentroids().entries()];
+	if (centroids.length < 2) return [];
+	const extra: Array<[number, number, number]> = [];
+	for (const [docId, vec] of centroids) {
+		if (connected.has(docId)) continue;
+		let bestId = -1;
+		let bestScore = -1;
+		for (const [otherId, otherVec] of centroids) {
+			if (otherId === docId) continue;
+			const score = cosine(vec, otherVec);
+			if (score > bestScore) {
+				bestScore = score;
+				bestId = otherId;
+			}
+		}
+		if (bestId === -1) continue;
+		extra.push(docId < bestId ? [docId, bestId, bestScore] : [bestId, docId, bestScore]);
+	}
+	return extra;
+}
+
 /** Notes sharing a tag specific enough to mean something, weighted by that tag's rarity. */
 function tagEdges(): Array<[number, number, string, number]> {
 	const { db } = openBrainDb();
@@ -208,6 +237,8 @@ export interface DerivedStats {
 	tag: number;
 	timeline: number;
 	cooccur: number;
+	/** Notes that had no edge at all and were given their nearest neighbour. */
+	rescued: number;
 }
 
 /**
@@ -226,6 +257,26 @@ export function rebuildDerivedEdges(): DerivedStats {
 	const timeline = timelineEdges(docs);
 	const cooccur = cooccurEdges();
 
+	const connected = new Set<number>();
+	for (const [a, b] of [...semantic, ...cooccur]) {
+		connected.add(a);
+		connected.add(b);
+	}
+	for (const [a, b] of tag) {
+		connected.add(a);
+		connected.add(b);
+	}
+	for (const [a, b] of timeline) {
+		connected.add(a);
+		connected.add(b);
+	}
+	for (const row of db.query("SELECT source_doc, target_doc FROM links").all() as Array<{ source_doc: number; target_doc: number }>) {
+		connected.add(row.source_doc);
+		connected.add(row.target_doc);
+	}
+	const rescued = rescueIsolated(docs, semantic, connected);
+	semantic.push(...rescued);
+
 	db.transaction(() => {
 		db.run("DELETE FROM derived_links");
 		const insert = db.query(
@@ -237,7 +288,7 @@ export function rebuildDerivedEdges(): DerivedStats {
 		for (const [a, b, n] of cooccur) insert.run(a, b, "cooccur", EDGE_WEIGHT.cooccur!, `recalled together in ${n} sessions`);
 	})();
 
-	return { semantic: semantic.length, tag: tag.length, timeline: timeline.length, cooccur: cooccur.length };
+	return { semantic: semantic.length, tag: tag.length, timeline: timeline.length, cooccur: cooccur.length, rescued: rescued.length };
 }
 
 export interface WeightedEdge {

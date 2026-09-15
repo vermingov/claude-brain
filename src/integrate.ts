@@ -33,10 +33,18 @@ const BLOCK_END = "<!-- claude-brain:end -->";
  * prompt, consolidate at the end. Every one ends in `|| true` so a stopped server or an
  * unmounted vault can never fail the session it is trying to help.
  */
-const HOOKS: Array<{ event: string; command: string; timeout: number }> = [
+const HOOKS: Array<{ event: string; command: string; timeout: number; matcher?: string }> = [
 	{ event: "SessionStart", command: "claude-brain hook session-start 2>/dev/null || true", timeout: 10 },
 	{ event: "UserPromptSubmit", command: "claude-brain hook prompt 2>/dev/null || true", timeout: 8 },
 	{ event: "SessionEnd", command: "claude-brain hook session-end 2>/dev/null || true", timeout: 20 },
+	// The guard. Only the tools that can rummage through the vault are matched, and it
+	// answers with nothing at all unless the call is one it refuses.
+	{
+		event: "PreToolUse",
+		matcher: "Read|Grep|Glob|LS|Bash|NotebookRead",
+		command: "claude-brain hook pre-tool 2>/dev/null || true",
+		timeout: 5,
+	},
 ];
 /** Pre-0.2 single hook. Removed on re-integration so an upgrade doesn't double up. */
 const LEGACY_HOOK_COMMAND = "claude-brain context 2>/dev/null || true";
@@ -46,8 +54,9 @@ function claudeMdBlock(): string {
 	return `${BLOCK_BEGIN}
 # claude-brain (always on)
 A personal second brain (markdown vault) is connected — persistent memory across every session. It is reachable two ways that do the same thing: the \`claude-brain\` MCP tools (\`recall\`, \`remember\`, \`note\`, \`path\`, \`explain\`, \`affected\`, \`map\`, \`status\`, \`consolidate\`) and the \`claude-brain\` CLI. Prefer the tools when they are loaded: no shell, no process start.
-- **Remember, don't ingest.** Do NOT read the vault wholesale. Look things up with the \`recall\` tool (CLI: \`claude-brain recall "<query>"\`) — hybrid search (BM25 + local embeddings + graph boost) returning only the answering lines of each matching note. Works semantically: describe the symptom, exact keywords not required; a misspelt cue is corrected against the vault's own vocabulary. \`full\` widens a hit to its whole section.
-- **Before debugging or starting work**, \`recall\` the topic or symptom first. Use returned paths to read only the specific note if more context is needed. A result that opens with "(weak match …)" found nothing the vault covers well — do not treat it as fact.
+- **The tools are the only way into the vault.** Never \`grep\`, \`glob\`, \`ls\` or otherwise walk the vault directory — a guard hook refuses it, because searching by filename skips the embeddings, the graph and the record of what was retrieved, and reads far more than the answer. Search with \`recall\`; open one note with \`read\`; write the day's log with \`journal\`; capture with \`note\`; keep a constraint with \`remember\`; retract a wrong memory with \`forget\`.
+- **Remember, don't ingest.** Look things up with the \`recall\` tool (CLI: \`claude-brain recall "<query>"\`) — hybrid search (BM25 + local embeddings + graph boost) returning only the answering lines of each matching note. Works semantically: describe the symptom, exact keywords not required; a misspelt cue is corrected against the vault's own vocabulary. \`full\` widens a hit to its whole section.
+- **Before debugging or starting work**, \`recall\` the topic or symptom first, then \`read\` the specific note if you need more than the answering lines. A result that opens with "(weak match …)" found nothing the vault covers well — it names the words no note contains. Do not treat it as fact, and say so rather than presenting a guess as memory.
 - **Two memory systems.** Vault notes are *semantic* memory (curated, what's true). Past sessions are *episodic* memory (automatic, what happened) — mined from Claude Code's own transcripts, so recall answers "have we hit this before" as well as "what do we know". Episodes appear under \`## Episodic\` and live only in the local index, never in the vault. Retrieval strengthens what it returns; a note says when another session last used it; unrehearsed prompts fade after ~4 weeks (tool failures ~7), while anything recalled once, and every \`remember\`, stays.
 - **\`remember\` tool** (CLI: \`claude-brain remember "<text>" -k decision|preference|outcome\`) for a durable constraint that isn't note-shaped ("deploy from main only, never a tag").
 - **Structure questions** use the graph, rebuilt automatically in ~100 ms — no LLM, never stale. Tools \`path\` / \`explain\` / \`affected\` / \`map\`, or the CLI below; arguments accept plain English, not just exact titles:
@@ -74,13 +83,22 @@ description: >
   debugging, planning, or research task.
 ---
 
+# The vault is reached through these tools, never through the filesystem
+
+\`recall\` searches it, \`read\` opens one note, \`journal\` writes the day's log, \`note\`
+captures a thought, \`remember\` keeps a constraint, \`forget\` retracts a wrong memory,
+and \`path\` / \`explain\` / \`affected\` / \`map\` answer questions about structure. A
+guard hook refuses \`grep\`, \`glob\` and directory listings inside the vault: they skip
+the embeddings and the graph, leave no record of what was retrieved, and read far more
+than the answer.
+
 # Recall (start of work)
 
-Call the \`recall\` tool (CLI: \`claude-brain recall "<query>"\`) before debugging or
-building — it searches the user's vault *and* past sessions, returning only the
-answering lines. Prefer it over re-deriving knowledge the vault already holds. Ask for
-\`full\` when you need a whole section rather than the matching lines. A result that
-opens with "(weak match …)" is the ranker's least-bad guess, not knowledge.
+Call \`recall\` before debugging or building — it searches the user's vault *and* past
+sessions, returning only the answering lines. Prefer it over re-deriving knowledge the
+vault already holds. Ask for \`full\` when you need a whole section. A result that opens
+with "(weak match …)" is the ranker's least-bad guess and names the words no note
+contains; say that rather than dressing a guess up as memory.
 
 # Designs the user saved
 
@@ -112,8 +130,8 @@ instead of searching. All of these accept plain English, not just exact titles:
 Before ending a session with meaningful work, record into the vault (location:
 \`claude-brain status\` shows the vault path; all files are markdown):
 
-1. **Work log** — append-or-create \`Journal/YYYY-MM-DD.md\` with a short dated
-   section: what was done, decisions made, open ends.
+1. **Work log** — the \`journal\` tool appends to today's entry, creating it if this is
+   the first thing written today: what was done, decisions made, open ends.
 2. **Solved bug / gotcha** — atomic note in \`Notes/<domain>/\` named after the
    symptom: Symptom / Root cause / Fix. Link related notes with \`[[wikilinks]]\`.
 3. **Quick capture** — \`claude-brain note "<text>" [-f <subfolder>]\` drops a
@@ -255,10 +273,10 @@ export async function integrate(): Promise<IntegrationStatus> {
 		if (pruned.length !== hooks.SessionStart.length) changed = true;
 		hooks.SessionStart = pruned;
 	}
-	for (const { event, command, timeout } of HOOKS) {
+	for (const { event, command, timeout, matcher } of HOOKS) {
 		const matchers: HookMatcher[] = hooks[event] ?? [];
 		if (matchers.some((m) => m.hooks?.some((h) => h.command === command))) continue;
-		matchers.push({ hooks: [{ type: "command", command, timeout }] });
+		matchers.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, timeout }] });
 		hooks[event] = matchers;
 		changed = true;
 	}

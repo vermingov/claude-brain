@@ -82,6 +82,23 @@ export function editDistance(a: string, b: string, max = MAX_DISTANCE): number {
 }
 
 /**
+ * How many chunks contain a term, counting a stem as the word: 0 means the vault has
+ * never used it. A query whose rare words are all zeroes is about something this brain
+ * has no notes on, however well its common words happen to score.
+ */
+export function termFrequency(term: string): number {
+	const bucket = vocabulary().get(term[0]!);
+	if (!bucket) return 0;
+	let best = 0;
+	for (const entry of bucket) {
+		const gap = term.length - entry.term.length;
+		const stem = (gap >= 0 && gap <= MAX_STEM_GAP && term.startsWith(entry.term)) || (gap < 0 && entry.term.startsWith(term));
+		if (stem && entry.df > best) best = entry.df;
+	}
+	return best;
+}
+
+/**
  * The vault's nearest term to `term`, or null when the term is already known or nothing
  * lies within two edits. "Known" allows for stemming: the index holds `tailscal`, the
  * query says `tailscale`, and that is a match, not a misspelling. Ties go to the more

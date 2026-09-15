@@ -15,7 +15,7 @@ import { EDGE_WEIGHT } from "./graph";
 import { EMBED_DIM, openBrainDb } from "./index-db";
 import { focusSnippet } from "./snippet";
 import { spreadActivation } from "./spreading";
-import { correctTerms } from "./vocab";
+import { correctTerms, termFrequency } from "./vocab";
 
 export interface RecallHit {
 	kind: "note" | "episode";
@@ -39,6 +39,8 @@ export interface RecallHit {
 	corrected?: string;
 	/** Neither arm was sure: the notes here are the ranker's least-bad guesses. */
 	weak?: boolean;
+	/** Words in the cue that appear in no note at all. Their absence is the tell. */
+	unknown?: string[];
 }
 
 export interface RecallOptions {
@@ -138,6 +140,18 @@ const TEMPORAL_BOOST = 1.3;
 export const WEAK_SCORE = 0.095;
 /** BM25 lead of the top row over the runner-up that counts as the lexical arm being sure. */
 const LEXICAL_MARGIN = 1.5;
+/**
+ * How much of a cue's meaning the vault can even represent, by rarity.
+ *
+ * A high score is not the same as an answer. "Helm chart values cluster" scored 0.145 on
+ * a vault with no Kubernetes in it, higher than a genuinely covered question, because
+ * three of its four words are this vault's own jargon — charts, values, clusters — and
+ * only the rare one, the one that carried the actual subject, was missing. Scored by
+ * inverse document frequency, that cue is mostly absent, and saying so is the difference
+ * between a search engine and a brain that knows what it does not know.
+ */
+const MIN_COVERAGE = 0.7;
+const MIN_COVERAGE_TERM = 3;
 
 const STOPWORDS = new Set(
 	("the a an and or of for to in on with is are was were be been it its this that then than how why what when " +
@@ -159,6 +173,36 @@ export function queryTerms(query: string): string[] {
 	// function words and bare numbers go first, then the tail is cut.
 	const content = terms.filter((term) => !STOPWORDS.has(term) && !/^\d+$/.test(term));
 	return (content.length > 0 ? content : terms).slice(0, MAX_TERMS);
+}
+
+export interface Coverage {
+	/** 0..1 of the cue's rarity-weighted words the vault has any note for. */
+	covered: number;
+	/** The words it has none for, rarest first. */
+	unknown: string[];
+}
+
+/**
+ * What share of a cue the vault could answer at all. Common words carry little weight —
+ * every vault has "the" and most have "error" — so a missing rare word costs far more
+ * than a missing common one.
+ */
+export function queryCoverage(terms: string[], corpusSize: number): Coverage {
+	const content = terms.filter((term) => term.length >= MIN_COVERAGE_TERM && !STOPWORDS.has(term));
+	if (content.length === 0) return { covered: 1, unknown: [] };
+	let total = 0;
+	let known = 0;
+	const unknown: Array<{ term: string; weight: number }> = [];
+	for (const term of content) {
+		const frequency = termFrequency(term);
+		// Rarity, bounded: an unknown word weighs as much as the rarest known one.
+		const weight = Math.log1p(corpusSize / (1 + frequency));
+		total += weight;
+		if (frequency > 0) known += weight;
+		else unknown.push({ term, weight });
+	}
+	unknown.sort((a, b) => b.weight - a.weight);
+	return { covered: total === 0 ? 1 : known / total, unknown: unknown.map((u) => u.term) };
 }
 
 function ftsMatch(terms: string[], mode: "and" | "or"): string {
@@ -644,6 +688,29 @@ function recordRecalls(sessionId: string, cwd: string, docIds: number[], now = D
 	})();
 }
 
+/**
+ * A note handed over by the brain — through `read`, not through a search. It counts as a
+ * retrieval like any other: it strengthens the trace, and it is what tells the guard this
+ * session came by the note honestly.
+ */
+export function noteServed(sessionId: string, cwd: string, path: string): void {
+	const { db } = openBrainDb();
+	const row = db.query("SELECT id FROM docs WHERE path = ?").get(path) as { id: number } | null;
+	if (!row) return;
+	recordRecalls(sessionId, cwd, [row.id]);
+	strengthen([row.id], []);
+}
+
+/** Vault paths the brain has handed this session, for the guard. */
+export function servedPaths(sessionId: string): Set<string> {
+	const { db } = openBrainDb();
+	if (!sessionId) return new Set();
+	const rows = db
+		.query("SELECT d.path FROM recalls r JOIN docs d ON d.id = r.doc_id WHERE r.session_id = ?")
+		.all(sessionId) as Array<{ path: string }>;
+	return new Set(rows.map((r) => r.path));
+}
+
 /** When another session last retrieved each note, and from where. */
 function lastUsedFor(docIds: number[], sessionId: string | undefined): Map<number, { ts: number; cwd: string }> {
 	const out = new Map<number, { ts: number; cwd: string }>();
@@ -736,7 +803,14 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	// Corrected stems still steer the snippet: its line scorer matches on prefixes.
 	const snippetCue = corrected ? `${query} ${corrected.join(" ")}` : query;
 	const correctedCue = corrected?.join(" ");
-	const weak = topNotes.length > 0 && topNotes[0]!.score < WEAK_SCORE && !lexical.confident;
+	const { db } = openBrainDb();
+	const chunks = (db.query("SELECT count(*) AS n FROM chunks").get() as { n: number }).n;
+	const coverage = queryCoverage(terms, chunks);
+	// Two ways to be unsure, and coverage overrules the ranker: a confident-looking score
+	// assembled out of the vault's own vocabulary is exactly the case worth catching.
+	const weak =
+		topNotes.length > 0 && (coverage.covered < MIN_COVERAGE || (topNotes[0]!.score < WEAK_SCORE && !lexical.confident));
+	const unknown = coverage.unknown.length > 0 ? coverage.unknown.slice(0, 4) : undefined;
 	const noteHits: RecallHit[] = topNotes.map((c) => {
 		const focused = focusSnippet(c.text, snippetCue, budget);
 		const solution = solutions.get(c.docId);
@@ -755,6 +829,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 			lastUsed: lastUsed.get(c.docId),
 			corrected: correctedCue,
 			weak,
+			unknown,
 		};
 	});
 	const episodeHits: RecallHit[] = episodes.map((e) => ({
