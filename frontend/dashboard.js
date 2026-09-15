@@ -1,121 +1,116 @@
 import { createBrainTab } from "./brain.js";
 import { createDesignsTab } from "./designs.js";
+import { createHomeTab } from "./home.js";
 import { createSettingsTab } from "./settings.js";
+import { el, text } from "./ui.js";
 
 // Tab registry. Controllers are created lazily on first activation.
 const TABS = [
-	{ id: "brain", label: "Brain", make: createBrainTab, icon: iconBrain },
-	{ id: "designs", label: "Designs", make: createDesignsTab, icon: iconDesigns },
-	{ id: "settings", label: "Settings", make: createSettingsTab, icon: iconSettings },
+	{ id: "home", label: "Home", make: createHomeTab },
+	{ id: "brain", label: "Brain", make: createBrainTab },
+	{ id: "designs", label: "Designs", make: createDesignsTab },
+	{ id: "settings", label: "Settings", make: createSettingsTab },
 ];
 
-function iconBrain() {
-	return '<svg viewBox="0 0 22 22" fill="none"><circle cx="6" cy="7" r="2.3" stroke="currentColor" stroke-width="1.4"/><circle cx="15.5" cy="5.5" r="1.8" stroke="currentColor" stroke-width="1.4"/><circle cx="14" cy="15" r="2.1" stroke="currentColor" stroke-width="1.4"/><circle cx="6.5" cy="15.5" r="1.6" stroke="currentColor" stroke-width="1.4"/><path d="M8 8l6 6M8 7.5l6-1.4M8.2 14l4.6 1" stroke="currentColor" stroke-width="1.2" opacity=".7"/></svg>';
-}
-function iconDesigns() {
-	return '<svg viewBox="0 0 22 22" fill="none"><rect x="3" y="4" width="16" height="12" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M3 13l3.6-3.2a1.4 1.4 0 0 1 1.9 0L12 13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="14.4" cy="8.4" r="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M7 19h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity=".6"/></svg>';
-}
-function iconSettings() {
-	return '<svg viewBox="0 0 22 22" fill="none"><circle cx="11" cy="11" r="3" stroke="currentColor" stroke-width="1.4"/><path d="M11 2.8v2.4M11 16.8v2.4M19.2 11h-2.4M5.2 11H2.8M16.8 5.2l-1.7 1.7M6.9 15.1l-1.7 1.7M16.8 16.8l-1.7-1.7M6.9 6.9L5.2 5.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>';
-}
+const WORDMARK =
+	'<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="7" cy="8" r="3" fill="currentColor"/><circle cx="17" cy="6.5" r="2.2" fill="currentColor" opacity=".7"/><circle cx="15.5" cy="17" r="2.6" fill="currentColor" opacity=".85"/><path d="M9.4 9.6l4.5 5.8M9.6 8l5-1M14 8.6l1.2 5.8" stroke="currentColor" stroke-width="1.1" opacity=".5"/></svg>';
 
 // An upgrade leaves the old server serving the new dashboard, so the page calls
 // routes that version does not have and shows a bare "request failed (404)". The
 // server can see the mismatch (what booted vs what is on disk now); surface it
 // once, globally, because it breaks every tab rather than any particular one.
-async function warnIfStale(app) {
-	let status;
-	try {
-		status = await (await fetch("/api/status")).json();
-	} catch {
-		return;
-	}
-	if (!status?.stale) return;
-	const bar = document.createElement("div");
-	bar.className = "stale-banner";
-	bar.textContent =
+function staleBanner(status) {
+	if (!status?.stale) return null;
+	return text(
+		"div",
+		"stale-banner",
 		`claude-brain ${status.installedVersion} is installed but version ${status.version} is still running. ` +
-		"Restart it so the dashboard and the server agree:  systemctl --user restart claude-brain";
-	app.prepend(bar);
+			"Restart it so the dashboard and the server agree:  systemctl --user restart claude-brain",
+	);
 }
 
 function build() {
 	const app = document.getElementById("app");
 	app.innerHTML = "";
-	warnIfStale(app);
 
-	const rail = document.createElement("aside");
-	rail.id = "rail";
-	rail.innerHTML =
-		'<div class="rail-logo" title="claude-brain">' +
-		'<svg viewBox="0 0 24 24" fill="none"><circle cx="7" cy="8" r="3" fill="#7dd3fc"/><circle cx="17" cy="6.5" r="2.2" fill="#a78bfa"/><circle cx="15.5" cy="17" r="2.6" fill="#34d399"/><path d="M9.4 9.6l4.5 5.8M9.6 8l5-1M14 8.6l1.2 5.8" stroke="#4c5470" stroke-width="1"/></svg>' +
-		"</div>";
+	const bar = el("header", "topbar");
+	const brand = el("div", "brand", `${WORDMARK}<span>claude-brain</span>`);
+	// Navigation is a radio group with a growing underline, after 3bdel3ziz-T (Uiverse, MIT).
+	const nav = el("nav", "nav");
+	const health = el("div", "health");
+	bar.append(brand, nav, health);
 
-	const nav = document.createElement("nav");
-	nav.className = "rail-nav";
-	const indicator = document.createElement("div");
-	indicator.className = "rail-indicator";
-	nav.appendChild(indicator);
+	const view = el("main", "view");
+	app.append(bar, view);
 
-	const view = document.createElement("main");
-	view.id = "view";
-
-	const btns = {};
+	const inputs = {};
 	const panels = {};
 	const controllers = {};
+	let active = null;
 
 	for (const tab of TABS) {
-		const btn = document.createElement("button");
-		btn.className = "rail-tab";
-		btn.dataset.tab = tab.id;
-		btn.innerHTML = `<span class="rail-icon">${tab.icon()}</span><span class="rail-label">${tab.label}</span>`;
-		btn.addEventListener("click", () => activate(tab.id));
-		nav.appendChild(btn);
-		btns[tab.id] = btn;
+		const label = el("label", "nav-item");
+		const input = el("input");
+		input.type = "radio";
+		input.name = "tab";
+		input.value = tab.id;
+		input.onchange = () => activate(tab.id);
+		label.append(input, text("span", null, tab.label));
+		nav.appendChild(label);
+		inputs[tab.id] = input;
 
-		const panel = document.createElement("section");
-		panel.className = "tab-panel";
+		const panel = el("section", "tab-panel");
 		panel.dataset.tab = tab.id;
 		view.appendChild(panel);
 		panels[tab.id] = panel;
 	}
 
-	rail.appendChild(nav);
-	app.appendChild(rail);
-	app.appendChild(view);
-
-	let active = null;
-
-	function moveIndicator(id) {
-		const index = TABS.findIndex((t) => t.id === id);
-		indicator.style.transform = `translateY(${index * 100}%)`;
-	}
+	const handlers = {
+		openBrain(path) {
+			activate("brain");
+			controllers.brain.open?.(path);
+		},
+	};
 
 	function activate(id) {
 		if (active === id) return;
 		if (active) {
 			controllers[active]?.hide?.();
 			panels[active].classList.remove("active");
-			btns[active].classList.remove("active");
 		}
-		if (!controllers[id]) {
-			const def = TABS.find((t) => t.id === id);
-			controllers[id] = def.make(panels[id]);
-		}
+		if (!controllers[id]) controllers[id] = TABS.find((t) => t.id === id).make(panels[id], handlers);
 		panels[id].classList.add("active");
-		btns[id].classList.add("active");
-		moveIndicator(id);
+		inputs[id].checked = true;
 		controllers[id].show?.();
 		active = id;
 		history.replaceState(null, "", `#${id}`);
+	}
+
+	function renderHealth(status) {
+		health.innerHTML = "";
+		const dot = el("span", `health-dot ${status?.vaultReady ? "ok" : "warn"}`);
+		const label = text(
+			"span",
+			null,
+			status?.vault ? (status.vaultReady ? status.vault.split("/").filter(Boolean).pop() : "vault not reachable") : "no vault yet",
+		);
+		health.append(dot, label);
 	}
 
 	// First run (no vault yet) lands on Settings so the user picks a location.
 	const fromHash = TABS.some((t) => `#${t.id}` === location.hash) ? location.hash.slice(1) : null;
 	fetch("/api/status")
 		.then((r) => r.json())
-		.then((s) => activate(fromHash ?? (s.vault ? "brain" : "settings")))
-		.catch(() => activate(fromHash ?? "brain"));
+		.then((status) => {
+			renderHealth(status);
+			const banner = staleBanner(status);
+			if (banner) app.prepend(banner);
+			activate(fromHash ?? (status.vault ? "home" : "settings"));
+		})
+		.catch(() => {
+			renderHealth(null);
+			activate(fromHash ?? "home");
+		});
 
 	const boot = document.getElementById("boot");
 	if (boot) {
@@ -124,8 +119,5 @@ function build() {
 	}
 }
 
-if (document.readyState === "loading") {
-	document.addEventListener("DOMContentLoaded", build);
-} else {
-	build();
-}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", build);
+else build();

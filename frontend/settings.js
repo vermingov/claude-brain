@@ -46,7 +46,7 @@ export function createSettingsTab(container) {
 
 	/**
 	 * An on/off control that reads as one: a switch, not a button whose label flips.
-	 * Switch styling adapted from Uiverse (alfoly1988, MIT).
+	 * The squish switch, after elijahgummer (Uiverse, MIT).
 	 */
 	function toggle(label, checked, onChange) {
 		const wrap = el("label", "switch");
@@ -133,14 +133,20 @@ export function createSettingsTab(container) {
 		);
 		const sync = status.sync;
 
-		const providers = el("div", "sync-providers");
+		// A radio pill with a growing underline, after 3bdel3ziz-T (Uiverse, MIT).
+		const providers = el("div", "radio-pill");
 		for (const p of PROVIDERS) {
-			const b = el("button", `settings-btn ${sync.provider === p.id ? "primary" : "ghost"}`, p.label);
-			b.onclick = async () => {
+			const label = el("label", "radio-item");
+			const input = el("input");
+			input.type = "radio";
+			input.name = "provider";
+			input.checked = sync.provider === p.id;
+			input.onchange = async () => {
 				await api("/api/sync/config", { provider: p.id });
 				await refresh();
 			};
-			providers.appendChild(b);
+			label.append(input, el("span", null, p.label));
+			providers.appendChild(label);
 		}
 		s.appendChild(providers);
 

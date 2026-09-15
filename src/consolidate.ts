@@ -141,9 +141,10 @@ export function consolidate(sinceDays = 14): ConsolidationReport {
 	// left it at 5 MB. Truncating here is safe — the server is the only writer.
 	db.run("PRAGMA wal_checkpoint(TRUNCATE)");
 	const proposals = findRecurring();
-	// Counted into the SessionStart digest, where someone will actually see it; the
-	// SessionEnd hook's stderr is read by nobody.
+	// Kept for the SessionStart digest and the dashboard, where someone will actually see
+	// them; the SessionEnd hook's stderr is read by nobody.
 	setMeta(db, "proposals", String(proposals.length));
+	setMeta(db, "proposals_json", JSON.stringify(proposals));
 	// Recalls accumulated since the last rebuild may have earned new co-recall edges.
 	scheduleGraphRebuild();
 	return {

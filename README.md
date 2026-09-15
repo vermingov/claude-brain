@@ -56,6 +56,11 @@ your own cloud account.
   and a new note lands beside its lobe; the page draws notes, halos and travelling sparks
   as GPU-billboarded sprites, one draw call per layer, and stays at the display's frame
   rate on an integrated GPU with well over a thousand notes.
+- **A dashboard with a Home** — the brain in numbers, activity over the last two weeks
+  (memories recorded, notes recalled), the notes you recall most, the themes that keep
+  recurring across separate sessions, recent sessions and the largest clusters, all
+  read live from the index. Controls are built from Uiverse components (MIT, credited in
+  the stylesheet); no fonts or assets are fetched from anywhere.
 - **Always fresh** — a file watcher reindexes seconds after you edit a note.
   Content-hash incremental: only changed notes are re-chunked and re-embedded.
 - **You choose where the brain lives** — point it at an existing Obsidian vault or

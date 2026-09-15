@@ -76,7 +76,7 @@ function createStarfield(scene) {
 	});
 }
 
-export function createBrainTab(container) {
+export function createBrainTab(container, handlers = {}) {
 	container.classList.add("brain-tab");
 	const canvas = document.createElement("canvas");
 	canvas.className = "brain-canvas";
@@ -87,7 +87,7 @@ export function createBrainTab(container) {
 	chrome.innerHTML =
 		`<div class="brain-search">${SEARCH_ICON}<input class="brain-search-input" type="text" placeholder="Search memories" autocomplete="off" spellcheck="false" /><kbd>/</kbd><ul class="brain-results"></ul></div>` +
 		'<div class="brain-stats"></div><div class="brain-legend"></div>' +
-		'<div class="brain-loading"><svg class="ring" viewBox="25 25 50 50" aria-hidden="true"><circle r="20" cy="50" cx="50"></circle></svg><div class="loading-text">waking the cortex</div></div>';
+		'<div class="brain-loading"><div class="loader" aria-hidden="true"></div><div class="loading-text">waking the cortex</div></div>';
 	container.appendChild(chrome);
 
 	const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -297,11 +297,16 @@ export function createBrainTab(container) {
 	const resize = () => engine.resize();
 	new ResizeObserver(resize).observe(container);
 
-	fetch("/api/graph")
-		.then((r) => r.json())
-		.then(build);
+	/** Open a note by vault path, from another tab. Waits for the graph if it is still loading. */
+	function open(path) {
+		const index = graph?.nodes.findIndex((node) => node.id === path) ?? -1;
+		if (index !== -1) focusOn(index);
+		else if (!graph) pendingOpen = path;
+	}
+	let pendingOpen = null;
 
-	return {
+	const controller = {
+		open,
 		show() {
 			visible = true;
 			resize();
@@ -312,5 +317,19 @@ export function createBrainTab(container) {
 			visible = false;
 			stopLoop();
 		},
+		onLoaded() {
+			if (pendingOpen) {
+				const path = pendingOpen;
+				pendingOpen = null;
+				open(path);
+			}
+		},
 	};
+	fetch("/api/graph")
+		.then((r) => r.json())
+		.then((data) => {
+			build(data);
+			controller.onLoaded();
+		});
+	return controller;
 }

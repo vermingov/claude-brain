@@ -35,6 +35,7 @@ import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
+import { overview } from "./src/overview";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
 import { openBrainDb, resetIndex } from "./src/index-db";
@@ -689,6 +690,7 @@ const serveOptions = {
 		}
 
 		if (url.pathname === "/api/status") return jsonResponse(await fullStatus());
+		if (url.pathname === "/api/overview") return jsonResponse(overview());
 		if (url.pathname === "/api/reindex" && post) return jsonResponse(await reindex());
 		if (url.pathname === "/api/vaults") return jsonResponse({ vaults: detectVaults() });
 

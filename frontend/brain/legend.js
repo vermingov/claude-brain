@@ -1,5 +1,6 @@
-// Filters: which lobes are shown, and which kinds of synapse. Counts are the real
-// numbers behind each row.
+// Filters: which lobes are shown, and which kinds of synapse. Each row's dot is the
+// checkbox itself, after catraco's bursting checkmark (Uiverse, MIT), filled with the
+// lobe's colour. Counts are the real numbers behind each row.
 
 const KINDS = [
 	{ id: "wikilink", label: "Wikilinks", on: true },
@@ -9,6 +10,9 @@ const KINDS = [
 	{ id: "tag", label: "Shared tags", on: false },
 ];
 
+const BURST =
+	'<svg class="burst" viewBox="0 0 50 50" aria-hidden="true"><polygon points="0,0 10,10"/><polygon points="0,25 10,25"/><polygon points="0,50 10,40"/><polygon points="50,0 40,10"/><polygon points="50,25 40,25"/><polygon points="50,50 40,40"/></svg>';
+
 export function createLegend(element, graph, handlers) {
 	const counts = new Map();
 	for (const n of graph.nodes) counts.set(n.category, (counts.get(n.category) ?? 0) + 1);
@@ -17,8 +21,8 @@ export function createLegend(element, graph, handlers) {
 
 	const row = (name, value, label, count, color, on) =>
 		`<label class="legend-item"${color ? ` style="--c:${color}"` : ""}>
-			<input type="checkbox" ${on ? "checked" : ""} data-${name}="${value}" />
-			<span class="dot"></span><span class="legend-label">${label}</span><span class="legend-count">${count}</span>
+			<span class="check"><input type="checkbox" ${on ? "checked" : ""} data-${name}="${value}" /><span class="mark"></span>${BURST}</span>
+			<span class="legend-label">${label}</span><span class="legend-count">${count}</span>
 		</label>`;
 
 	element.innerHTML =
