@@ -36,6 +36,8 @@ export interface RecallHit {
 	lastUsed?: { ts: number; cwd: string };
 	/** The cue actually searched, when a misspelt term was snapped to the vault's vocabulary. */
 	corrected?: string;
+	/** Neither arm was sure: the notes here are the ranker's least-bad guesses. */
+	weak?: boolean;
 }
 
 export interface RecallOptions {
@@ -126,8 +128,13 @@ const TEMPORAL_BOOST = 1.3;
 /**
  * Below this the ranker is returning its least-bad option for a cue that names nothing
  * the vault knows. Measured: confident cues land 0.136–0.207, vague ones 0.088–0.107.
+ * That band assumes the two arms disagree mildly; a cue that names a note's title hits
+ * lexical rank 0 by a wide margin while the vector arm shrugs, and lands in it too — so
+ * a confident lexical arm overrides the label (LEXICAL_MARGIN).
  */
 export const WEAK_SCORE = 0.095;
+/** BM25 lead of the top row over the runner-up that counts as the lexical arm being sure. */
+const LEXICAL_MARGIN = 1.5;
 
 const STOPWORDS = new Set(
 	("the a an and or of for to in on with is are was were be been it its this that then than how why what when " +
@@ -173,10 +180,16 @@ function likePrefix(prefix: string): string {
 	return `${prefix.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
+interface LexicalResult {
+	ranks: Map<number, number>;
+	/** The top row led the runner-up by LEXICAL_MARGIN — this arm knows what it found. */
+	confident: boolean;
+}
+
 /** BM25 over one FTS table. Falls back from all-terms to any-term when too few match. */
-function lexicalRanks(table: string, columnWeights: number[], terms: string[], pathPrefix?: string): Map<number, number> {
+function lexicalRanks(table: string, columnWeights: number[], terms: string[], pathPrefix?: string): LexicalResult {
 	const ranks = new Map<number, number>();
-	if (terms.length === 0) return ranks;
+	if (terms.length === 0) return { ranks, confident: false };
 	const { db } = openBrainDb();
 	const weights = columnWeights.join(", ");
 	// Only chunks rows have a doc, and therefore a path, to scope by.
@@ -193,7 +206,7 @@ function lexicalRanks(table: string, columnWeights: number[], terms: string[], p
 		if (!match) return [];
 		try {
 			const params = scoped ? [match, likePrefix(pathPrefix!), CANDIDATES] : [match, CANDIDATES];
-			return db.query(sql).all(...params) as Array<{ rowid: number }>;
+			return db.query(sql).all(...params) as Array<{ rowid: number; s: number }>;
 		} catch {
 			return [];
 		}
@@ -204,7 +217,9 @@ function lexicalRanks(table: string, columnWeights: number[], terms: string[], p
 		rows = rows.concat(search(ftsMatch(terms, "or")).filter((r) => !seen.has(r.rowid)));
 	}
 	rows.slice(0, CANDIDATES).forEach((r, i) => ranks.set(r.rowid, i));
-	return ranks;
+	// bm25() is negative, more negative is better; the ratio of magnitudes is the lead.
+	const confident = rows.length >= 2 && Math.abs(rows[0]!.s) >= LEXICAL_MARGIN * Math.abs(rows[1]!.s);
+	return { ranks, confident };
 }
 
 function vectorRanks(
@@ -654,15 +669,15 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	// Lexical first: it is synchronous, and it decides whether the cue needs spelling help.
 	let terms = queryTerms(query);
 	let corrected: string[] | undefined;
-	let noteLexical = lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], terms, prefix);
-	if (noteLexical.size < LEXICAL_FLOOR && terms.length > 0) {
+	let lexical = lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], terms, prefix);
+	if (lexical.ranks.size < LEXICAL_FLOOR && terms.length > 0) {
 		const fixed = correctTerms(terms);
 		if (fixed) {
 			const retry = lexicalRanks("chunks_fts", [3.0, 2.0, 1.0], fixed, prefix);
-			if (retry.size > noteLexical.size) {
+			if (retry.ranks.size > lexical.ranks.size) {
 				terms = fixed;
 				corrected = fixed;
-				noteLexical = retry;
+				lexical = retry;
 			}
 		}
 	}
@@ -670,7 +685,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	// there, and a list of stems is a worse sentence than a misspelt one.
 	const vector = primeQuery(options.sessionId, await embedQuery(query));
 
-	let notes = hydrateChunks(fuse([noteLexical, vectorRanks("vec_chunks", "chunk_id", vector, prefix)]));
+	let notes = hydrateChunks(fuse([lexical.ranks, vectorRanks("vec_chunks", "chunk_id", vector, prefix)]));
 	// Safety net only: both rankers already scoped in SQL, so this is a no-op unless a
 	// path changed between the ranking queries and hydration.
 	if (prefix) notes = notes.filter((c) => c.path.toLowerCase().startsWith(prefix));
@@ -685,7 +700,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	let episodes: EpisodeCandidate[] = [];
 	if (episodeK > 0 && !options.pathPrefix) {
 		const window = temporalWindow(query);
-		const rankLists = [lexicalRanks("episodes_fts", [1.0], terms), vectorRanks("vec_episodes", "episode_id", vector)];
+		const rankLists = [lexicalRanks("episodes_fts", [1.0], terms).ranks, vectorRanks("vec_episodes", "episode_id", vector)];
 		if (window) rankLists.push(temporalRanks(window));
 		let pool = hydrateEpisodes(fuse(rankLists)).filter((e) => e.sessionId !== options.excludeSessionId);
 		if (window) {
@@ -709,6 +724,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 	// Corrected stems still steer the snippet: its line scorer matches on prefixes.
 	const snippetCue = corrected ? `${query} ${corrected.join(" ")}` : query;
 	const correctedCue = corrected?.join(" ");
+	const weak = topNotes.length > 0 && topNotes[0]!.score < WEAK_SCORE && !lexical.confident;
 	const noteHits: RecallHit[] = topNotes.map((c) => {
 		const focused = focusSnippet(c.text, snippetCue, budget);
 		const solution = solutions.get(c.docId);
@@ -726,6 +742,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 			copies: c.copies,
 			lastUsed: lastUsed.get(c.docId),
 			corrected: correctedCue,
+			weak,
 		};
 	});
 	const episodeHits: RecallHit[] = episodes.map((e) => ({

@@ -3,7 +3,7 @@
 
 import { basename } from "node:path";
 import { alreadyInjected, markInjected } from "./episodic";
-import { hybridRecall, type RecallHit, type RecallOptions, WEAK_SCORE } from "./hybrid-search";
+import { hybridRecall, type RecallHit, type RecallOptions } from "./hybrid-search";
 import { reindex } from "./indexer";
 
 export type { RecallHit, RecallOptions };
@@ -65,9 +65,7 @@ export function renderHits(hits: RecallHit[], query: string, now = Date.now()): 
 	const sections: string[] = [];
 	const corrected = hits.find((h) => h.corrected)?.corrected;
 	if (corrected) sections.push(`(searched as: ${corrected})`);
-	if (notes.length > 0 && Math.max(...notes.map((h) => h.score)) < WEAK_SCORE) {
-		sections.push("(weak match — the vault may not cover this; treat these as guesses)");
-	}
+	if (notes.some((h) => h.weak)) sections.push("(weak match — the vault may not cover this; treat these as guesses)");
 	if (notes.length > 0) {
 		sections.push(
 			notes

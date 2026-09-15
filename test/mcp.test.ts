@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const scratch = join(tmpdir(), `brain-mcp-${process.pid}`);
-let proc: ReturnType<typeof Bun.spawn>;
+let proc: Bun.Subprocess<"pipe", "pipe", "ignore">;
 let nextId = 1;
 const pending = new Map<number, (v: Record<string, unknown>) => void>();
 
