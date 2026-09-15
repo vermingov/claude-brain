@@ -124,7 +124,7 @@ interface Row {
 const STOPWORDS = new Set(
 	("the a an and or of for to in on with is are was were be been it its this that then than always never dont do not " +
 		"you your we our my i me should must always never from now onwards going forward every time whenever by default " +
-		"make sure remember please just also only ever when if").split(" "),
+		"make sure remember please just also only ever when if about into onto upon out off via stop avoid").split(" "),
 );
 
 /** The words that decide whether a rule is about what is being asked now. */
@@ -168,6 +168,30 @@ const REVERSAL_OVERLAP = 0.6;
 const CUE_BONUS = 2;
 
 /**
+ * Enough of a stemmer to see that two inflections are one word: use/using/used, dash/dashes,
+ * commit/committing, merge/merging. Nobody restates a rule in the tense they first said it
+ * in — "don't use em dashes" comes back as "stop using em dashes" — and without this those
+ * are two rules about nothing in common but the word "dashes".
+ *
+ * Deliberately crude, and only ever compared against itself: the output is a key for
+ * matching, never anything shown. The trailing "e" goes so that use and using meet in the
+ * middle, and a doubled consonant left by the suffix is collapsed so that committing lands
+ * on commit.
+ */
+function stemCue(word: string): string {
+	if (word.length <= 2) return word;
+	let base = word;
+	if (base.endsWith("ing") && base.length >= 5) base = base.slice(0, -3);
+	else if (base.endsWith("ed") && base.length >= 5) base = base.slice(0, -2);
+	else if (base.endsWith("ies") && base.length >= 5) base = `${base.slice(0, -3)}y`;
+	else if (base.endsWith("es") && base.length >= 5) base = base.slice(0, -2);
+	else if (base.endsWith("s") && !base.endsWith("ss") && base.length >= 4) base = base.slice(0, -1);
+	if (base.length > 2 && base.at(-1) === base.at(-2)) base = base.slice(0, -1);
+	if (base.length > 2 && base.endsWith("e")) base = base.slice(0, -1);
+	return base.length >= 2 ? base : word;
+}
+
+/**
  * Verbs people swap freely when restating a rule they already gave: "never publish xrec to
  * github" and "xrec goes to the AUR, never github" are one rule with two verbs. What a rule
  * is *about* — the tool, the repo, the file — is what identifies it, so the action counts
@@ -176,12 +200,12 @@ const CUE_BONUS = 2;
 const GENERIC_VERBS = new Set(
 	("go use run push pull publish send put keep make write add remove check ask prefer start stop deploy commit ship " +
 		"read call build open close set take give show treat verify merge squash create delete update change fix handle " +
-		"ensure apply install save load import export return pass follow touch split move copy").split(" "),
+		"ensure apply install save load import export return pass follow touch split move copy")
+		.split(" ")
+		.map(stemCue),
 );
-/** Enough of a stemmer to recognise the same verb inflected: goes, publishing, merged. */
-function cueWeight(cue: string): number {
-	const forms = [cue, cue.replace(/e?s$/, ""), cue.replace(/ed$/, ""), cue.replace(/ing$/, ""), cue.replace(/ing$/, "e")];
-	return forms.some((form) => GENERIC_VERBS.has(form)) ? 0.5 : 1;
+function cueWeight(stem: string): number {
+	return GENERIC_VERBS.has(stem) ? 0.5 : 1;
 }
 
 /**
@@ -190,10 +214,13 @@ function cueWeight(cue: string): number {
  */
 export function cueOverlap(a: string[], b: string[]): number {
 	if (a.length === 0 || b.length === 0) return 0;
-	const weigh = (cues: string[]) => cues.reduce((sum, cue) => sum + cueWeight(cue), 0);
-	const other = new Set(b);
-	const shared = weigh(a.filter((cue) => other.has(cue)));
-	return shared / Math.min(weigh(a), weigh(b));
+	// Stems are a matching key, computed here rather than stored: the cues on disk stay the
+	// words the user actually used, and an older rule keeps matching after this changes.
+	const weigh = (stems: string[]) => stems.reduce((sum, stem) => sum + cueWeight(stem), 0);
+	const left = [...new Set(a.map(stemCue))];
+	const right = new Set(b.map(stemCue));
+	const shared = weigh(left.filter((stem) => right.has(stem)));
+	return shared / Math.min(weigh(left), weigh([...right]));
 }
 
 // --- Detection -------------------------------------------------------------------
@@ -216,7 +243,27 @@ const IMPERATIVE =
 const QUESTION = /\?\s*$/;
 /** "in this project", "here", "for this repo": the rule is about where it was given. */
 const LOCAL = /\b(in (this|the) (project|repo|repository|codebase|folder|directory)|for (this|the) (project|repo|repository|codebase)|here)\b/i;
-const NEGATIVE = /\b(never|no longer|don'?t|do not|avoid|stop|without|instead of|rather than)\b/i;
+const NEGATIVE = /\b(never|no longer|no more|don'?t|do not|avoid|stop|without|instead of|rather than)\b/i;
+
+/**
+ * A prohibition given as a plain imperative: "don't use em dashes", "stop wrapping every
+ * line". No marker word, and none is needed — telling someone to stop doing something is
+ * almost never about this one turn, the way "run the tests" usually is. This is the one
+ * shape allowed in without a marker, and only under the two guards below.
+ */
+const IMPERATIVE_PROHIBITION = /^(don'?t|do not|never|avoid|stop|no more)\b/i;
+/**
+ * Said about now, not from now on: "don't commit yet", "leave it for now". The hedge is
+ * the whole difference between an instruction and a note about the current turn, so it
+ * disqualifies a sentence outright, marker or no marker.
+ */
+const TURN_SCOPED = /\b(yet|for now|right now|at the moment|today|this time|just this once|for this one|in this case|until I)\b/i;
+/**
+ * How many content words a bare prohibition needs before it counts as a rule. A rule names
+ * an action and a thing — "use", "dashes" — while "stop the server" and "don't worry about
+ * it" name only one, because their object is the task at hand rather than a habit.
+ */
+const BARE_PROHIBITION_CUES = 2;
 
 const MAX_DIRECTIVE_CHARS = 220;
 /** How a rule gets attached to the sentence before it. None of this is part of the rule. */
@@ -240,14 +287,21 @@ export function detectDirectives(prompt: string): DraftDirective[] {
 	const out: DraftDirective[] = [];
 	for (const sentence of sentences(prompt)) {
 		if (sentence.length > MAX_DIRECTIVE_CHARS || QUESTION.test(sentence)) continue;
-		if (!MARKERS.test(sentence)) continue;
+		if (TURN_SCOPED.test(sentence)) continue;
+		const bare = IMPERATIVE_PROHIBITION.test(sentence.replace(CONNECTIVE, ""));
+		if (!MARKERS.test(sentence) && !bare) continue;
 		const modal = MODAL.test(sentence);
 		// "it always crashes" is a complaint; "it should always retry" is a rule.
 		if (DESCRIPTIVE.test(sentence) && !modal) continue;
 		if (PAST.test(sentence) && !modal) continue;
 		const cues = cuesOf(sentence);
 		if (cues.length === 0) continue;
-		const stated = EXPLICIT.test(sentence) || IMPERATIVE.test(sentence) || modal;
+		// "stop the server" and "don't worry about it" name one thing, and it is the task in
+		// hand; "don't use em dashes" names an action and a habit. That is the difference.
+		// The prohibiting word is not among the cues — polarity already carries it.
+		if (bare && !MARKERS.test(sentence) && cues.length < BARE_PROHIBITION_CUES) continue;
+		// A bare prohibition is an imperative by construction, so it is stated, not inferred.
+		const stated = bare || EXPLICIT.test(sentence) || IMPERATIVE.test(sentence) || modal;
 		out.push({
 			text: sentence.replace(CONNECTIVE, "").replace(/^[,\s]+/, ""),
 			polarity: NEGATIVE.test(sentence) ? "dont" : "do",
@@ -456,7 +510,7 @@ export function selectDirectives(options: SelectOptions = {}): Directive[] {
 	const { db } = openBrainDb();
 	const now = options.now ?? Date.now();
 	const rows = db.query("SELECT * FROM directives WHERE superseded_by IS NULL").all() as Row[];
-	const promptCues = options.prompt ? new Set(cuesOf(options.prompt)) : null;
+	const promptCues = options.prompt ? new Set(cuesOf(options.prompt).map(stemCue)) : null;
 
 	const scored = rows
 		.map((row) => hydrate(row, now))
@@ -471,7 +525,7 @@ export function selectDirectives(options: SelectOptions = {}): Directive[] {
 			return true;
 		})
 		.map((directive) => {
-			const match = promptCues ? directive.cues.filter((cue) => promptCues.has(cue)).length : 0;
+			const match = promptCues ? directive.cues.filter((cue) => promptCues.has(stemCue(cue))).length : 0;
 			// With a prompt in hand, only rules about it are worth the space at all; the rest
 			// were already offered at the start of the session.
 			if (promptCues && match === 0) return null;

@@ -47,6 +47,26 @@ describe("what is a standing instruction", () => {
 		expect(rule("whenever you touch the shader, re-run the headless check")).toHaveLength(1);
 	});
 
+	test("telling it to stop doing something is a rule, with no marker word needed", () => {
+		expect(rule("dont use em dashes")).toHaveLength(1);
+		expect(rule("stop using em dashes please")).toHaveLength(1);
+		expect(rule("avoid rewriting whole files")).toHaveLength(1);
+		expect(rule("do not push to master")).toHaveLength(1);
+		expect(rule("no more glassmorphism in the UI")).toHaveLength(1);
+		expect(detectDirectives("dont use em dashes")[0]!.status).toBe("stated");
+	});
+
+	test("a prohibition about the task in hand is not a standing one", () => {
+		// One content word, and it is the thing being worked on rather than a habit.
+		expect(rule("stop the server")).toHaveLength(0);
+		expect(rule("dont worry about it")).toHaveLength(0);
+		expect(rule("dont do that")).toHaveLength(0);
+		// Said about now, however it is phrased.
+		expect(rule("dont commit yet")).toHaveLength(0);
+		expect(rule("avoid touching it for now")).toHaveLength(0);
+		expect(rule("never mind that for this one")).toHaveLength(0);
+	});
+
 	test("a description of the world is not an instruction", () => {
 		expect(rule("it always crashes when I open the settings tab")).toHaveLength(0);
 		expect(rule("the build never finishes on this machine")).toHaveLength(0);
@@ -155,6 +175,14 @@ describe("capture", () => {
 		const again = captureDirective(restated, "s2", "/w", NOW + DAY);
 		expect(again.reinforced).toBe(true);
 		expect(again.directive.id).toBe(first.directive.id);
+	});
+
+	test("a rule restated in another tense is the same rule", () => {
+		const first = captureDirective(statedDirective("Dont ever use em dashes when talking to me"), "s1", "/w", NOW);
+		const again = captureDirective(statedDirective("stop using em dashes please"), "s2", "/w", NOW + DAY);
+		expect(again.reinforced).toBe(true);
+		expect(again.directive.id).toBe(first.directive.id);
+		expect(listDirectives(NOW + DAY)).toHaveLength(1);
 	});
 
 	test("two rules that differ in their subject stay apart, however alike they read", () => {
