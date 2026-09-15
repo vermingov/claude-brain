@@ -15,6 +15,7 @@
 import { resolve } from "node:path";
 import { captureNote } from "../src/capture";
 import { api, baseUrl, ensureServer as startServer, postJson } from "../src/daemon";
+import { looksLikeRule } from "../src/rule-shape";
 
 const BASE = baseUrl();
 
@@ -80,6 +81,10 @@ async function cmdRecall(rest: string[]): Promise<void> {
  * Durable episodic capture — a decision or preference worth surviving the session but
  * not structured enough to deserve a note. Higher salience, so consolidation keeps it
  * when the surrounding chatter is forgotten.
+ *
+ * Text shaped like a rule goes to the standing instructions instead, the same way the
+ * MCP tool of this name routes it: "always deploy from main" is not a fact to recall
+ * later, it is an instruction to follow, and the two stores treat it differently.
  */
 async function cmdRemember(rest: string[]): Promise<void> {
 	let kind = "decision";
@@ -87,9 +92,10 @@ async function cmdRemember(rest: string[]): Promise<void> {
 	if (kIdx !== -1) kind = rest.splice(kIdx, 2)[1] ?? "decision";
 	const text = rest.join(" ").trim();
 	if (!text) {
-		console.error('claude-brain remember "<text>" [-k decision|preference|outcome]');
+		console.error('claude-brain remember "<text>" [-k decision|preference|outcome|rule]');
 		process.exit(1);
 	}
+	if (kind === "rule" || (kIdx === -1 && looksLikeRule(text))) return cmdRules([text]);
 	await ensureServer();
 	await postJson("/api/episode", {
 		sessionId: sessionIdFromEnv() ?? "manual",
@@ -317,6 +323,45 @@ async function cmdDesign(rest: string[]): Promise<void> {
 }
 
 /**
+ * The standing instructions the brain is holding: what it will put in front of future
+ * sessions, strongest first.
+ */
+async function cmdRules(rest: string[]): Promise<void> {
+	const retractIndex = rest.indexOf("--retract");
+	await ensureServer();
+	if (retractIndex !== -1) {
+		const id = Number(rest[retractIndex + 1]);
+		if (!Number.isInteger(id)) {
+			console.error("claude-brain rules --retract <id>");
+			process.exit(1);
+		}
+		const res = await postJson("/api/directives/retract", { id });
+		const out = res ? ((await res.json()) as { retracted: boolean }) : { retracted: false };
+		console.log(out.retracted ? `dropped rule ${id}` : `no rule ${id}`);
+		return;
+	}
+	const text = rest.filter((arg) => !arg.startsWith("--")).join(" ").trim();
+	if (text) {
+		const res = await postJson("/api/directives", { text, sessionId: sessionIdFromEnv() ?? "manual", cwd: process.cwd() });
+		const out = res ? ((await res.json()) as { directive: { id: number }; reinforced: boolean }) : null;
+		console.log(out ? `standing instruction #${out.directive.id}${out.reinforced ? " (said before, now stronger)" : ""}` : "not stored");
+		return;
+	}
+	const res = await api("/api/directives");
+	const out = res ? ((await res.json()) as { directives: Array<Record<string, never>> }) : { directives: [] };
+	const rules = out.directives as unknown as Array<{ id: number; text: string; status: string; strength: number; statements: number; lastStated: number }>;
+	if (rules.length === 0) {
+		console.log("no standing instructions yet — tell the assistant \"always …\" or \"never …\" and it keeps it");
+		return;
+	}
+	for (const rule of rules) {
+		const when = new Date(rule.lastStated).toISOString().slice(0, 10);
+		console.log(`${String(rule.id).padStart(4)}  ${rule.strength.toFixed(2)}  ${rule.status.padEnd(12)} ${rule.statements}× last ${when}  ${rule.text}`);
+	}
+	console.log("\ndrop one with:  claude-brain rules --retract <id>");
+}
+
+/**
  * Retract something the brain recorded wrongly. Two steps on purpose: a query lists what
  * matches with its ids, an id deletes that one. Only episodic memory — the vault is the
  * user\'s and nothing here touches it.
@@ -505,8 +550,9 @@ async function cmdIntegrate(rest: string[]): Promise<void> {
 	console.log(JSON.stringify(status));
 	if (rest[0] !== "--remove") {
 		console.log(
-			"Claude Code wired: MCP server (tools recall/remember/note/path/explain/affected/map), session hooks, " +
-				"recall-first instructions, recording skill. Restart Claude Code to load the MCP server.",
+			"Claude Code wired: MCP server (recall, read, journal, note, remember, forget, path, explain, affected, " +
+				"map), session hooks, the vault guard, recall-first instructions and the recording skill. Restart " +
+				"Claude Code to load the MCP server.",
 		);
 	}
 }
@@ -560,6 +606,9 @@ switch (cmd) {
 	case "design":
 		await cmdDesign(rest);
 		break;
+	case "rules":
+		await cmdRules(rest);
+		break;
 	case "forget":
 		await cmdForget(rest);
 		break;
@@ -599,6 +648,8 @@ switch (cmd) {
                                      store a durable fact in episodic memory
   claude-brain forget "<text>" | --id <id>
                                      retract a memory the brain got wrong
+  claude-brain rules ["<instruction>"] [--retract <id>]
+                                     standing instructions: list, add, or drop one
 
  structure
   claude-brain path "<from>" "<to>"  how two notes connect

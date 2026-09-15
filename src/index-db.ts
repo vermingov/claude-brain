@@ -229,6 +229,51 @@ function createEpisodicTables(db: Database, vectors: boolean): void {
 		mined_at INTEGER NOT NULL
 	)`);
 
+	/**
+	 * Procedural memory: the standing instructions. Episodes are what happened and notes
+	 * are what is true; these are how to act, and unlike either they are not waited for —
+	 * they are put in front of the session before it starts, because an instruction you
+	 * have to go looking for is one you have already failed to follow.
+	 */
+	db.run(directivesTable("directives"));
+	// Uniqueness belongs to the live rules alone. A superseded rule keeps its fingerprint,
+	// so a column-wide UNIQUE would make changing your mind back — restating a rule that
+	// once replaced this one — collide with the row it replaced.
+	db.run("CREATE UNIQUE INDEX IF NOT EXISTS directives_fingerprint ON directives(fingerprint) WHERE superseded_by IS NULL");
+	db.run("CREATE INDEX IF NOT EXISTS directives_live ON directives(superseded_by, status)");
+
+	createInjectedTable(db);
+}
+
+/** Shared by the schema and by the migration that rebuilds the table under a new shape. */
+function directivesTable(name: string): string {
+	return `CREATE TABLE IF NOT EXISTS ${name} (
+		id INTEGER PRIMARY KEY,
+		text TEXT NOT NULL,
+		fingerprint TEXT NOT NULL,
+		/** global, or the directory it was given for. */
+		scope TEXT NOT NULL DEFAULT 'global',
+		scope_value TEXT NOT NULL DEFAULT '',
+		/** Content words that make this rule relevant to a prompt. */
+		cues TEXT NOT NULL DEFAULT '',
+		/** Negative rules ("never X") supersede positive ones about the same thing. */
+		polarity TEXT NOT NULL DEFAULT 'do',
+		/** provisional (inferred) | stated (said plainly) | consolidated (proven over time) */
+		status TEXT NOT NULL DEFAULT 'provisional',
+		created INTEGER NOT NULL,
+		last_stated INTEGER NOT NULL,
+		last_fired INTEGER NOT NULL DEFAULT 0,
+		fire_count INTEGER NOT NULL DEFAULT 0,
+		/** Distinct sessions that stated it: repetition across time is what makes it stick. */
+		statements INTEGER NOT NULL DEFAULT 1,
+		stated_in TEXT NOT NULL DEFAULT '',
+		/** When each statement happened, so strength can be the real base-level equation. */
+		stated_at TEXT NOT NULL DEFAULT '',
+		superseded_by INTEGER
+	)`;
+}
+
+function createInjectedTable(db: Database): void {
 	// What a live session already had injected, so associative recall never repeats
 	// itself into the same context window.
 	db.run(`CREATE TABLE IF NOT EXISTS injected (
@@ -412,7 +457,26 @@ function reembedIfPoolingChanged(db: Database, vectors: boolean): void {
 }
 
 /** Additive column adds for indexes written before a given feature existed. */
+/**
+ * The first shape of `directives` made `fingerprint` unique across the whole table, which
+ * meant a rule could never be stated again once something had superseded it: the insert
+ * collided with the row it had replaced. Rebuild under the partial index instead.
+ */
+function relaxDirectiveFingerprints(db: Database): void {
+	const sql =
+		(db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'directives'").get() as { sql: string } | null)
+			?.sql ?? "";
+	if (!sql.includes("UNIQUE")) return;
+	db.run("ALTER TABLE directives RENAME TO directives_old");
+	db.run(directivesTable("directives"));
+	db.run("INSERT INTO directives SELECT * FROM directives_old");
+	db.run("DROP TABLE directives_old");
+	db.run("CREATE UNIQUE INDEX IF NOT EXISTS directives_fingerprint ON directives(fingerprint) WHERE superseded_by IS NULL");
+	db.run("CREATE INDEX IF NOT EXISTS directives_live ON directives(superseded_by, status)");
+}
+
 function migrate(db: Database): void {
+	relaxDirectiveFingerprints(db);
 	const columns = (table: string) =>
 		new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name));
 

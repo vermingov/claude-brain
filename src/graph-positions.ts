@@ -3,6 +3,7 @@
 // save to the next, so the brain looks the same each time it is opened and a new note
 // appears beside its lobe instead of the whole vault reshuffling.
 
+import { emit } from "./events";
 import { type LayoutEdge, type LayoutNode, lobeOf, ROOT_CATEGORY } from "./graph-layout";
 import { openBrainDb } from "./index-db";
 import type { LayoutJob } from "./layout-worker";
@@ -90,6 +91,12 @@ export function relayout(): Promise<number> {
 	}
 	running = runWorker(loadJob())
 		.then(store)
+		.then((count) => {
+			// Positions are final: anyone watching the brain can now show the new notes
+			// where they actually belong, rather than guessing or waiting for a reload.
+			emit({ type: "graph", ts: Date.now(), notes: count });
+			return count;
+		})
 		.finally(() => {
 			running = null;
 			if (queued) {

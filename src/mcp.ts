@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { captureNote } from "./capture";
 import { api, ensureServer, postJson } from "./daemon";
+import { looksLikeRule } from "./rule-shape";
 
 /** Newest first; the client's choice is echoed back when it is one of these. */
 const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -122,28 +123,78 @@ const TOOLS: Tool[] = [
 	{
 		name: "remember",
 		description:
-			"Store a durable fact in episodic memory — a decision, a preference, or an outcome — that should survive " +
-			"this session but is not note-shaped. It is exempt from forgetting.",
+			"Keep something across sessions. A standing instruction — 'always run the tests first', 'never publish that " +
+			"repo' — is stored as a rule: the brain puts it in front of every future session that it applies to, without " +
+			"being asked, and strengthens it each time the user says it again. Anything else (a decision, a preference, " +
+			"an outcome) is stored as an episodic fact. Call this the moment the user tells you how they want things " +
+			"done; that is the whole point of the brain.",
 		inputSchema: {
 			type: "object",
 			properties: {
-				text: { type: "string", description: "The fact, in one or two sentences" },
-				kind: { type: "string", enum: ["decision", "preference", "outcome"], description: "Default: decision" },
+				text: { type: "string", description: "The instruction or the fact, in the user's own words where possible" },
+				kind: {
+					type: "string",
+					enum: ["rule", "decision", "preference", "outcome"],
+					description: "rule for a standing instruction; otherwise how to file it. Default: inferred from the wording",
+				},
 			},
 			required: ["text"],
 		},
 		async run(args) {
 			await daemon();
-			const kind = ["decision", "preference", "outcome"].includes(str(args.kind)) ? str(args.kind) : "decision";
-			const res = await postJson("/api/episode", {
-				sessionId: SESSION,
-				cwd: process.cwd(),
-				kind,
-				text: str(args.text),
-				salience: 2,
-			});
+			const body = str(args.text).trim();
+			const kind = str(args.kind);
+			// A rule either says so or reads like one; both paths end in the same place.
+			const standing = kind === "rule" || (kind === "" && looksLikeRule(body));
+			if (standing) {
+				const res = await postJson("/api/directives", { text: body, sessionId: SESSION, cwd: process.cwd() });
+				const out = JSON.parse(await text(res, "remember")) as {
+					directive: { id: number; text: string; status: string; strength: number };
+					reinforced: boolean;
+					superseded?: { text: string };
+				};
+				const how = out.superseded
+					? `replacing "${out.superseded.text}"`
+					: out.reinforced
+						? "you have said this before, so it now carries more weight"
+						: "it will be put in front of later sessions";
+				return `standing instruction #${out.directive.id} — ${how}.`;
+			}
+			const filed = ["decision", "preference", "outcome"].includes(kind) ? kind : "decision";
+			const res = await postJson("/api/episode", { sessionId: SESSION, cwd: process.cwd(), kind: filed, text: body, salience: 2 });
 			await text(res, "remember");
-			return `remembered (${kind}): ${str(args.text).slice(0, 120)}`;
+			return `remembered (${filed}): ${body.slice(0, 120)}`;
+		},
+	},
+	{
+		name: "rules",
+		description:
+			"The standing instructions the brain is holding, strongest first, with how often and how recently they were " +
+			"stated. Call it when the user asks what you have been told, or before doing something they may have a rule " +
+			"about. Pass `retract` with an id to drop one that no longer applies.",
+		inputSchema: {
+			type: "object",
+			properties: { retract: { type: "integer", description: "Id of a rule to drop" } },
+		},
+		async run(args) {
+			await daemon();
+			const retract = int(args.retract);
+			if (retract !== undefined) {
+				const res = await postJson("/api/directives/retract", { id: retract });
+				const out = JSON.parse(await text(res, "rules")) as { retracted: boolean };
+				return out.retracted ? `dropped rule ${retract}` : `no rule ${retract}`;
+			}
+			const res = await api("/api/directives");
+			const out = JSON.parse(await text(res, "rules")) as {
+				directives: Array<{ id: number; text: string; status: string; strength: number; statements: number; lastStated: number }>;
+			};
+			if (out.directives.length === 0) return "no standing instructions yet";
+			return out.directives
+				.map((rule) => {
+					const when = new Date(rule.lastStated).toISOString().slice(0, 10);
+					return `  ${rule.id}  [${rule.status}, strength ${rule.strength.toFixed(2)}, said ${rule.statements}×, last ${when}] ${rule.text}`;
+				})
+				.join("\n");
 		},
 	},
 	{

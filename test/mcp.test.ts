@@ -77,6 +77,7 @@ describe("mcp", () => {
 		expect(tools.map((t) => t.name)).toEqual([
 			"recall",
 			"remember",
+			"rules",
 			"note",
 			"read",
 			"journal",

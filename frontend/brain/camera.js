@@ -1,13 +1,9 @@
-// Orbit camera with free flight, an idle drift, and glides to a note. Everything here
-// is a few vector operations per frame.
+// Orbit camera with free flight and glides to a note. It never moves on its own: the
+// view holds exactly where it was left, and every frame here is a few vector operations.
 
 import { ArcRotateCamera } from "@babylonjs/core/Cameras/arcRotateCamera";
 import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 
-const IDLE_ROTATE_DELAY_MS = 5000;
-// A slow turn, a little over five minutes for a full revolution: enough for the eye to
-// read the shape as solid, not enough to be motion the viewer has to ignore.
-const IDLE_ROTATE_SPEED = 0.018; // radians per second
 const FLY_SPEED = 130; // units per second; Shift multiplies
 
 export function createCamera(scene, canvas, isActive) {
@@ -24,8 +20,8 @@ export function createCamera(scene, canvas, isActive) {
 	camera.lowerRadiusLimit = 15;
 	camera.upperRadiusLimit = 4000;
 
-	let lastInteraction = Date.now();
 	let glide = null;
+	let held = false;
 	const flyKeys = new Set();
 	const typing = () => {
 		const a = document.activeElement;
@@ -36,11 +32,6 @@ export function createCamera(scene, canvas, isActive) {
 	});
 	document.addEventListener("keyup", (e) => flyKeys.delete(e.code));
 	window.addEventListener("blur", () => flyKeys.clear());
-	for (const event of ["pointerdown", "wheel"]) canvas.addEventListener(event, () => touch());
-
-	function touch() {
-		lastInteraction = Date.now();
-	}
 
 	// WASD flies camera and orbit pivot together (QE / Space+C vertical), Shift is afterburner.
 	function fly(dt) {
@@ -58,28 +49,30 @@ export function createCamera(scene, canvas, isActive) {
 		move.normalize().scaleInPlace(FLY_SPEED * (flyKeys.has("ShiftLeft") || flyKeys.has("ShiftRight") ? 4 : 1) * dt);
 		camera.target.addInPlace(move);
 		camera.position.addInPlace(move);
-		touch();
 		return true;
 	}
 
 	function glideTo(target, radius, ms) {
+		if (held) return;
 		glide = { fromTarget: camera.target.clone(), toTarget: target, fromRadius: camera.radius, toRadius: radius, start: performance.now(), ms };
-		touch();
 	}
 
-	/** Per frame. `holdStill` suppresses the idle drift while something is selected. */
-	function update(dt, now, holdStill, reducedMotion) {
+	/** Per frame: flight, and a glide if one is running. Nothing else ever moves the camera. */
+	function update(dt, now) {
 		if (fly(dt)) glide = null;
-		if (glide) {
-			const t = Math.min((now - glide.start) / glide.ms, 1);
-			const e = 1 - (1 - t) ** 3;
-			camera.setTarget(Vector3.Lerp(glide.fromTarget, glide.toTarget, e));
-			camera.radius = glide.fromRadius + (glide.toRadius - glide.fromRadius) * e;
-			if (t >= 1) glide = null;
-		}
-		const idle = !reducedMotion && !holdStill && !glide && Date.now() - lastInteraction > IDLE_ROTATE_DELAY_MS;
-		if (idle) camera.alpha += IDLE_ROTATE_SPEED * dt;
+		if (!glide) return;
+		const t = Math.min((now - glide.start) / glide.ms, 1);
+		const e = 1 - (1 - t) ** 3;
+		camera.setTarget(Vector3.Lerp(glide.fromTarget, glide.toTarget, e));
+		camera.radius = glide.fromRadius + (glide.toRadius - glide.fromRadius) * e;
+		if (t >= 1) glide = null;
 	}
 
-	return { camera, glideTo, update, touch };
+	/** Harness hook: refuse every automatic move, so a frame can be compared with itself. */
+	function hold(on) {
+		held = on;
+		if (on) glide = null;
+	}
+
+	return { camera, glideTo, update, hold };
 }

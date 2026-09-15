@@ -9,7 +9,7 @@ export type Via = "mcp" | "cli" | "hook" | "ui" | "unknown";
 
 const VIA: readonly Via[] = ["mcp", "cli", "hook", "ui", "unknown"];
 
-export interface BrainEvent {
+export interface ActivityEvent {
 	type: ActivityKind;
 	ts: number;
 	via: Via;
@@ -20,6 +20,15 @@ export interface BrainEvent {
 	/** For a traversal: the ordered route, so a signal can run it hop by hop. */
 	route?: string[];
 }
+
+/** The vault changed and the layout has caught up: whoever is watching should re-read it. */
+export interface GraphEvent {
+	type: "graph";
+	ts: number;
+	notes: number;
+}
+
+export type BrainEvent = ActivityEvent | GraphEvent;
 
 type Listener = (event: BrainEvent) => void;
 

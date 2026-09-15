@@ -106,6 +106,29 @@ export function createHomeTab(container, { openBrain }) {
 		columns.append(left, right);
 		wrap.appendChild(columns);
 
+		if (data.directives?.length) {
+			const rules = section("Standing instructions");
+			rules.appendChild(
+				text("p", "section-note", "Given in earlier sessions and put in front of every new one. The bar is how present each is now."),
+			);
+			const list = el("ul", "rule-list");
+			for (const rule of data.directives) {
+				const item = el("li");
+				item.appendChild(text("span", "rule-text", rule.text));
+				const meta = el("div", "rule-meta");
+				const bar = el("span", "rule-bar");
+				const fill = el("span", "rule-fill");
+				// Activation is unbounded in principle; two is as strong as these get in practice.
+				fill.style.width = `${Math.max(4, Math.min(100, ((rule.strength + 1) / 3) * 100))}%`;
+				bar.appendChild(fill);
+				meta.append(bar, text("span", "rule-status", `${rule.status} · said ${rule.statements}× · ${ago(rule.lastStated)}`));
+				item.appendChild(meta);
+				list.appendChild(item);
+			}
+			rules.appendChild(list);
+			left.appendChild(rules);
+		}
+
 		const activity = section("Activity, last 14 days");
 		activity.appendChild(activityChart(data.activity));
 		activity.appendChild(

@@ -51,14 +51,27 @@ export function createSearch(elements, graph, handlers) {
 		}
 	}
 
-	input.addEventListener("input", () => run(input.value));
-	input.addEventListener("keydown", (e) => {
+	// The input outlives any one graph — it belongs to the page, not to the payload — so
+	// these come off again when the graph is replaced. Left attached, every reload would
+	// add another pair, and a keystroke would run one search per graph ever loaded.
+	const onInput = () => run(input.value);
+	const onKeyDown = (e) => {
 		if (e.key === "Enter") results.querySelector("li")?.click();
 		else if (e.key === "Escape") {
 			clear();
 			input.blur();
 		}
-	});
+	};
+	input.addEventListener("input", onInput);
+	input.addEventListener("keydown", onKeyDown);
 
-	return { clear, focus: () => input.focus(), isFocused: () => document.activeElement === input };
+	return {
+		clear,
+		focus: () => input.focus(),
+		isFocused: () => document.activeElement === input,
+		dispose() {
+			input.removeEventListener("input", onInput);
+			input.removeEventListener("keydown", onKeyDown);
+		},
+	};
 }

@@ -13,7 +13,13 @@ const KINDS = [
 const BURST =
 	'<svg class="burst" viewBox="0 0 50 50" aria-hidden="true"><polygon points="0,0 10,10"/><polygon points="0,25 10,25"/><polygon points="0,50 10,40"/><polygon points="50,0 40,10"/><polygon points="50,25 40,25"/><polygon points="50,50 40,40"/></svg>';
 
-export function createLegend(element, graph, handlers) {
+/**
+ * @param {{categories: Set<string>, kinds: Set<string>}|null} hidden  What was filtered out
+ *   before this graph replaced the last one. The legend is the only record of that choice,
+ *   so it renders from it and hands it back: without this a vault change silently re-shows
+ *   lobes the viewer had switched off, with every box still ticked.
+ */
+export function createLegend(element, graph, handlers, hidden = null) {
 	const counts = new Map();
 	for (const n of graph.nodes) counts.set(n.category, (counts.get(n.category) ?? 0) + 1);
 	const kindCounts = new Map();
@@ -25,13 +31,17 @@ export function createLegend(element, graph, handlers) {
 			<span class="legend-label">${label}</span><span class="legend-count">${count}</span>
 		</label>`;
 
+	const categories = graph.categories.filter((c) => (counts.get(c.id) ?? 0) > 0);
+	const kinds = KINDS.filter((k) => kindCounts.has(k.id));
+	const categoryOn = (c) => !hidden?.categories.has(c.id);
+	const kindOn = (k) => (hidden ? !hidden.kinds.has(k.id) : k.on);
+
 	element.innerHTML =
-		`<div class="legend-group"><h4>Lobes</h4>${graph.categories
-			.filter((c) => (counts.get(c.id) ?? 0) > 0)
-			.map((c) => row("category", c.id, c.label, counts.get(c.id), c.color, true))
+		`<div class="legend-group"><h4>Lobes</h4>${categories
+			.map((c) => row("category", c.id, c.label, counts.get(c.id), c.color, categoryOn(c)))
 			.join("")}</div>` +
-		`<div class="legend-group"><h4>Synapses</h4>${KINDS.filter((k) => kindCounts.has(k.id))
-			.map((k) => row("kind", k.id, k.label, kindCounts.get(k.id), null, k.on))
+		`<div class="legend-group"><h4>Synapses</h4>${kinds
+			.map((k) => row("kind", k.id, k.label, kindCounts.get(k.id), null, kindOn(k)))
 			.join("")}</div>`;
 
 	for (const input of element.querySelectorAll("input[data-category]")) {
@@ -40,5 +50,10 @@ export function createLegend(element, graph, handlers) {
 	for (const input of element.querySelectorAll("input[data-kind]")) {
 		input.onchange = () => handlers.onKind(input.dataset.kind, input.checked);
 	}
-	return { hiddenKinds: KINDS.filter((k) => !k.on && kindCounts.has(k.id)).map((k) => k.id) };
+	// What the boxes actually say, narrowed to what this graph has: a lobe the vault no
+	// longer contains must not stay filtered forever.
+	return {
+		hiddenCategories: categories.filter((c) => !categoryOn(c)).map((c) => c.id),
+		hiddenKinds: kinds.filter((k) => !kindOn(k)).map((k) => k.id),
+	};
 }

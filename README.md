@@ -33,6 +33,15 @@ your own cloud account.
   wrote down. Past sessions are mined from Claude Code's own transcripts, so recall
   answers "have we hit this before" alongside "what do we know". Nothing episodic is
   written to your vault; it lives in the local index only.
+- **Standing instructions** — the rules you state in passing ("always run tsc before
+  committing", "never publish that repo") are caught from the prompt, held apart from
+  notes and episodes, and put in front of later sessions unasked. Saying one again
+  strengthens it; saying the opposite replaces it, and the old one stops being offered
+  rather than lingering to intrude. Only a handful compete for the space at the top of a
+  session, so the strongest win and a rule about what you are doing right now comes
+  forward. A rule you have repeated across sessions graduates into your `CLAUDE.md`,
+  where it holds whether or not the daemon is running. `claude-brain rules` shows what is
+  held and `--retract` drops one.
 - **Memory that behaves like memory** — retrieving a note strengthens it, unused
   traces decay on a power-law curve, and recall spreads one hop along every kind of
   association — wikilinks, similarity, tags, notes that keep being recalled together —
@@ -122,8 +131,11 @@ CLI reference:
 claude-brain recall "<query>" [k] [-p <folder>] [-e <n>] [--full]
                                    search notes and past sessions
 claude-brain note "<text>" [-f <subfolder>]      quick-capture (default Inbox/)
-claude-brain remember "<text>" [-k decision|preference|outcome]
-                                   store a durable fact in episodic memory
+claude-brain remember "<text>" [-k decision|preference|outcome|rule]
+                                   store a durable fact; rule-shaped text becomes a
+                                   standing instruction
+claude-brain rules [--retract <id>]
+                                   the standing instructions, strongest first
 
 claude-brain path "<from>" "<to>"  how two notes connect, hop by hop
 claude-brain explain "<note>"      a note and everything around it

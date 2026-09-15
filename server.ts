@@ -37,6 +37,7 @@ import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
 import { findEpisodes, forgetEpisode } from "./src/episodic";
 import { asVia, subscribe } from "./src/events";
+import { captureDirective, listDirectives, retractDirective, statedDirective } from "./src/directives";
 import { guardToolCall } from "./src/guard";
 import { appendJournal, readNote } from "./src/vault-io";
 import { overview } from "./src/overview";
@@ -44,7 +45,7 @@ import { renderAffected, renderExplain, renderMap, renderPath } from "./src/grap
 import { indexStatus } from "./src/hybrid-search";
 import { openBrainDb, resetIndex } from "./src/index-db";
 import { reindex } from "./src/indexer";
-import { autoIntegrate, integrate, integrationStatus, unintegrate } from "./src/integrate";
+import { autoIntegrate, integrate, integrationStatus, unintegrate, writeStandingInstructions } from "./src/integrate";
 import { recall, recallMarkdown } from "./src/recall";
 import { noteServed, servedPaths } from "./src/hybrid-search";
 import { digest, finishSession, prime } from "./src/session-memory";
@@ -746,6 +747,34 @@ const serveOptions = {
 					},
 				}),
 			);
+		}
+
+		// The standing instructions: what the brain will put in front of future sessions.
+		if (url.pathname === "/api/directives" && !post) {
+			return jsonResponse({ directives: listDirectives() });
+		}
+
+		if (url.pathname === "/api/directives" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const str = (v: unknown) => (typeof v === "string" ? v : "");
+			const text = str(body.text).trim();
+			if (!text) return jsonResponse({ error: "missing text" }, 400);
+			const result = captureDirective(statedDirective(text), str(body.sessionId), str(body.cwd));
+			return jsonResponse(result);
+		}
+
+		if (url.pathname === "/api/directives/retract" && post) {
+			const body = (await req.json()) as Record<string, unknown>;
+			const id = typeof body.id === "number" ? body.id : Number(body.id);
+			if (!Number.isInteger(id)) return jsonResponse({ error: "missing id" }, 400);
+			const retracted = retractDirective(id);
+			// A retracted rule has to stop being followed now, not at the next session end:
+			// if it had reached CLAUDE.md, take it back out of the file in the same breath.
+			if (retracted) {
+				const consolidated = listDirectives().filter((rule) => rule.status === "consolidated");
+				await writeStandingInstructions(consolidated.map((rule) => rule.text));
+			}
+			return jsonResponse({ retracted });
 		}
 
 		if (url.pathname === "/api/journal" && post) {

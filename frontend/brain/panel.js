@@ -101,5 +101,10 @@ export function createPanel(container, graph, handlers) {
 		panel.classList.remove("open");
 	}
 
-	return { open, close, isOpen: () => panel.classList.contains("open") };
+	return {
+		open,
+		close,
+		isOpen: () => panel.classList.contains("open"),
+		dispose: () => panel.remove(),
+	};
 }

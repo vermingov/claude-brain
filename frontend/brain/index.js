@@ -124,15 +124,15 @@ export function createBrainTab(container) {
 	createStarfield(scene);
 	// Test hook: the harness reads the camera through this, and can play a volley without
 	// a daemon behind it.
-	let frozen = false;
 	canvas.brainView = {
 		camera: view.camera,
 		engine,
 		simulate: (event) => onActivity(event),
-		/** Harness hook: hold the camera still, so a resting frame can be compared. */
-		freeze: (on) => {
-			frozen = on;
-		},
+		/** Harness hook: refuse automatic camera moves, so a resting frame can be compared. */
+		freeze: (on) => view.hold(on),
+		/** Harness hooks: where a note lands on screen, and what the pointer would hit there. */
+		project: (index) => projectNode(index),
+		pickAt: (x, y) => picker?.pick(x, y) ?? -1,
 	};
 
 	// Everything below exists once the graph has loaded.
@@ -155,6 +155,25 @@ export function createBrainTab(container) {
 	let loadedAt = 0;
 	let qualityChecked = false;
 	let stopWatching = () => {};
+
+	/** A note's centre in pointer coordinates, and how big it is there. */
+	function projectNode(index) {
+		if (!graph) return null;
+		const node = graph.nodes[index];
+		const m = scene.getTransformMatrix().m;
+		const depth = node.x * m[3] + node.y * m[7] + node.z * m[11] + m[15];
+		if (depth <= 0) return null;
+		const scaling = engine.getHardwareScalingLevel();
+		const width = engine.getRenderWidth() * scaling;
+		const height = engine.getRenderHeight() * scaling;
+		const focal = view.camera.getProjectionMatrix().m[5];
+		return {
+			x: ((node.x * m[0] + node.y * m[4] + node.z * m[8] + m[12]) / depth + 1) * 0.5 * width,
+			y: (1 - (node.x * m[1] + node.y * m[5] + node.z * m[9] + m[13]) / depth) * 0.5 * height,
+			radius: (radii[index] * focal * height) / (2 * depth),
+			depth,
+		};
+	}
 
 	/** Titles are for what the viewer is touching and what just fired, nothing else. */
     function labelSet() {
@@ -230,6 +249,10 @@ export function createBrainTab(container) {
 	}
 
 	function onActivity(event) {
+		if (event.type === "graph") {
+			void refreshGraph();
+			return;
+		}
 		if (!layers || reducedMotion) return;
 		const seeds = (event.paths ?? []).map((path) => indexByPath.get(path)).filter((index) => index !== undefined);
 		const route = (event.route ?? []).map((path) => indexByPath.get(path)).filter((index) => index !== undefined);
@@ -257,7 +280,19 @@ export function createBrainTab(container) {
 		restyle();
 	}
 
-	function build(data) {
+	/** Tear down everything that was built from the previous graph payload. */
+	function unmount() {
+		if (!layers) return;
+		for (const layer of Object.values(layers)) layer.dispose?.();
+		panel?.dispose();
+		layers = null;
+	}
+
+	function mount(data) {
+		const previous = graph ? new Set(graph.nodes.map((node) => node.id)) : null;
+		const keepHidden = emphasis ? { categories: emphasis.state.hiddenCategories, kinds: emphasis.state.hiddenKinds } : null;
+		const openPath = emphasis && emphasis.state.selected !== -1 ? graph.nodes[emphasis.state.selected].id : null;
+		unmount();
 		graph = data;
 		emphasis = createEmphasis(graph);
 		conduction = buildConduction(graph);
@@ -317,6 +352,7 @@ export function createBrainTab(container) {
 				onPick: focusOn,
 			},
 		);
+		layers.search = search;
 		const legend = createLegend(chrome.querySelector(".brain-legend"), graph, {
 			onCategory(id, on) {
 				if (on) emphasis.state.hiddenCategories.delete(id);
@@ -328,11 +364,30 @@ export function createBrainTab(container) {
 				else emphasis.state.hiddenKinds.add(kind);
 				restyle();
 			},
-		});
+		}, keepHidden);
+		for (const id of legend.hiddenCategories) emphasis.state.hiddenCategories.add(id);
 		for (const kind of legend.hiddenKinds) emphasis.state.hiddenKinds.add(kind);
 		restingStatus = `${n.toLocaleString()} notes · ${graph.edges.length.toLocaleString()} synapses`;
 		statsEl.textContent = restingStatus;
+		if (openPath !== null) {
+			const back = indexByPath.get(openPath);
+			if (back !== undefined) emphasis.state.selected = back;
+		}
 		restyle();
+
+		// A note that was not here a moment ago fires as it arrives, so the vault changing
+		// is something you watch happen rather than something you find later.
+		if (previous) {
+			const arrived = graph.nodes.map((node, i) => (previous.has(node.id) ? -1 : i)).filter((i) => i !== -1);
+			if (arrived.length > 0 && !reducedMotion) {
+				play(planVolley(conduction, arrived.slice(0, 8), { now: performance.now() / 1000, passes: emphasis.edgeVisible, limit: 120 }));
+				setStatus(`${arrived.length} new note${arrived.length === 1 ? "" : "s"} in the vault`);
+			}
+		}
+	}
+
+	function build(data) {
+		mount(data);
 		stopWatching = watchActivity(onActivity);
 
 		// Settle into a three-quarter profile: the brain silhouette reads best there. The
@@ -348,6 +403,20 @@ export function createBrainTab(container) {
 		const loading = chrome.querySelector(".brain-loading");
 		loading.classList.add("done");
 		setTimeout(() => loading.remove(), 700);
+	}
+
+	/** The vault changed and the daemon has finished placing it: take the new picture. */
+	let refreshing = false;
+	async function refreshGraph() {
+		if (refreshing || !visible) return;
+		refreshing = true;
+		try {
+			const data = await (await fetch("/api/graph")).json();
+			search?.clear();
+			mount(data);
+		} finally {
+			refreshing = false;
+		}
 	}
 
 	// Pointer: throttled screen-space picks.
@@ -394,8 +463,7 @@ export function createBrainTab(container) {
 				if (engine.getFps() < LOW_FPS) quality.lighten();
 			}
 		}
-		const holdStill = frozen || (emphasis !== null && (emphasis.state.selected !== -1 || emphasis.state.matches !== null));
-		view.update(dt, now, holdStill, reducedMotion);
+		view.update(dt, now);
 	});
 
 	function startLoop() {
@@ -427,6 +495,8 @@ export function createBrainTab(container) {
 			resize();
 			setTimeout(resize, 80);
 			startLoop();
+			// Away from this tab, updates were skipped; take the current picture on return.
+			if (graph) void refreshGraph();
 		},
 		hide() {
 			visible = false;

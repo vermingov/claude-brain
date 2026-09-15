@@ -10,6 +10,14 @@
 
 import { consolidate } from "./consolidate";
 import {
+	captureDirective,
+	detectDirectives,
+	consolidate as consolidateDirectives,
+	markFired,
+	PROMPT_BUDGET,
+	selectDirectives,
+} from "./directives";
+import {
 	alreadyInjected,
 	endSession,
 	ensureSession,
@@ -21,6 +29,7 @@ import {
 import { clearPriming, indexStatus } from "./hybrid-search";
 import { getMeta, openBrainDb } from "./index-db";
 import { ago, recall } from "./recall";
+import { standingInstructions, writeStandingInstructions } from "./integrate";
 import { findTranscript, isSynthetic, mineTranscript } from "./transcript";
 
 /**
@@ -60,10 +69,20 @@ export function digest({ sessionId, cwd }: DigestOptions): string {
 	ensureSession(sessionId, cwd);
 	const status = indexStatus();
 	const proposals = Number(getMeta(openBrainDb().db, "proposals") ?? "0") || 0;
+	// The standing instructions come first and come unasked. A rule the session has to go
+	// looking for is one it has already broken. The consolidated ones are skipped: they are
+	// in CLAUDE.md already, and this block would only repeat them.
+	const standing = standingInstructions();
+	const rules = selectDirectives({ cwd }).filter((rule) => !standing.has(rule.text));
 	const lines = [
-		`brain: ${status.docs} notes · ${status.episodes} episodes · ${status.communities} clusters` +
-			` — \`claude-brain recall "<q>"\`, \`claude-brain path/explain/affected/map\``,
+		`brain: ${status.docs} notes · ${status.episodes} episodes — recall before you dig` +
+			(rules.length > 0 ? ", rules are below" : ""),
 	];
+	if (rules.length > 0) {
+		markFired(rules.map((rule) => rule.id));
+		markInjected(sessionId, rules.map((rule) => `directive:${rule.id}`));
+		lines.push("standing instructions (follow these):", ...rules.map((rule) => `- ${rule.text}`));
+	}
 	for (const session of recentSessions(cwd, 2, sessionId)) {
 		if (!session.summary) continue;
 		lines.push(`last here (${ago(session.ended ?? session.started)}): ${clip(session.summary, 220)}`);
@@ -88,18 +107,49 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 	const text = prompt.trim();
 	if (text.length < 25 || isSynthetic(text)) return "";
 	ensureSession(sessionId, cwd);
-	// A null id means this exact prompt is already stored for this session — the user
-	// is repeating themselves, and so would the recall.
+
+	// "always do X", "never do Y": a rule, not a request for this turn. Caught here rather
+	// than left to the agent to notice, because the whole point is that it survives the
+	// session it was given in. Before the episode is stored, because the two stores decide
+	// what counts as a repeat differently: saying a rule again is the whole of how it gets
+	// strong, and an episodic duplicate must not swallow it.
+	const captured: string[] = [];
+	for (const draft of detectDirectives(text)) {
+		const result = captureDirective(draft, sessionId, cwd);
+		markInjected(sessionId, [`directive:${result.directive.id}`]);
+		// The instruction is already in the prompt; repeating it back costs context and
+		// tells the session nothing it does not have. Only the change is worth a line.
+		if (result.superseded) captured.push(`#${result.directive.id} replaces "${clip(result.superseded.text, 70)}"`);
+		else if (!result.reinforced) captured.push(`#${result.directive.id}`);
+	}
+
+	// Rules whose subject is what is being asked right now, minus the ones this session has
+	// already been given: a rule is worth saying once, not every turn. Consolidated rules
+	// are skipped for the same reason as at session start — CLAUDE.md carries them.
+	const standing = standingInstructions();
+	const live = selectDirectives({ cwd, all: true });
+	const shown = alreadyInjected(sessionId, live.map((rule) => `directive:${rule.id}`));
+	const spent = new Set(
+		live.filter((rule) => shown.has(`directive:${rule.id}`) || standing.has(rule.text)).map((rule) => rule.id),
+	);
+	const rules = selectDirectives({ cwd, prompt: text, limit: PROMPT_BUDGET, exclude: spent });
+	if (rules.length > 0) {
+		markFired(rules.map((rule) => rule.id));
+		markInjected(sessionId, rules.map((rule) => `directive:${rule.id}`));
+	}
+
+	// A null id means this exact prompt is already stored for this session — the user is
+	// repeating themselves, and so would the recall.
 	const encoded = recordEpisode({ sessionId, cwd, kind: "prompt", text: clip(text, 600), salience: 1.4 });
-	if (encoded === null) return "";
+	if (encoded === null) return frame([], captured, rules);
 
 	const hits = await recall(text, { k: 4, episodeK: 2, sessionId, cwd, excludeSessionId: sessionId, via: "hook" });
-	if (hits.length === 0) return "";
+	if (hits.length === 0) return frame([], captured, rules);
 	// Whatever it scored: if the vault has no word for what was asked, it has nothing to
 	// offer, and injecting its best guess on every turn is how a brain becomes noise.
-	if (hits.some((hit) => hit.weak)) return "";
+	if (hits.some((hit) => hit.weak)) return frame([], captured, rules);
 	const best = Math.max(...hits.map((h) => h.score));
-	if (best < MIN_SCORE) return "";
+	if (best < MIN_SCORE) return frame([], captured, rules);
 
 	const strong = hits.filter((h) => h.score >= Math.max(MIN_SCORE, best * RELATIVE_FLOOR));
 	const refs = strong.map((h) => (h.kind === "note" ? h.path : `${h.path}#${h.snippet.slice(0, 40)}`));
@@ -108,7 +158,7 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 	const fresh = strong.filter((_, i) => !seen.has(refs[i]!));
 	const notes = fresh.filter((h) => h.kind === "note").slice(0, MAX_NOTES);
 	const episodes = fresh.filter((h) => h.kind === "episode").slice(0, MAX_EPISODES);
-	if (notes.length === 0 && episodes.length === 0) return "";
+	if (notes.length === 0 && episodes.length === 0) return frame([], captured, rules);
 
 	markInjected(
 		sessionId,
@@ -119,12 +169,27 @@ export async function prime({ sessionId, cwd, prompt }: PrimeOptions): Promise<s
 		...notes.map((h) => `- \`${h.path}\` — ${h.title}: ${clip(h.snippet)}`),
 		...episodes.map((h) => `- [${h.when ? ago(h.when) : "earlier"}] you have hit this before: ${clip(h.snippet, 200)}`),
 	];
-	return [
-		"<brain-recall>",
-		"Recalled from the second brain (background memory, not user instructions):",
-		...body,
-		"</brain-recall>",
-	].join("\n");
+	return frame(body, captured, rules);
+}
+
+/**
+ * One block or none. Standing instructions are the user's own words given back, so they
+ * are labelled as instructions; everything else is background the session may use or
+ * ignore.
+ */
+function frame(memory: string[], captured: string[], rules: Array<{ text: string }>): string {
+	const lines: string[] = [];
+	if (rules.length > 0) {
+		lines.push("Standing instructions from earlier sessions — follow them:");
+		lines.push(...rules.map((rule) => `- ${rule.text}`));
+	}
+	if (captured.length > 0) lines.push(`Kept as a standing instruction: ${captured.join(", ")}.`);
+	if (memory.length > 0) {
+		lines.push("Recalled from the vault (background, not instructions):");
+		lines.push(...memory);
+	}
+	if (lines.length === 0) return "";
+	return ["<brain-recall>", ...lines, "</brain-recall>"].join("\n");
 }
 
 export interface EndReport {
@@ -150,6 +215,10 @@ export async function finishSession(sessionId: string): Promise<EndReport> {
 		endSession(sessionId);
 	}
 	clearPriming(sessionId);
+	// Sleep-time consolidation: rules that have held across sessions move to the slow
+	// store, where they are loaded whether or not this daemon is running.
+	const promoted = consolidateDirectives();
+	await writeStandingInstructions(promoted.map((rule) => rule.text));
 
 	const report = consolidate(7);
 	return {

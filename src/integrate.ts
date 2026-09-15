@@ -28,6 +28,9 @@ const MCP_NAME = "claude-brain";
 
 const BLOCK_BEGIN = "<!-- claude-brain:begin -->";
 const BLOCK_END = "<!-- claude-brain:end -->";
+/** The slow store: rules that have held long enough to be loaded every session, daemon or no daemon. */
+const STANDING_BEGIN = "<!-- claude-brain:standing:begin -->";
+const STANDING_END = "<!-- claude-brain:standing:end -->";
 /**
  * Three hooks, one per moment that matters: orient at the start, encode-and-cue on each
  * prompt, consolidate at the end. Every one ends in `|| true` so a stopped server or an
@@ -58,7 +61,8 @@ A personal second brain (markdown vault) is connected — persistent memory acro
 - **Remember, don't ingest.** Look things up with the \`recall\` tool (CLI: \`claude-brain recall "<query>"\`) — hybrid search (BM25 + local embeddings + graph boost) returning only the answering lines of each matching note. Works semantically: describe the symptom, exact keywords not required; a misspelt cue is corrected against the vault's own vocabulary. \`full\` widens a hit to its whole section.
 - **Before debugging or starting work**, \`recall\` the topic or symptom first, then \`read\` the specific note if you need more than the answering lines. A result that opens with "(weak match …)" found nothing the vault covers well — it names the words no note contains. Do not treat it as fact, and say so rather than presenting a guess as memory.
 - **Two memory systems.** Vault notes are *semantic* memory (curated, what's true). Past sessions are *episodic* memory (automatic, what happened) — mined from Claude Code's own transcripts, so recall answers "have we hit this before" as well as "what do we know". Episodes appear under \`## Episodic\` and live only in the local index, never in the vault. Retrieval strengthens what it returns; a note says when another session last used it; unrehearsed prompts fade after ~4 weeks (tool failures ~7), while anything recalled once, and every \`remember\`, stays.
-- **\`remember\` tool** (CLI: \`claude-brain remember "<text>" -k decision|preference|outcome\`) for a durable constraint that isn't note-shaped ("deploy from main only, never a tag").
+- **\`remember\` tool** (CLI: \`claude-brain remember "<text>" -k decision|preference|outcome\`) for a durable constraint that isn't note-shaped ("deploy from main only, never a tag"). Text that reads like a rule is filed as a standing instruction rather than an episode; pass kind \`rule\` to force it.
+- **Standing instructions are the third memory.** Notes say what is true and episodes say what happened; these say how to act. A rule stated in passing ("always run tsc before committing", "never publish that repo") is caught from the prompt, kept apart from both, and put in front of later sessions unasked, strongest first. Saying it again strengthens it; saying the opposite replaces it. \`rules\` lists them with strength and how often they were said (CLI: \`claude-brain rules\`); \`rules\` with \`retract\` drops one (CLI: \`claude-brain rules --retract <id>\`) — only when the user asks. A rule repeated across sessions is written into this file's own standing-instructions block, after which it holds whether or not the daemon is running.
 - **Structure questions** use the graph, rebuilt automatically in ~100 ms — no LLM, never stale. Tools \`path\` / \`explain\` / \`affected\` / \`map\`, or the CLI below; arguments accept plain English, not just exact titles:
   - \`claude-brain path "<A>" "<B>"\` — how two notes connect, with the relation on each hop
   - \`claude-brain explain "<note>"\` — a note, its cluster, and every neighbour by edge kind
@@ -137,8 +141,12 @@ Before ending a session with meaningful work, record into the vault (location:
 3. **Quick capture** — \`claude-brain note "<text>" [-f <subfolder>]\` drops a
    thought into \`<subfolder>/\` (default \`Inbox/\`) without opening an editor.
 4. **Durable constraint** — \`claude-brain remember "<text>" -k preference\` for a
-   rule that isn't note-shaped. It survives the forgetting pass; a plain prompt
+   fact that isn't note-shaped. It survives the forgetting pass; a plain prompt
    does not.
+5. **Standing instruction** — a rule about how to work ("always …", "never …") is
+   caught from the prompt automatically and handed to later sessions.
+   \`claude-brain rules\` shows what is held; \`--retract <id>\` drops one, only
+   when the user asks.
 
 \`claude-brain consolidate\` reports themes that recurred across separate sessions.
 Those are the strongest candidates for a real note — something hit three times in
@@ -153,6 +161,67 @@ Rules:
 - Keep entries atomic and searchable — titles describe the symptom or topic.
 - The index updates itself; no reindex commands needed.
 `;
+}
+
+/**
+ * Write the consolidated standing instructions into CLAUDE.md, in their own fenced block.
+ *
+ * This is the crossing from the fast store to the slow one. A rule the user has repeated,
+ * or one that has stood unchallenged for days, stops depending on a running daemon and a
+ * hook firing at the right moment: it is simply part of what every session is told. An
+ * empty list removes the block, so retracting a rule takes it back out of the file.
+ */
+export async function writeStandingInstructions(rules: string[]): Promise<boolean> {
+	let markdown: string;
+	try {
+		markdown = readFileSync(claudeMd(), "utf-8");
+	} catch {
+		return false;
+	}
+	const blockRe = new RegExp(`\\n?${STANDING_BEGIN}[\\s\\S]*?${STANDING_END}\\n?`);
+	const block =
+		rules.length === 0
+			? ""
+			: [
+					`\n${STANDING_BEGIN}`,
+					"# Standing instructions (remembered by claude-brain)",
+					"The user gave these in earlier sessions and has not withdrawn them. Follow them as if they were said",
+					"again now. `claude-brain rules` lists them with their strength; `claude-brain rules --retract <id>` drops one.",
+					"",
+					...rules.map((rule) => `- ${rule}`),
+					`${STANDING_END}\n`,
+				].join("\n");
+	const next = block
+		? blockRe.test(markdown)
+			? markdown.replace(blockRe, block)
+			: `${markdown.trimEnd()}\n${block}`
+		: `${markdown.replace(blockRe, "\n").trimEnd()}\n`;
+	if (next === markdown) return false;
+	await Bun.write(claudeMd(), next);
+	return true;
+}
+
+/**
+ * The rules CLAUDE.md is already carrying. A consolidated rule is loaded with the file on
+ * every session, so injecting it again at session start spends context to say the same
+ * thing twice. Read back rather than assumed: if the user deleted the block by hand, the
+ * rule goes back to being injected instead of silently going missing.
+ */
+export function standingInstructions(): Set<string> {
+	let markdown: string;
+	try {
+		markdown = readFileSync(claudeMd(), "utf-8");
+	} catch {
+		return new Set();
+	}
+	const block = markdown.match(new RegExp(`${STANDING_BEGIN}([\\s\\S]*?)${STANDING_END}`))?.[1];
+	if (!block) return new Set();
+	return new Set(
+		block
+			.split("\n")
+			.filter((line) => line.startsWith("- "))
+			.map((line) => line.slice(2).trim()),
+	);
 }
 
 export interface IntegrationStatus {
@@ -320,7 +389,10 @@ export async function autoIntegrate(version: string | null): Promise<Integration
 export async function unintegrate(): Promise<IntegrationStatus> {
 	try {
 		const md = readFileSync(claudeMd(), "utf-8");
-		const cleaned = md.replace(new RegExp(`\\n?${BLOCK_BEGIN}[\\s\\S]*?${BLOCK_END}\\n?`), "\n").trimEnd();
+		const cleaned = md
+			.replace(new RegExp(`\\n?${BLOCK_BEGIN}[\\s\\S]*?${BLOCK_END}\\n?`), "\n")
+			.replace(new RegExp(`\\n?${STANDING_BEGIN}[\\s\\S]*?${STANDING_END}\\n?`), "\n")
+			.trimEnd();
 		await Bun.write(claudeMd(), cleaned ? `${cleaned}\n` : "");
 	} catch {
 		/* nothing to clean */

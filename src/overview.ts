@@ -3,6 +3,7 @@
 // one expensive thing (finding recurring themes) is taken from the last consolidation
 // rather than recomputed per page load.
 
+import { type Directive, listDirectives } from "./directives";
 import { indexStatus, type IndexStatus } from "./hybrid-search";
 import { getMeta, openBrainDb } from "./index-db";
 import type { Recurrence } from "./consolidate";
@@ -37,6 +38,8 @@ export interface RecentSession {
 
 export interface Overview {
 	index: IndexStatus;
+	/** The standing instructions, strongest first. */
+	directives: Directive[];
 	activity: DayActivity[];
 	topNotes: TopNote[];
 	recentSessions: RecentSession[];
@@ -100,5 +103,14 @@ export function overview(now = Date.now()): Overview {
 	} catch {
 		/* an older daemon stored only the count */
 	}
-	return { index: indexStatus(), activity: activity(now), topNotes, recentSessions, themes, clusters, episodesByKind };
+	return {
+		index: indexStatus(),
+		directives: listDirectives(now).slice(0, 8),
+		activity: activity(now),
+		topNotes,
+		recentSessions,
+		themes,
+		clusters,
+		episodesByKind,
+	};
 }
