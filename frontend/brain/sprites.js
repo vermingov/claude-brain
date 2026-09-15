@@ -27,14 +27,18 @@ export function createSpriteLayer(scene, spec) {
 		scene,
 		{ vertex: spec.vertex, fragment: spec.fragment },
 		{
-			attributes: ["position", "corner", "tint", "size", "phase", ...(spec.extraAttributes ?? [])],
+			attributes: ["position", "corner", "tint", "size", "phase", "flash", ...(spec.extraAttributes ?? [])],
 			uniforms: ["view", "projection", "time", "pulse", "fogDensity", "fogColor"],
-			needAlphaBlending: spec.additive,
+			needAlphaBlending: true,
 		},
 	);
 	if (spec.additive) {
 		material.alphaMode = Constants.ALPHA_ADD;
 		material.disableDepthWrite = true;
+	} else {
+		// Opaque discs with a blended rim: keep depth so nearer notes still occlude.
+		material.alphaMode = Constants.ALPHA_COMBINE;
+		material.disableDepthWrite = false;
 	}
 	material.backFaceCulling = false;
 	material.setFloat("time", 0);
@@ -63,6 +67,8 @@ export function createSpriteLayer(scene, spec) {
 	mesh.setVerticesData("tint", new Float32Array(count * 16), true, 4);
 	mesh.setVerticesData("size", new Float32Array(count * 4), true, 1);
 	mesh.setVerticesData("phase", new Float32Array(count * 4), true, 1);
+	const flashes = new Float32Array(count * 4).fill(-1e9);
+	mesh.setVerticesData("flash", flashes, true, 1);
 	for (const name of spec.extraAttributes ?? []) mesh.setVerticesData(name, new Float32Array(count * 12), true, 3);
 
 	/** Write one vec3 per instance into a per-corner buffer. */
@@ -100,6 +106,11 @@ export function createSpriteLayer(scene, spec) {
 			const data = new Float32Array(count * 4);
 			for (let i = 0; i < count; i++) data.fill(values[i], i * 4, i * 4 + 4);
 			mesh.updateVerticesData("phase", data);
+		},
+		/** Mark instances as flashed at `seconds`; the shader fades them over the next moments. */
+		flash(indexes, seconds) {
+			for (const i of indexes) flashes.fill(seconds, i * 4, i * 4 + 4);
+			mesh.updateVerticesData("flash", flashes);
 		},
 		setTime: (seconds) => material.setFloat("time", seconds),
 		setPulse: (amount) => material.setFloat("pulse", amount),

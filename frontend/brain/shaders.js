@@ -12,15 +12,18 @@ float fogFactor(float depth) { float d = depth * fogDensity; return clamp(exp(-d
 /** Static sprite: the quad sits at `position`, sized by `size`, pulsing by `phase` when `pulse` > 0. */
 Effect.ShadersStore.brainSpriteVertexShader = `
 precision highp float;
-attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size; attribute float phase;
+attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute float size; attribute float phase; attribute float flash;
 uniform mat4 view; uniform mat4 projection; uniform float time; uniform float pulse;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth;
 void main() {
 	vec4 viewPos = view * vec4(position, 1.0);
-	float s = size * (1.0 + pulse * 0.08 * sin(time * 1.4 + phase));
+	// A recalled note flares and fades over a couple of seconds.
+	float since = time - flash;
+	float boost = since >= 0.0 ? exp(-since * 1.3) : 0.0;
+	float s = size * (1.0 + pulse * 0.08 * sin(time * 1.4 + phase)) * (1.0 + 0.7 * boost);
 	viewPos.xy += corner * s;
 	gl_Position = projection * viewPos;
-	vTint = tint; vCorner = corner; vDepth = -viewPos.z;
+	vTint = vec4(tint.rgb + boost * 0.6, tint.a + boost * 0.5); vCorner = corner; vDepth = -viewPos.z;
 }`;
 
 /** A spark rides its edge from `position` to `target`, restarting when it arrives. */
@@ -44,12 +47,15 @@ precision highp float;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth;
 ${FOG}
 void main() {
-	float d2 = dot(vCorner, vCorner);
-	if (d2 > 1.0) discard;
-	vec3 normal = vec3(vCorner, sqrt(1.0 - d2));
+	float d = length(vCorner);
+	// The rim is blended over one screen pixel, so a disc has no staircase edge.
+	float edge = fwidth(d);
+	float coverage = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, d);
+	if (coverage <= 0.002) discard;
+	vec3 normal = vec3(vCorner, sqrt(max(1.0 - d * d, 0.0)));
 	float light = 0.55 + 0.45 * max(dot(normal, normalize(vec3(-0.4, 0.6, 0.75))), 0.0);
 	vec3 color = vTint.rgb * light;
-	gl_FragColor = vec4(mix(fogColor, color, fogFactor(vDepth)), 1.0);
+	gl_FragColor = vec4(mix(fogColor, color, fogFactor(vDepth)), coverage);
 }`;
 
 /** Additive radial glow with a steep falloff, so halos read as rims instead of washing the scene out. */

@@ -35,6 +35,7 @@ import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
+import { subscribe } from "./src/events";
 import { overview } from "./src/overview";
 import { renderAffected, renderExplain, renderMap, renderPath } from "./src/graph-render";
 import { indexStatus } from "./src/hybrid-search";
@@ -150,6 +151,37 @@ async function llmStatus() {
 		account: probe.account ?? null,
 		version: probe.version ?? null,
 	};
+}
+
+/**
+ * Server-sent events: every recall the daemon makes, as it makes it. A comment line every
+ * 25 s keeps idle proxies and browsers from closing the stream.
+ */
+function eventStream(): Response {
+	const encoder = new TextEncoder();
+	let unsubscribe = () => {};
+	let keepAlive: ReturnType<typeof setInterval> | null = null;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			const write = (chunk: string) => {
+				try {
+					controller.enqueue(encoder.encode(chunk));
+				} catch {
+					unsubscribe();
+				}
+			};
+			write(": connected\n\n");
+			unsubscribe = subscribe((event) => write(`data: ${JSON.stringify(event)}\n\n`));
+			keepAlive = setInterval(() => write(": keep-alive\n\n"), 25_000);
+		},
+		cancel() {
+			unsubscribe();
+			if (keepAlive) clearInterval(keepAlive);
+		},
+	});
+	return new Response(stream, {
+		headers: { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" },
+	});
 }
 
 function textResponse(text: string): Response {
@@ -691,6 +723,7 @@ const serveOptions = {
 
 		if (url.pathname === "/api/status") return jsonResponse(await fullStatus());
 		if (url.pathname === "/api/overview") return jsonResponse(overview());
+		if (url.pathname === "/api/events") return eventStream();
 		if (url.pathname === "/api/reindex" && post) return jsonResponse(await reindex());
 		if (url.pathname === "/api/vaults") return jsonResponse({ vaults: detectVaults() });
 

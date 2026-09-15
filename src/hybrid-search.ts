@@ -10,6 +10,7 @@
 
 import { activationBoost, strengthen } from "./activation";
 import { embedQuery } from "./embedder";
+import { emit } from "./events";
 import { EDGE_WEIGHT } from "./graph";
 import { EMBED_DIM, openBrainDb } from "./index-db";
 import { focusSnippet } from "./snippet";
@@ -716,6 +717,7 @@ export async function hybridRecall(query: string, options: RecallOptions = {}): 
 			episodes.map((e) => e.id),
 		);
 		if (options.sessionId) recordRecalls(options.sessionId, cwd ?? "", topNotes.map((n) => n.docId));
+		if (topNotes.length > 0) emit({ type: "recall", ts: Date.now(), paths: topNotes.map((n) => n.path), query: clip(query, 120) });
 	}
 	const lastUsed = lastUsedFor(topNotes.map((n) => n.docId), options.sessionId);
 

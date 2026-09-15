@@ -1,11 +1,13 @@
-// Force-directed layout with the anatomy of a brain: category lobes pinned onto the
-// cortex of an ellipsoid, a shell force that keeps notes in the cortical band instead
-// of the deep interior, and a longitudinal fissure between the hemispheres. Pure
-// computation, no I/O — it runs in a worker thread on the daemon so the layout is
-// computed once per change and served to every viewer, instead of every page load
-// re-simulating three hundred ticks in the browser and freezing it meanwhile.
+// Force-directed layout with the anatomy of a brain: every note is held on the cortex of
+// a procedural brain (brain-surface.ts) — two folded hemispheres, cerebellum, brainstem —
+// and each folder gathers in an anatomical region, the biggest folders taking the
+// frontal and parietal lobes. Links and charge move notes along the surface; the field
+// keeps them on it. Pure computation, no I/O — it runs in a worker thread on the daemon
+// so the layout is computed once per change and served to every viewer, instead of
+// every page load re-simulating three hundred ticks in the browser.
 
 import { forceLink, forceManyBody, forceSimulation } from "d3-force-3d";
+import { brainGradient, type BrainShape, projectToSurface, regionAnchor } from "./brain-surface";
 
 export interface LayoutNode {
 	id: number;
@@ -31,14 +33,13 @@ export interface Point {
 	z: number;
 }
 
-/** Ellipsoid the layout settles into: longer front-to-back than wide, wider than tall. */
+/** Semi-axes of the cerebrum: longer front-to-back than wide, wider than tall. */
 export const BRAIN = { x: 150, y: 120, z: 200 };
 /** The proportions above fit ~160 notes on the cortex; a bigger vault gets a bigger brain. */
 const BRAIN_BASE_NOTES = 160;
-const FISSURE_HALF_WIDTH = 14;
-/** Notes live in the cortical shell, not the deep interior. */
-const SHELL_INNER = 0.62;
 const CLUSTER_STRENGTH = 0.9;
+/** How hard the field pulls a drifting note back onto the cortex, per tick. */
+const SURFACE_STIFFNESS = 0.5;
 const CHARGE = -95;
 export const COLD_TICKS = 300;
 /** A warm start already has a picture; it only needs to absorb what changed. */
@@ -68,28 +69,19 @@ export function lobeOf(path: string): string {
 	return folder.replace(/^\d+[\s._-]+/, "") || folder;
 }
 
+export function brainShape(scale: number): BrainShape {
+	return { ax: BRAIN.x * scale, ay: BRAIN.y * scale, az: BRAIN.z * scale };
+}
+
 /**
- * Golden-spiral points on the upper cortex of the ellipsoid, mirrored into alternating
- * hemispheres so lobes spread over both sides instead of stacking on one.
+ * One anatomical region per lobe, largest lobes first, alternating hemispheres, so the
+ * folders that hold most of the vault take the frontal and parietal cortex and a
+ * two-note folder ends up somewhere small.
  */
-export function categoryAnchors(categories: string[], scale = 1): Map<string, Point> {
-	const golden = Math.PI * (3 - Math.sqrt(5));
-	return new Map(
-		categories.map((category, i) => {
-			const y = 0.15 + (i / Math.max(categories.length - 1, 1)) * 0.8;
-			const r = Math.sqrt(Math.max(0, 1 - y * y));
-			const theta = golden * i;
-			const side = i % 2 === 0 ? 1 : -1;
-			return [
-				category,
-				{
-					x: side * Math.max(Math.abs(Math.cos(theta) * r) * BRAIN.x * scale, FISSURE_HALF_WIDTH * 2.5),
-					y: y * BRAIN.y * scale,
-					z: Math.sin(theta) * r * BRAIN.z * scale,
-				},
-			];
-		}),
-	);
+export function categoryAnchors(categories: string[], scale = 1, sizes = new Map<string, number>()): Map<string, Point> {
+	const shape = brainShape(scale);
+	const ranked = [...categories].sort((a, b) => (sizes.get(b) ?? 0) - (sizes.get(a) ?? 0) || a.localeCompare(b));
+	return new Map(ranked.map((category, rank) => [category, regionAnchor(rank, shape)]));
 }
 
 /** Small deterministic generator, so the same vault lays out the same way twice. */
@@ -106,8 +98,7 @@ export function brainScale(noteCount: number): number {
 	return Math.max(1, Math.cbrt(noteCount / BRAIN_BASE_NOTES));
 }
 
-function anatomyForce(nodes: LayoutNode[], anchors: Map<string, Point>, scale: number): (alpha: number) => void {
-	const brain = { x: BRAIN.x * scale, y: BRAIN.y * scale, z: BRAIN.z * scale };
+function anatomyForce(nodes: LayoutNode[], anchors: Map<string, Point>, shape: BrainShape): (alpha: number) => void {
 	return (alpha) => {
 		for (const node of nodes) {
 			const anchor = anchors.get(node.category);
@@ -118,26 +109,11 @@ function anatomyForce(nodes: LayoutNode[], anchors: Map<string, Point>, scale: n
 				node.vy! += (anchor.y - node.y!) * k;
 				node.vz! += (anchor.z - node.z!) * k;
 			}
-			// Cortical shell: radial push toward the [SHELL_INNER, 1] band of the ellipsoid.
-			const ex = node.x! / brain.x;
-			const ey = node.y! / brain.y;
-			const ez = node.z! / brain.z;
-			const e = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1e-6;
-			const shellK = 0.6 * alpha;
-			if (e > 1) {
-				node.vx! -= node.x! * (1 - 1 / e) * shellK;
-				node.vy! -= node.y! * (1 - 1 / e) * shellK;
-				node.vz! -= node.z! * (1 - 1 / e) * shellK;
-			} else if (e < SHELL_INNER) {
-				const out = (SHELL_INNER / e - 1) * shellK;
-				node.vx! += node.x! * out;
-				node.vy! += node.y! * out;
-				node.vz! += node.z! * out;
-			}
-			// Longitudinal fissure: keep the hemisphere gap clear.
-			if (Math.abs(node.x!) < FISSURE_HALF_WIDTH) {
-				node.vx! += (node.x! >= 0 ? 1 : -1) * (FISSURE_HALF_WIDTH - Math.abs(node.x!)) * alpha * 0.9;
-			}
+			// The cortex: whatever the other forces did this tick, walk back toward the surface.
+			const { value, normal } = brainGradient({ x: node.x!, y: node.y!, z: node.z! }, shape);
+			node.vx! -= normal.x * value * SURFACE_STIFFNESS;
+			node.vy! -= normal.y * value * SURFACE_STIFFNESS;
+			node.vz! -= normal.z * value * SURFACE_STIFFNESS;
 		}
 	};
 }
@@ -149,7 +125,10 @@ function anatomyForce(nodes: LayoutNode[], anchors: Map<string, Point>, scale: n
  */
 export function layoutGraph(nodes: LayoutNode[], edges: LayoutEdge[], categories: string[], ticks?: number): Map<number, Point> {
 	const scale = brainScale(nodes.length);
-	const anchors = categoryAnchors(categories, scale);
+	const shape = brainShape(scale);
+	const sizes = new Map<string, number>();
+	for (const node of nodes) sizes.set(node.category, (sizes.get(node.category) ?? 0) + 1);
+	const anchors = categoryAnchors(categories, scale, sizes);
 	const warm = nodes.some((n) => n.x !== undefined);
 	const random = lcg(nodes.length * 7919 + edges.length);
 	for (const node of nodes) {
@@ -183,10 +162,11 @@ export function layoutGraph(nodes: LayoutNode[], edges: LayoutEdge[], categories
 				.strength(strength as never),
 		)
 		.force("charge", forceManyBody().strength(CHARGE))
-		.force("anatomy", anatomyForce(nodes, anchors, scale))
+		.force("anatomy", anatomyForce(nodes, anchors, shape))
 		.alpha(warm ? WARM_ALPHA : 1)
 		.stop();
 	const rounds = ticks ?? (warm ? WARM_TICKS : COLD_TICKS);
 	for (let i = 0; i < rounds; i++) simulation.tick();
-	return new Map(nodes.map((n) => [n.id, { x: n.x!, y: n.y!, z: n.z! }]));
+	// Settle every note exactly onto the cortex; the field's folds are the picture.
+	return new Map(nodes.map((n) => [n.id, projectToSurface({ x: n.x!, y: n.y!, z: n.z! }, shape)]));
 }

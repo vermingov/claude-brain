@@ -7,6 +7,7 @@
 
 import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { baseActivation } from "./activation";
 import { stripFrontmatter } from "./chunker";
 import { vaultRoot } from "./config";
 import { lobeOf, ROOT_CATEGORY } from "./graph-layout";
@@ -21,6 +22,8 @@ export interface GraphNode {
 	date: string | null;
 	connections: number;
 	community: number | null;
+	/** How alive the note is in memory right now, 0..1: recent, repeated recall runs hot. */
+	activation: number;
 	x: number;
 	y: number;
 	z: number;
@@ -85,9 +88,12 @@ interface DocRow {
 	y: number | null;
 	z: number | null;
 	community: number | null;
+	access_count: number;
+	last_access: number;
+	mtime: number;
 }
 
-const DOC_COLUMNS = `d.id, d.path, d.title, l.x, l.y, l.z, c.community
+const DOC_COLUMNS = `d.id, d.path, d.title, l.x, l.y, l.z, c.community, d.access_count, d.last_access, d.mtime
 	FROM docs d
 	LEFT JOIN doc_layout l ON l.doc_id = d.id
 	LEFT JOIN communities c ON c.doc_id = d.id`;
@@ -119,7 +125,14 @@ function loadEdges(): Array<{ source: number; target: number; kind: EdgeKind }> 
 	];
 }
 
-function nodeOf(row: DocRow, tags: string[], connections: number): GraphNode {
+/** ACT-R base-level activation squashed to 0..1; a never-recalled note sits near 0.15. */
+function activationOf(row: DocRow, now: number): number {
+	if (row.access_count === 0) return 0;
+	const level = baseActivation({ accessCount: row.access_count, lastAccess: row.last_access, created: row.mtime }, now);
+	return Number(Math.max(0, Math.tanh(level / 2.5)).toFixed(3));
+}
+
+function nodeOf(row: DocRow, tags: string[], connections: number, now = Date.now()): GraphNode {
 	return {
 		id: row.path,
 		title: row.title,
@@ -128,6 +141,7 @@ function nodeOf(row: DocRow, tags: string[], connections: number): GraphNode {
 		date: basename(row.path).match(DATE_IN_FILENAME_RE)?.[1] ?? null,
 		connections,
 		community: row.community,
+		activation: activationOf(row, now),
 		x: row.x ?? 0,
 		y: row.y ?? 0,
 		z: row.z ?? 0,
@@ -149,7 +163,8 @@ export function buildGraph(): GraphData {
 		connections[target]!++;
 	}
 	const tags = loadTags();
-	const nodes = docs.map((d, i) => nodeOf(d, tags.get(d.id) ?? [], connections[i]!));
+	const now = Date.now();
+	const nodes = docs.map((d, i) => nodeOf(d, tags.get(d.id) ?? [], connections[i]!, now));
 
 	// Stable category order: root first, then folders alphabetically — the same order
 	// the layout uses for its anchors.

@@ -14,6 +14,7 @@ import { createEdgeLayer } from "./edges.js";
 import { createEmphasis, DIM_CORE } from "./emphasis.js";
 import { createLabels } from "./labels.js";
 import { createLegend } from "./legend.js";
+import { watchRecalls } from "./live.js";
 import { createPanel } from "./panel.js";
 import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
@@ -34,6 +35,9 @@ function createPipeline(scene, camera) {
 	// HDR-style bloom is what makes the neurons read as light sources; FXAA smooths lines;
 	// grain and vignette give the void some texture. One pipeline, GPU-side.
 	const pipeline = new DefaultRenderingPipeline("brainFx", true, scene, [camera]);
+	// Multisampling on the pipeline's own target is what smooths the synapse lines;
+	// FXAA on top catches what MSAA leaves on sprite rims.
+	pipeline.samples = Math.min(4, scene.getEngine().getCaps().maxMSAASamples ?? 1);
 	pipeline.fxaaEnabled = true;
 	pipeline.bloomEnabled = true;
 	pipeline.bloomThreshold = 0.45;
@@ -94,10 +98,9 @@ export function createBrainTab(container, handlers = {}) {
 	let visible = false;
 	let running = false;
 
-	// MSAA off: the pipeline's FXAA is cheaper and bloom hides the difference. Rendering
-	// above 1.25x device pixels buys nothing visible and multiplies every bloom pass.
-	const engine = new Engine(canvas, false, { powerPreference: "high-performance" });
-	engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.25));
+	// Rendering above 1.5x device pixels buys nothing visible and multiplies every bloom pass.
+	const engine = new Engine(canvas, true, { powerPreference: "high-performance", stencil: false });
+	engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 1.5));
 	const scene = new Scene(engine);
 	scene.clearColor = BACKGROUND;
 	scene.fogMode = Scene.FOGMODE_EXP2;
@@ -121,6 +124,8 @@ export function createBrainTab(container, handlers = {}) {
 	let radii = [];
 	let loadedAt = 0;
 	let qualityChecked = false;
+	let stopWatching = () => {};
+	let statsReset = null;
 
 	function restyle() {
 		if (!layers) return;
@@ -130,17 +135,21 @@ export function createBrainTab(container, handlers = {}) {
 		const haloTints = new Float32Array(n * 4);
 		const haloSizes = new Float32Array(n);
 		for (let i = 0; i < n; i++) {
+			const node = graph.nodes[i];
 			const state = emphasis.nodeState(i);
-			const base = emphasis.tintOf(graph.nodes[i]);
+			const base = emphasis.tintOf(node);
 			const hidden = state === "hidden";
+			// A note recalled often and recently runs hot: brighter core, wider halo.
+			const heat = node.activation ?? 0;
 			coreSizes[i] = hidden ? 0 : radii[i];
-			haloSizes[i] = hidden ? 0 : radii[i] * HALO_SCALE;
+			haloSizes[i] = hidden ? 0 : radii[i] * HALO_SCALE * (1 + 0.5 * heat);
 			if (state === "dim") {
 				coreTints.set([DIM_CORE[0], DIM_CORE[1], DIM_CORE[2], 1], i * 4);
 				haloTints.set([base[0], base[1], base[2], 0.03], i * 4);
 			} else {
-				coreTints.set([base[0], base[1], base[2], 1], i * 4);
-				haloTints.set([base[0], base[1], base[2], state === "hi" ? 0.55 : 0.28], i * 4);
+				const lift = 0.35 * heat;
+				coreTints.set([base[0] + (1 - base[0]) * lift, base[1] + (1 - base[1]) * lift, base[2] + (1 - base[2]) * lift, 1], i * 4);
+				haloTints.set([base[0], base[1], base[2], (state === "hi" ? 0.55 : 0.22) + 0.45 * heat], i * 4);
 			}
 		}
 		layers.cores.setTints(coreTints);
@@ -220,6 +229,21 @@ export function createBrainTab(container, handlers = {}) {
 		for (const kind of legend.hiddenKinds) emphasis.state.hiddenKinds.add(kind);
 		chrome.querySelector(".brain-stats").textContent = `${n} notes · ${graph.edges.length} synapses`;
 		restyle();
+
+		const indexByPath = new Map(graph.nodes.map((node, i) => [node.id, i]));
+		stopWatching = watchRecalls((event) => {
+			const hit = event.paths.map((path) => indexByPath.get(path)).filter((i) => i !== undefined);
+			if (hit.length === 0) return;
+			const seconds = performance.now() / 1000;
+			layers.cores.flash(hit, seconds);
+			layers.halos.flash(hit, seconds);
+			layers.sparks.ignite(hit, seconds);
+			chrome.querySelector(".brain-stats").textContent = `recalled: ${event.query}`;
+			clearTimeout(statsReset);
+			statsReset = setTimeout(() => {
+				chrome.querySelector(".brain-stats").textContent = `${n} notes · ${graph.edges.length} synapses`;
+			}, 6000);
+		});
 
 		// Settle into a three-quarter profile: the brain silhouette reads best there. The
 		// framing radius comes from where most notes are, so one stray note flung to the
@@ -316,6 +340,9 @@ export function createBrainTab(container, handlers = {}) {
 		hide() {
 			visible = false;
 			stopLoop();
+		},
+		dispose() {
+			stopWatching();
 		},
 		onLoaded() {
 			if (pendingOpen) {

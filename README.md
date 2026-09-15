@@ -49,13 +49,17 @@ your own cloud account.
   `--apply` touches the vault and `--undo` reverses it. It never renames, merges or
   deletes, and it refuses outright on a vault whose Obsidian link format would break
   links on a move.
-- **3D knowledge graph** — every note a neuron, every kind of edge a synapse (wikilinks,
-  similarity, shared tags, notes recalled together, the journal timeline), folders as
-  lobes, with search, lobe and synapse filters, and an in-graph note reader. The layout is
-  computed once by the daemon and kept, so the brain looks the same each time you open it
-  and a new note lands beside its lobe; the page draws notes, halos and travelling sparks
-  as GPU-billboarded sprites, one draw call per layer, and stays at the display's frame
-  rate on an integrated GPU with well over a thousand notes.
+- **A brain that looks and behaves like one** — every note sits on the cortex of a
+  procedural brain: two folded hemispheres, the fissure between them, the cerebellum, a
+  brainstem. Folders are lobes and take anatomical regions, the biggest first. Every kind
+  of edge is a synapse (wikilinks, similarity, shared tags, notes recalled together, the
+  journal timeline). Notes you recall often and recently run hot and glow; when Claude
+  Code recalls something, the daemon streams the event and the dashboard flashes those
+  notes and sends signals out along their synapses as it happens. The layout is computed
+  once by the daemon and kept, so the brain looks the same each time and a new note lands
+  in its lobe; the page draws notes, halos and sparks as GPU-billboarded sprites with
+  multisampled edges, one draw call per layer, at the display's frame rate on an
+  integrated GPU with well over a thousand notes.
 - **A dashboard with a Home** — the brain in numbers, activity over the last two weeks
   (memories recorded, notes recalled), the notes you recall most, the themes that keep
   recurring across separate sessions, recent sessions and the largest clusters, all
