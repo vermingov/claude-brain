@@ -134,6 +134,12 @@ export function createField(scene, graph, view) {
 	);
 	material.setTexture("noteState", texture);
 
+	// Which notes exist yet. Everything does, until a replay of the vault's history says
+	// otherwise; a note that does not exist is culled in the vertex shader, and so is every
+	// connection with an end that does not exist, which is how the wiring grows in with it.
+	const born = new Float32Array(notes).fill(1);
+	let presence = () => "normal";
+
 	let pending = null;
 	/** Upload once per batch, not once per note. */
 	function commit() {
@@ -183,8 +189,34 @@ export function createField(scene, graph, view) {
 		light,
 		/** What the view is doing with each note: hover, selection, a search, a hidden lobe. */
 		restyle(stateOf) {
+			presence = stateOf;
 			for (let i = 0; i < notes; i++) {
-				state[SHOWN + i * 4 + 1] = EMPHASIS[stateOf(i)] ?? EMPHASIS.normal;
+				state[SHOWN + i * 4 + 1] = born[i] * (EMPHASIS[stateOf(i)] ?? EMPHASIS.normal);
+			}
+			commit();
+		},
+
+		/** Wind the vault back to before any of it was written. */
+		unbuild() {
+			born.fill(0);
+			for (let i = 0; i < notes; i++) state[SHOWN + i * 4 + 1] = 0;
+			commit();
+		},
+
+		/** One note comes into existence, landing the way a new note does. */
+		build(index) {
+			born[index] = 1;
+			state[SHOWN + index * 4] = performance.now() / 1000;
+			state[SHOWN + index * 4 + 1] = EMPHASIS[presence(index)] ?? EMPHASIS.normal;
+			commit();
+		},
+
+		/** Back to the present: everything exists, and nothing is mid-landing. */
+		rebuilt() {
+			born.fill(1);
+			for (let i = 0; i < notes; i++) {
+				state[SHOWN + i * 4] = 0;
+				state[SHOWN + i * 4 + 1] = EMPHASIS[presence(i)] ?? EMPHASIS.normal;
 			}
 			commit();
 		},

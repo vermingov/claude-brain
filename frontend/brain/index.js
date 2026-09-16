@@ -22,6 +22,7 @@ import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
 import { createDust } from "./dust.js";
 import { createField } from "./field.js";
+import { planHistory, playHistory } from "./history.js";
 import { arrivalRange, createArrivals } from "./arrivals.js";
 
 /** Outer space: no blue in it, so distance fades to nothing rather than to a colour. */
@@ -81,11 +82,14 @@ export function createBrainTab(container) {
 	chrome.className = "brain-chrome";
 	chrome.innerHTML =
 		`<div class="brain-search">${SEARCH_ICON}<input class="brain-search-input" type="text" placeholder="Search memories" autocomplete="off" spellcheck="false" /><kbd>/</kbd><ul class="brain-results"></ul></div>` +
-		'<div class="brain-stats"></div><div class="brain-legend"></div>' +
+		'<div class="brain-stats"></div>' +
+		'<button class="brain-replay" type="button" title="Watch the vault get written">replay</button>' +
+		'<div class="brain-legend"></div>' +
 		'<div class="brain-loading"><div class="loader" aria-hidden="true"></div><div class="loading-text">waking the cortex</div></div>';
 	container.appendChild(chrome);
 	const statsEl = chrome.querySelector(".brain-stats");
 
+	const replayButton = chrome.querySelector(".brain-replay");
 	const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 	let visible = false;
 	let running = false;
@@ -235,6 +239,43 @@ export function createBrainTab(container) {
 		setStatus(`${indices.length} new note${indices.length === 1 ? "" : "s"} in the vault`);
 	}
 
+	/**
+	 * Watch the vault get written, oldest note first.
+	 *
+	 * Connections need no handling: the field culls any process with an end that does not
+	 * exist yet, so the wiring grows in as its notes do.
+	 */
+	let replay = null;
+	function toggleReplay() {
+		if (replay) {
+			replay.stop();
+			replay = null;
+			replayButton.textContent = "replay";
+			setStatus(restingStatus);
+			return;
+		}
+		if (!layers) return;
+		const plan = planHistory(graph.nodes);
+		if (plan.order.length === 0) {
+			setStatus("no dates on these notes to replay");
+			return;
+		}
+		replayButton.textContent = "stop";
+		replay = playHistory(plan, layers.field, (progress) => {
+			const when = new Date(progress.stamp).toLocaleDateString(undefined, {
+				year: "numeric",
+				month: "short",
+				day: "numeric",
+			});
+			setStatus(`${when} · ${progress.at.toLocaleString()} of ${progress.of.toLocaleString()} notes`);
+			if (!progress.done) return;
+			replay = null;
+			replayButton.textContent = "replay";
+			setStatus(`${Math.round(plan.span)} days, ${progress.of.toLocaleString()} notes`);
+		});
+	}
+	replayButton.onclick = toggleReplay;
+
 	function onActivity(event) {
 		if (event.type === "graph") {
 			void refreshGraph();
@@ -269,6 +310,9 @@ export function createBrainTab(container) {
 
 	/** Tear down everything that was built from the previous graph payload. */
 	function unmount() {
+		replay?.stop();
+		replay = null;
+		if (replayButton) replayButton.textContent = "replay";
 		if (!layers) return;
 		for (const layer of Object.values(layers)) layer.dispose?.();
 		panel?.dispose();

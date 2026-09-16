@@ -24,6 +24,8 @@ export interface GraphNode {
 	community: number | null;
 	/** How alive the note is in memory right now, 0..1: recent, repeated recall runs hot. */
 	activation: number;
+	/** When the note came into the vault, for replaying how the brain was built. */
+	created: number;
 	x: number;
 	y: number;
 	z: number;
@@ -142,6 +144,8 @@ function nodeOf(row: DocRow, tags: string[], connections: number, now = Date.now
 		connections,
 		community: row.community,
 		activation: activationOf(row, now),
+		// When this note came into the vault, for replaying how the brain was built.
+		created: row.mtime,
 		x: row.x ?? 0,
 		y: row.y ?? 0,
 		z: row.z ?? 0,
