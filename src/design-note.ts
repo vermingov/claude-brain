@@ -19,6 +19,7 @@ import { designFolder, loadConfig, vaultReady, vaultRoot } from "./config";
 import {
 	type DesignRow,
 	VAULT_IMAGE_SUBDIR,
+	recreationHtmlPath,
 	listSources,
 	freeFileName,
 	imagePath,
@@ -394,12 +395,19 @@ export function designBrief(rows: DesignRow[]): string {
 		// Reserved up front rather than appended last: this pointer is the escape hatch to
 		// the full note and the image, so it must not be the first thing the budget drops.
 		const pointer = `full spec: \`claude-brain design show "${name}"\``;
+		// The rebuild is the most useful line in the brief when there is one: an agent
+		// building "in this style" wants a working page using the real tokens, not five
+		// adjectives about it.
+		const rebuilt = row.recreate_status === "built"
+			? `rebuilt (${Math.round(row.recreate_score / 10)}% match), read it: ${recreationHtmlPath(row.id)}`
+			: "";
 		const overhead = title.length + pointer.length + 2;
 		if (used + overhead > DESIGN_BRIEF_CHARS) break;
 
 		const kept = [title];
 		used += overhead;
 		for (const line of [
+			rebuilt,
 			spec.palette.length > 0
 				? `palette: ${spec.palette.map((p) => (p.role ? `${p.hex} ${p.role}` : p.hex)).join(" · ")}`
 				: "",

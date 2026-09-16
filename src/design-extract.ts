@@ -21,6 +21,7 @@ import { askJson, status as claudeStatus, describeImagesJson, sessionSpendUsd, s
 import { loadConfig, vaultReady, vaultRoot } from "./config";
 import { type DesignSpec, normalizeSpec, writeDesignNote } from "./design-note";
 import { type DesignRow, type DesignSource, getDesign, imagePath, listSources, renderPath, sourcePath, updateDesign } from "./design-store";
+import { maybeRecreate } from "./design-recreate";
 import { verifySpecAgainstEvidence } from "./design-url";
 import { imageMeta } from "./image-meta";
 import { openBrainDb } from "./index-db";
@@ -499,6 +500,10 @@ function store(row: DesignRow, spec: DesignSpec, raw: unknown, thin: boolean): v
 	// The description is stored either way. A note that could not be written is a vault
 	// problem, not an extraction problem, and materializePending() will retry it.
 	if (!written.ok) updateDesign(row.id, { error: written.detail });
+	// A board with a URL on it can be proved rather than only described: rebuild the page
+	// from what was measured and score the rebuild against a photograph of the real one.
+	// Queued after the note is filed, so the cheap, certain artefact lands first.
+	maybeRecreate(row.id);
 }
 
 // -------------------------------------------------------------------- boot passes

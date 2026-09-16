@@ -31,14 +31,21 @@ import { join } from "node:path";
 import { CACHE_DIR, STATE_DIR, loadConfig } from "./config";
 import { imageMeta } from "./image-meta";
 
-/** Aliases, not pinned model ids — the CLI resolves them and pinned ids rot. */
-export type ClaudeModel = "haiku" | "sonnet" | "opus";
+/** Aliases, not pinned model ids — the CLI resolves them and pinned ids rot. `fable` is
+ *  the newest family; the CLI maps each alias to whatever its current member is. */
+export type ClaudeModel = "haiku" | "sonnet" | "opus" | "fable";
+
+/** How hard the model is asked to think. Mirrors the CLI's own --effort levels. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface AskOptions {
 	/** Absolute image paths. Presence switches the Read tool on; without it the model
 	 *  invents a description instead of failing. */
 	images?: string[];
 	model?: ClaudeModel;
+	/** Left unset the CLI uses its own default for the model, which is what most callers
+	 *  want; the rebuild pass sets it deliberately from the user's plan. */
+	effort?: Effort;
 	timeoutMs?: number;
 	/** Hard per-call ceiling handed to the CLI itself, in USD. */
 	maxCostUsd?: number;
@@ -258,6 +265,29 @@ function remainingBudgetUsd(): number {
 
 // ---------------------------------------------------------------- cross-process lock
 
+/**
+ * Drop a lock this process itself left behind.
+ *
+ * The lock is released in a `finally`, which covers a call that throws but not a process
+ * that stops running the module. `bun --watch` does exactly that: on a file change it tears
+ * the module graph down and re-runs it **inside the same process**, so the awaited call is
+ * abandoned with the lock file still on disk — naming a pid that is still very much alive,
+ * which is its own pid. Every later call then waits two seconds and reports "busy", forever,
+ * until the ten-minute staleness window closes.
+ *
+ * A lock naming our own pid at startup cannot be a call of ours in flight, because nothing
+ * of ours has run yet. It is ours and it is stale, so it goes.
+ */
+function clearOwnStaleLock(): void {
+	try {
+		const held = safeParse<{ pid?: number }>(readFileSync(LOCK_PATH, "utf-8"));
+		if (held?.pid === process.pid) unlinkSync(LOCK_PATH);
+	} catch {
+		/* no lock, or another process cleaned it first */
+	}
+}
+clearOwnStaleLock();
+
 function lockHolderIsAlive(): boolean {
 	let raw: string;
 	try {
@@ -461,6 +491,7 @@ function baseArgs(opts: AskOptions): string[] {
 	];
 	// Read is required for images and forbidden otherwise — an unconstrained tool set is
 	// how an LLM ends up editing the user's notes.
+	if (opts.effort) args.push("--effort", opts.effort);
 	args.push("--tools", opts.images?.length ? "Read" : "");
 	if (opts.images?.length) args.push("--allowedTools", "Read");
 	return args;

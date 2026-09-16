@@ -31,6 +31,15 @@
 	--bad: #e5645c;
 	--radius: 10px;
 	--radius-sm: 6px;
+	/* One spacing scale for the whole dashboard. Before this every block invented its own
+	   margins, which is why a drawer could have 28px above a heading and 4px under it. */
+	--s1: 4px;
+	--s2: 8px;
+	--s3: 12px;
+	--s4: 16px;
+	--s5: 24px;
+	--s6: 32px;
+	--s7: 48px;
 	--font: Inter, "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
 	--mono: ui-monospace, "JetBrains Mono", Menlo, monospace;
 	--ease: cubic-bezier(0.22, 1, 0.36, 1);
@@ -443,27 +452,37 @@ code { font-family: var(--mono); font-size: 0.92em; }
 	z-index: 5;
 }
 .brain-panel.open { transform: none; }
-.panel-inner { height: 100%; overflow-y: auto; padding: 28px 28px 40px; }
+.panel-inner { height: 100%; overflow-y: auto; padding: var(--s6) var(--s6) var(--s7); }
+/* The close button was a "×" glyph in a grid cell: the character sits above the optical
+   centre of its line box in a system font, so it read as misaligned however the box was
+   centred, and the spring-eased hover rotation swung that offset visibly up and to the
+   right. It is an SVG now, centred by its own viewBox — and a rotation is gone with it,
+   since an X rotated 90 degrees lands on itself and the movement was never anything but
+   the glyph's own offset being spun around. */
 .panel-close {
 	position: absolute;
-	top: 14px;
-	right: 14px;
-	width: 34px;
-	height: 34px;
-	display: grid;
-	place-items: center;
+	top: var(--s4);
+	right: var(--s4);
+	width: 32px;
+	height: 32px;
+	padding: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
 	border-radius: 50%;
-	border: 1px solid var(--line-2);
-	background: var(--bg-2);
+	border: 1px solid var(--line);
+	background: var(--bg-3);
 	color: var(--text-2);
 	z-index: 2;
-	transition: color 0.15s, border-color 0.15s, transform 0.2s var(--spring);
+	transition: color 0.15s var(--ease), border-color 0.15s var(--ease), background 0.15s var(--ease);
 }
-.panel-close:hover { color: var(--text); border-color: var(--accent); transform: rotate(90deg); }
-.panel-loading, .panel-error { padding: 28px; color: var(--text-3); }
+.panel-close svg { display: block; }
+.panel-close:hover { color: var(--text); border-color: var(--line-2); background: var(--bg-2); }
+.panel-close:active { background: var(--bg-sunken); }
+.panel-loading, .panel-error { padding: var(--s6); color: var(--text-3); }
 .panel-error { color: var(--bad); }
 .panel-lobe { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); margin-right: 44px; }
-.brain-panel h2 { margin: 8px 44px 10px 0; font-size: 21px; line-height: 1.25; font-weight: 600; letter-spacing: -0.01em; }
+.brain-panel h2 { margin: 0 var(--s7) var(--s3) 0; font-size: 21px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; }
 .panel-facts { margin: 0 0 6px; font-size: 13px; color: var(--text-2); }
 .panel-tags { margin: 0; font-size: 13px; color: var(--text-3); }
 .panel-content { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 14px; line-height: 1.65; color: #d8d2c8; }
@@ -485,7 +504,7 @@ code { font-family: var(--mono); font-size: 0.92em; }
 
 .settings-tab { overflow: hidden auto; }
 .settings-wrap { max-width: 760px; margin: 0 auto; padding: 44px 40px 90px; }
-.settings-section { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px 26px; margin-bottom: 16px; }
+.settings-section { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: var(--s5) var(--s6); margin-bottom: var(--s4); }
 .settings-section h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
 .settings-sub { margin: 0 0 18px; color: var(--text-2); max-width: 62ch; }
 .vault-current { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
@@ -511,12 +530,12 @@ code { font-family: var(--mono); font-size: 0.92em; }
 /* Designs ------------------------------------------------------------------ */
 
 .designs-tab { overflow: hidden auto; }
-.designs-wrap { max-width: 1240px; margin: 0 auto; padding: 44px 40px 90px; }
-.designs-head h2 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
-.designs-sub { margin: 0 0 18px; color: var(--text-2); max-width: 64ch; }
+.designs-wrap { max-width: 1240px; margin: 0 auto; padding: var(--s7) clamp(var(--s4), 4vw, var(--s7)) 90px; }
+.designs-head h2 { margin: 0 0 var(--s2); font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.designs-sub { margin: 0 0 var(--s5); color: var(--text-2); max-width: 64ch; line-height: 1.55; }
 .designs-tools { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .designs-tools .settings-input { width: auto; flex: 1 1 220px; min-width: 180px; }
-.designs-notices { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.designs-notices { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s3); }
 .designs-notice { padding: 10px 14px; border-radius: var(--radius-sm); background: rgba(230, 180, 85, 0.1); color: var(--warn); font-size: 13px; }
 .designs-drop {
 	display: flex;
@@ -535,9 +554,44 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .designs-drop strong { color: var(--text); font-weight: 500; }
 .designs-drop span { font-size: 13px; color: var(--text-3); }
 .designs-drop:hover, .designs-drop.dragging { border-color: var(--accent); background: var(--accent-soft); }
-.designs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; }
+/* A labelled control on its own line: label left, control right, wrapping when narrow. */
+.settings-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 12px 0 4px; }
+.settings-label { font-size: 13px; color: var(--text-2); flex: 0 0 auto; min-width: 128px; }
+.settings-row .settings-input { flex: 1 1 200px; min-width: 0; }
+.settings-input-narrow { flex: 0 0 auto !important; width: 200px; }
+input[type="number"].settings-input-narrow { width: 88px; }
+/* Sized to its longest option rather than to a fixed width: "Detect from my Claude login"
+   was being clipped mid-word. */
+select.settings-input { width: auto; min-width: 232px; appearance: none; padding-right: 30px; background-image: linear-gradient(45deg, transparent 50%, var(--text-3) 50%), linear-gradient(135deg, var(--text-3) 50%, transparent 50%); background-position: calc(100% - 16px) 50%, calc(100% - 11px) 50%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+
+/* Two ways in, and they are not the same act: a picture is any interface, a URL is a
+   website whose code can be read and rebuilt. Two columns of plain text and one control
+   each — the only box is the drop target, where a box means "drop here" rather than
+   decoration. */
+.designs-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: var(--s5) var(--s6); margin: var(--s6) 0 var(--s3); }
+.designs-source { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.designs-source h3 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+.designs-source > p { margin: 0 0 2px; font-size: 12.5px; line-height: 1.5; color: var(--text-3); max-width: 46ch; }
+.designs-source .designs-drop { margin: 4px 0 0; padding: 16px; }
+.designs-url-row { display: flex; gap: 8px; margin-top: 4px; }
+.designs-url-row .settings-input { flex: 1 1 auto; min-width: 0; }
+.designs-source-note:empty { display: none; }
+.designs-source-note { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: var(--text-3); max-width: 46ch; }
+.designs-both { margin: 6px 0 24px; font-size: 12px; color: var(--text-3); max-width: 84ch; }
+
+/* The rebuild: the page and the copy of it, and what the copy scored. */
+.design-rebuild { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--line); }
+.design-rebuild-score { margin: 0 0 4px; font-size: 13px; color: var(--text); }
+.design-rebuild-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0 4px; }
+.design-rebuild-pair figure { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.design-rebuild-pair img { width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--line); display: block; }
+.design-rebuild-pair figcaption { font-size: 11.5px; color: var(--text-3); }
+.design-actions { flex-wrap: wrap; }
+.design-actions a.settings-btn { display: inline-flex; align-items: center; text-decoration: none; }
+
+.designs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: var(--s5) var(--s4); }
 .designs-empty { grid-column: 1 / -1; color: var(--text-3); padding: 20px 0; }
-.design-card { display: flex; flex-direction: column; gap: 8px; padding: 0; text-align: left; background: none; border: 0; color: inherit; border-radius: var(--radius); }
+.design-card { display: flex; flex-direction: column; gap: var(--s2); padding: 0; text-align: left; background: none; border: 0; color: inherit; border-radius: var(--radius); }
 .design-thumb { aspect-ratio: 4 / 3; overflow: hidden; border-radius: var(--radius); border: 1px solid var(--line); background: var(--bg-sunken); transition: border-color 0.2s; }
 .design-card:hover .design-thumb { border-color: var(--accent); }
 .design-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform 0.5s var(--ease); }
@@ -550,36 +604,63 @@ code { font-family: var(--mono); font-size: 0.92em; }
 .design-summary { margin: 0; font-size: 13px; color: var(--text-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .design-card.has-error .design-thumb { border-color: var(--bad); }
 .design-dismiss { align-self: flex-start; }
-.design-detail .panel-inner { padding-top: 60px; }
-.design-detail-img { width: 100%; border-radius: var(--radius); border: 1px solid var(--line); margin: 12px 0; }
+/* Clear of the close button, which floats over this padding box. */
+.design-detail .panel-inner { padding-top: 64px; }
+.design-detail-img { width: 100%; border-radius: var(--radius); border: 1px solid var(--line); margin: var(--s4) 0 var(--s5); }
 .panel-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 13px; color: var(--text-2); margin-bottom: 14px; }
-.design-source { font-size: 13px; color: var(--text-3); margin-bottom: 8px; }
-.design-caption { color: var(--text); margin: 0 0 14px; }
+.design-source { font-size: 13px; color: var(--text-3); margin: 0 0 var(--s2); }
+.design-caption { color: var(--text); margin: 0 0 var(--s4); }
 .design-hint { color: var(--text-3); font-size: 13px; }
-.design-refs h4, .design-spec-block h4 { margin: 20px 0 8px; font-size: 13px; font-weight: 600; color: var(--text-2); }
-.design-ref-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; }
-.design-ref { position: relative; flex: 0 0 108px; display: flex; flex-direction: column; gap: 4px; }
+.design-refs { margin: var(--s5) 0; }
+.design-refs h4, .design-spec-block h4 { margin: 0 0 var(--s3); font-size: 13px; font-weight: 600; color: var(--text-2); letter-spacing: -0.005em; }
+.design-spec-block { margin: var(--s5) 0 0; }
+.design-ref-strip { display: flex; gap: var(--s2); overflow-x: auto; padding-bottom: var(--s2); }
+/* min-width: 0 or the flex basis is a suggestion: a long URL in the label below gives the
+   item a min-content width wider than the tile, which pushed the remove button off the
+   thumbnail it belongs to. */
+.design-ref { position: relative; flex: 0 0 108px; min-width: 0; display: flex; flex-direction: column; gap: var(--s1); }
 .design-ref img { width: 108px; height: 78px; object-fit: cover; border-radius: var(--radius-sm); border: 1px solid var(--line); }
 .design-ref-url { width: 108px; height: 78px; display: grid; place-items: center; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--bg-sunken); font-size: 12px; color: var(--text-3); }
 .design-ref-name { font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .design-ref-warn { font-size: 11px; color: var(--warn); }
-.design-ref-drop { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%; border: 0; background: rgba(0, 0, 0, 0.6); color: var(--text); line-height: 1; }
-.design-ref-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-.design-palette { display: flex; flex-direction: column; gap: 6px; margin: 14px 0; }
+/* Same construction as the drawer's close: an icon, centred by its own box. */
+.design-ref-drop {
+	position: absolute;
+	top: var(--s1);
+	right: var(--s1);
+	width: 22px;
+	height: 22px;
+	padding: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 50%;
+	border: 0;
+	background: rgba(0, 0, 0, 0.65);
+	color: var(--text-2);
+	transition: color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.design-ref-drop svg { display: block; width: 10px; height: 10px; }
+.design-ref-drop:hover { color: var(--text); background: rgba(0, 0, 0, 0.85); }
+/* Wraps rather than squeezing: at 480px the button and a URL field do not fit on one line,
+   and forcing them to is what pushed this row into the text under it. */
+.design-ref-actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-top: var(--s3); }
+.design-ref-actions .settings-input { flex: 1 1 200px; min-width: 0; }
+.design-palette { display: flex; flex-direction: column; gap: var(--s2); margin: var(--s5) 0; }
 .design-palette-row { display: flex; align-items: center; gap: 10px; font-size: 13px; }
 .design-swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid var(--line-2); flex: none; }
-.design-swatches { display: flex; gap: 6px; margin: 14px 0; }
+.design-swatches { display: flex; gap: var(--s2); margin: var(--s5) 0; }
 .design-hex { color: var(--text-2); }
 .design-role { color: var(--text-3); }
-.design-chips { font-size: 13px; color: var(--text-2); margin: 0 0 14px; }
+.design-chips { font-size: 13px; color: var(--text-2); margin: 0 0 var(--s5); }
 .design-chip + .design-chip::before { content: " · "; color: var(--text-3); }
-.design-desc { margin: 0 0 12px; line-height: 1.6; }
+.design-desc { margin: 0 0 var(--s3); line-height: 1.6; }
 .design-desc.empty { color: var(--text-3); }
 .design-spec-block ul { margin: 0; padding-left: 18px; color: #d8d2c8; }
 .design-spec-block li { margin: 3px 0; }
-.design-actions { display: flex; gap: 8px; margin-top: 24px; }
+.design-actions { display: flex; gap: var(--s2); margin-top: var(--s5); }
 .design-forget { color: var(--bad); }
-.design-confirm { margin-top: 24px; padding: 14px; border: 1px solid var(--line-2); border-radius: var(--radius); }
+.design-confirm { margin-top: var(--s5); padding: var(--s4); border: 1px solid var(--line-2); border-radius: var(--radius); }
 .design-confirm p { margin: 0 0 8px; }
 .design-plan { margin: 0 0 8px; padding-left: 18px; font-family: var(--mono); font-size: 12px; color: var(--text-2); }
 .design-plan-keep { color: var(--text-3); font-size: 13px; }

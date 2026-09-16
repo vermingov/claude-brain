@@ -317,7 +317,16 @@ function createDesignTables(db: Database): void {
 		palette TEXT NOT NULL DEFAULT '[]',
 		mood TEXT NOT NULL DEFAULT '',
 		created INTEGER NOT NULL,
-		extracted INTEGER NOT NULL DEFAULT 0
+		extracted INTEGER NOT NULL DEFAULT 0,
+		/* The rebuild: a design captured from a URL is proved understood by being built
+		   again and scored against a screenshot of the real page. Score is per mille so
+		   the column stays an integer. */
+		recreate_status TEXT NOT NULL DEFAULT '',
+		recreate_score INTEGER NOT NULL DEFAULT 0,
+		recreate_rounds INTEGER NOT NULL DEFAULT 0,
+		recreate_error TEXT NOT NULL DEFAULT '',
+		recreate_notes TEXT NOT NULL DEFAULT '',
+		recreate_at INTEGER NOT NULL DEFAULT 0
 	)`);
 	// Every entry point (server, CLI, all three hooks) calls openBrainDb, so a bare
 	// CREATE INDEX here would throw "already exists" on the second run and brick the
@@ -488,6 +497,20 @@ function migrate(db: Database): void {
 	// forget what the session has been asking about.
 	const sessionCols = columns("sessions");
 	if (!sessionCols.has("context")) db.run("ALTER TABLE sessions ADD COLUMN context BLOB");
+
+	// Designs captured from a URL gained a rebuild: the page built again from what was
+	// measured, rendered, and scored against a screenshot of the real thing.
+	const designCols = columns("designs");
+	for (const [name, decl] of [
+		["recreate_status", "TEXT NOT NULL DEFAULT ''"],
+		["recreate_score", "INTEGER NOT NULL DEFAULT 0"],
+		["recreate_rounds", "INTEGER NOT NULL DEFAULT 0"],
+		["recreate_error", "TEXT NOT NULL DEFAULT ''"],
+		["recreate_notes", "TEXT NOT NULL DEFAULT ''"],
+		["recreate_at", "INTEGER NOT NULL DEFAULT 0"],
+	] as Array<[string, string]>) {
+		if (!designCols.has(name)) db.run(`ALTER TABLE designs ADD COLUMN ${name} ${decl}`);
+	}
 
 	const linkCols = columns("links");
 	if (!linkCols.has("relation")) db.run("ALTER TABLE links ADD COLUMN relation TEXT NOT NULL DEFAULT 'references'");

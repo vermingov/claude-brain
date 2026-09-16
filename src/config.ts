@@ -18,16 +18,35 @@ export interface LlmConfig {
 	/** Master consent switch. Nothing in claude-brain spends the user's Claude quota
 	 *  until this is on — it ships to strangers who did not ask to be billed. */
 	enabled: boolean;
-	model: "haiku" | "sonnet" | "opus";
+	model: "haiku" | "sonnet" | "opus" | "fable";
 	dailyBudgetUsd: number;
 	/** Escape hatch when the binary is somewhere Bun.which cannot see. */
 	binaryPath: string | null;
+	/** Pick the model for heavy jobs from the user's plan and what is left of their
+	 *  allowance, rather than using `model` for everything. See model-policy.ts. */
+	autoModel: boolean;
+	/** "auto" reads the subscription from the CLI. The 5×/20× split is not in anything
+	 *  local, so a Max 20× subscriber says so here once. */
+	plan: "auto" | "pro" | "max5" | "max20" | "free" | "api";
+	/** Optional command printing {"daily":n,"weekly":n,"fableWeekly":n} as percent used.
+	 *  Nothing on the machine publishes live rate limits, so this is the only way to give
+	 *  the model policy real numbers. */
+	usageCommand: string;
 }
 
 export interface DesignsConfig {
 	folder: string;
 	autoExtract: boolean;
 	copyImages: boolean;
+	/** After a URL design is described, rebuild the page from what was measured and score
+	 *  the rebuild against a screenshot of the real thing. Costs a call per round. */
+	recreate: boolean;
+	/** How many times the model may look at its own attempt and try again. */
+	recreateRounds: number;
+	/** Let the rebuild's render reach the network. Off means no web fonts, so a page that
+	 *  uses one scores worse than it should; on means a locally rendered document may make
+	 *  requests. Neither is obviously right, so it is a choice. */
+	recreateNetwork: boolean;
 }
 
 export interface BrainConfig {
@@ -57,8 +76,23 @@ const DEFAULTS: BrainConfig = {
 	vault: null,
 	port: DEFAULT_PORT,
 	sync: { provider: null, enabled: false, intervalMinutes: 30, remoteFolder: "ClaudeBrain" },
-	llm: { enabled: false, model: "haiku", dailyBudgetUsd: 2, binaryPath: null },
-	designs: { folder: "Design Library", autoExtract: true, copyImages: true },
+	llm: {
+		enabled: false,
+		model: "haiku",
+		dailyBudgetUsd: 2,
+		binaryPath: null,
+		autoModel: true,
+		plan: "auto",
+		usageCommand: "",
+	},
+	designs: {
+		folder: "Design Library",
+		autoExtract: true,
+		copyImages: true,
+		recreate: true,
+		recreateRounds: 2,
+		recreateNetwork: true,
+	},
 	autoIntegrate: true,
 };
 

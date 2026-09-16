@@ -47,6 +47,7 @@ const PRICE_PER_MTOK: Record<ClaudeModel, { input: number; output: number }> = {
 	haiku: { input: 1, output: 5 },
 	sonnet: { input: 3, output: 15 },
 	opus: { input: 5, output: 25 },
+	fable: { input: 5, output: 25 },
 };
 
 export interface TaxonomyFolder {

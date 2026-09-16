@@ -1,6 +1,8 @@
 // The note reader: the note a viewer opened, rendered from its markdown, with what it
 // is connected to. Vault-local content, so a small line-based renderer is enough.
 
+import { icon } from "../ui.js";
+
 function escapeHtml(s) {
 	return String(s).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
@@ -33,8 +35,9 @@ function renderMarkdown(md) {
 	return out.join("");
 }
 
-const CLOSE_ICON =
-	'<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>';
+// One icon, two drawers: this panel and the design detail. They were drawn differently
+// before, which is how one of them ended up with a glyph that sat off-centre.
+const CLOSE_ICON = icon("close");
 
 /**
  * @param {HTMLElement} container

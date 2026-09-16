@@ -24,6 +24,29 @@ export function text(tag, className, value) {
 	return node;
 }
 
+/**
+ * Icons, as geometry. A multiplication sign is not a close icon: the glyph sits wherever
+ * the font puts it, which in a system stack is above the optical centre, and no amount of
+ * centring the box will centre the mark inside it. Two strokes in a square viewBox are
+ * centred by construction, at any size, in any font.
+ */
+const ICONS = {
+	close: '<path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>',
+};
+
+export function icon(name, size = 14) {
+	return `<svg width="${size}" height="${size}" viewBox="0 0 14 14" fill="none" aria-hidden="true">${ICONS[name] ?? ""}</svg>`;
+}
+
+/** A square button whose only content is an icon, and which therefore needs a label. */
+export function iconButton(className, name, label) {
+	const node = el("button", className, icon(name));
+	node.type = "button";
+	node.setAttribute("aria-label", label);
+	node.title = label;
+	return node;
+}
+
 /** For the callers that still assemble a string of markup by hand. */
 
 /**

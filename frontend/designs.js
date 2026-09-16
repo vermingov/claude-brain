@@ -17,7 +17,7 @@
 // polls; rebuilding on every tick would re-fetch every card image, steal focus from the
 // filter box mid-keystroke and flash empty wells twice a second.
 
-import { api, el, text } from "./ui.js";
+import { api, el, iconButton, text } from "./ui.js";
 
 const ACCEPT = "image/png,image/jpeg,image/webp,image/gif,image/avif";
 const THUMB_EDGE = 320;
@@ -44,6 +44,31 @@ const STATUS = {
 	unavailable: { label: "Claude unavailable", tone: "off", poll: false },
 	failed: { label: "failed", tone: "bad", poll: false },
 };
+
+/**
+ * The rebuild's own states (RecreateStatus in src/design-recreate.ts). Separate from the
+ * description's: a board can be fully described and still have no rebuild, and saying
+ * "failed" on the card for that would be a lie about the thing the user actually asked for.
+ */
+const REBUILD = {
+	queued: { label: "rebuild queued", tone: "wait", poll: true },
+	building: { label: "rebuilding it", tone: "wait", poll: true },
+	built: { label: "rebuilt", tone: "ok", poll: false },
+	unsupported: { label: "", tone: "off", poll: false },
+	"no-browser": { label: "no browser", tone: "off", poll: false },
+	unavailable: { label: "needs Claude", tone: "off", poll: false },
+	failed: { label: "rebuild failed", tone: "bad", poll: false },
+};
+
+function rebuildOf(row) {
+	return REBUILD[row?.recreate_status] ?? null;
+}
+
+/** Per mille on the row, because the column is an integer. */
+function matchPct(row) {
+	const score = Number(row?.recreate_score ?? 0);
+	return score > 0 ? `${Math.round(score / 10)}%` : "";
+}
 
 /**
  * A retry re-runs the same vision call, so it only helps where the call itself was the
@@ -243,8 +268,8 @@ export function createDesignsTab(container) {
 	const head = el("div", "designs-head");
 	head.appendChild(text("h2", "designs-title", "Design library"));
 	head.appendChild(text("p", "designs-sub",
-		"Screenshots, mockups and references become notes in your vault, described once and then " +
-		"recalled like anything else you have written down."));
+		"Drop in a screenshot or paste a URL. What the brain reads out of it becomes a note in your " +
+		"vault, so you can ask for it later the way you ask for anything else you wrote down."));
 
 	const search = el("input", "settings-input designs-search");
 	search.type = "search";
@@ -253,9 +278,6 @@ export function createDesignsTab(container) {
 		filter = search.value;
 		renderGrid();
 	};
-	const addBtn = text("button", "settings-btn primary", "Add images");
-	addBtn.type = "button";
-	addBtn.onclick = () => picker.click();
 	const reloadBtn = text("button", "settings-btn ghost", "Refresh");
 	reloadBtn.type = "button";
 	reloadBtn.onclick = () => {
@@ -263,12 +285,15 @@ export function createDesignsTab(container) {
 		message = "";
 		refresh();
 	};
-	// Capturing a URL is the same act as dropping a screenshot — a reference for a design —
-	// so it lives in the same row of controls rather than in a mode of its own.
+	// Two ways in, and they are not the same act. An image is any interface — a phone app,
+	// a mockup, a frame from a video — and all the brain can do is look at it. A URL is a
+	// website, which means there is source code to read and a page that can be rebuilt from
+	// it and checked. Presenting them as one control hid that difference, and the difference
+	// is the entire reason the URL path is worth more.
 	const urlInput = el("input", "settings-input designs-url");
 	urlInput.type = "url";
-	urlInput.placeholder = "…or paste a URL to learn its design";
-	const urlBtn = text("button", "settings-btn", "Capture");
+	urlInput.placeholder = "https://…";
+	const urlBtn = text("button", "settings-btn primary", "Capture");
 	urlBtn.type = "button";
 
 	async function captureUrl() {
@@ -296,6 +321,8 @@ export function createDesignsTab(container) {
 		if (c.rules) bits.push(`${c.rules} rules`);
 		if (c.colors?.length) bits.push(`${c.colors.length} colours`);
 		if (c.frameworks?.length) bits.push(c.frameworks.join(", "));
+		if (out.screenshot) bits.push(`screenshot ${out.screenshot}`);
+		else if (out.screenshotError) bits.push(`no screenshot: ${out.screenshotError}`);
 		message = `captured ${c.title || value}${bits.length ? `: ${bits.join(", ")}` : ""}`;
 		pollStalled = false;
 		await refresh();
@@ -308,7 +335,7 @@ export function createDesignsTab(container) {
 	};
 
 	const tools = el("div", "designs-tools");
-	tools.append(search, addBtn, urlInput, urlBtn, reloadBtn);
+	tools.append(search, reloadBtn);
 	head.appendChild(tools);
 
 	const notices = el("div", "designs-notices");
@@ -316,15 +343,43 @@ export function createDesignsTab(container) {
 
 	// A button, not a div: this is the only way to add images without a mouse.
 	const drop = el("button", "designs-drop",
-		"<strong>Drop images here</strong>" +
-		"<span>or paste from the clipboard, or press Enter. PNG, JPEG, WebP, GIF, AVIF</span>");
+		"<strong>Drop images, or click to browse</strong>" +
+		"<span>Pasting works too. PNG, JPEG, WebP, GIF, AVIF.</span>");
 	drop.type = "button";
 	drop.onclick = () => picker.click();
+
+	const imagePanel = el("div", "designs-source");
+	imagePanel.appendChild(text("h3", null, "A picture of an interface"));
+	imagePanel.appendChild(text("p", null,
+		"An app, a site, a mockup, a frame you liked. The brain reads the palette, spacing, type, " +
+		"shape and motion out of it and writes them down."));
+	imagePanel.appendChild(drop);
+
+	const urlPanel = el("div", "designs-source");
+	urlPanel.appendChild(text("h3", null, "A website"));
+	urlPanel.appendChild(text("p", null,
+		"The brain opens the page in a browser, reads the CSS and markup the browser ended up with, " +
+		"and photographs it. Then it builds the page again from that code and scores the copy " +
+		"against the photograph."));
+	const urlRow = el("div", "designs-url-row");
+	urlRow.append(urlInput, urlBtn);
+	urlPanel.appendChild(urlRow);
+	const urlNote = text("p", "designs-source-note",
+		"You keep the tokens, the components, the page's own markup and CSS, the screenshot, and a " +
+		"rebuilt copy you can open.");
+	urlPanel.appendChild(urlNote);
+
+	const sources = el("div", "designs-sources");
+	sources.append(imagePanel, urlPanel);
+
+	const both = text("p", "designs-both",
+		"You can mix the two. Add a URL to a design you started from images, or drop a screenshot " +
+		"onto a site you captured. Only a design with a URL on it can be rebuilt.");
 
 	const grid = el("div", "designs-grid");
 	const empty = text("div", "designs-empty", "No designs yet.");
 	grid.appendChild(empty);
-	wrap.append(head, drop, grid);
+	wrap.append(head, sources, both, grid);
 
 	const picker = el("input");
 	picker.type = "file";
@@ -499,7 +554,11 @@ export function createDesignsTab(container) {
 			stopPoll();
 			return;
 		}
-		const ids = designs.filter((d) => statusOf(d.status).poll).map((d) => d.id).sort().join(",");
+		const ids = designs
+			.filter((d) => statusOf(d.status).poll || rebuildOf(d)?.poll)
+			.map((d) => d.id)
+			.sort()
+			.join(",");
 		if (!ids) {
 			polledIds = "";
 			stopPoll();
@@ -554,10 +613,16 @@ export function createDesignsTab(container) {
 			.join(" ").toLowerCase().includes(needle);
 	}
 
+	/**
+	 * One endpoint decides what a card shows, because the answer depends on files only the
+	 * server can see: the rebuild if there is one, then the upload, then anything else on
+	 * the board. The version suffix is what makes a rebuild landing mid-session actually
+	 * appear — the card only assigns src when the string changes.
+	 */
 	function imageSrc(row) {
 		const id = encodeURIComponent(row.id);
-		// Falls back to the original for rows the CLI added, which have no thumb on disk.
-		return row.thumb ? `/api/designs/${id}/thumb` : `/api/designs/${id}/image`;
+		const version = row.recreate_at || row.extracted || row.created || 0;
+		return `/api/designs/${id}/cover?v=${version}`;
 	}
 
 
@@ -638,6 +703,7 @@ export function createDesignsTab(container) {
 		img.loading = "lazy";
 		img.decoding = "async";
 		img.alt = "";
+		img.onerror = () => { img.hidden = true; };
 		well.appendChild(img);
 		const name = text("div", "design-name", "");
 		const status = text("span", "design-status", "");
@@ -658,11 +724,21 @@ export function createDesignsTab(container) {
 			update(row) {
 				id = row.id;
 				const src = imageSrc(row);
-				if (img.getAttribute("src") !== src) img.src = src;
+				if (img.getAttribute("src") !== src) {
+					// A board captured from a URL has no picture until its rebuild lands, and
+					// a broken-image glyph is a worse answer than an empty well.
+					img.hidden = false;
+					img.src = src;
+				}
 				name.textContent = titleOf(row);
-				const st = statusOf(row.status);
+				// The rebuild is the more interesting fact once there is one: "87% match" says
+				// more about a captured site than "described" does.
+				const rebuild = rebuildOf(row);
+				const st = rebuild?.label && rebuild.tone !== "off" ? rebuild : statusOf(row.status);
 				status.className = `design-status st-${st.tone}`;
-				status.textContent = st.label;
+				status.textContent = st === rebuild && row.recreate_status === "built"
+					? `${matchPct(row)} match`
+					: st.label;
 				dims.textContent = row.width && row.height ? `${row.width}×${row.height}` : "";
 				dims.hidden = !dims.textContent;
 				if (row.spec !== specRaw) {
@@ -722,9 +798,7 @@ export function createDesignsTab(container) {
 			if (src.kind === "url" && !src.captured) {
 				tile.appendChild(text("span", "design-ref-warn", "not read"));
 			}
-			const drop = text("button", "design-ref-drop", "×");
-			drop.type = "button";
-			drop.title = "Remove this reference";
+			const drop = iconButton("design-ref-drop", "close", "Remove this reference");
 			drop.onclick = async () => {
 				drop.disabled = true;
 				const out = await api(`/api/designs/${encodeURIComponent(row.id)}/detach`, { sourceId: src.id });
@@ -795,9 +869,7 @@ export function createDesignsTab(container) {
 	}
 
 	function closeButton() {
-		const close = text("button", "panel-close", "×");
-		close.type = "button";
-		close.setAttribute("aria-label", "Close");
+		const close = iconButton("panel-close", "close", "Close");
 		close.onclick = closeDetail;
 		return close;
 	}
@@ -811,9 +883,12 @@ export function createDesignsTab(container) {
 		const inner = el("div", "panel-inner");
 		inner.appendChild(text("h2", null, title));
 
+		// The cover, not the upload: a design captured from a URL has no bytes of its own,
+		// and asking for /image gave it a broken picture where the rebuild should be.
 		const img = el("img", "design-detail-img");
-		img.src = `/api/designs/${encodeURIComponent(row.id)}/image`;
+		img.src = imageSrc(row);
 		img.alt = title;
+		img.onerror = () => { img.hidden = true; };
 		inner.appendChild(img);
 
 		const st = statusOf(row.status);
@@ -851,6 +926,9 @@ export function createDesignsTab(container) {
 			inner.appendChild(chips);
 		}
 
+		const rebuild = rebuildPanel(row);
+		if (rebuild) inner.appendChild(rebuild);
+
 		inner.appendChild(specBody(row, spec));
 
 		if (row.note_path) {
@@ -862,6 +940,120 @@ export function createDesignsTab(container) {
 		inner.appendChild(detailActions(row));
 		detail.appendChild(inner);
 		close.focus();
+	}
+
+	/** What the model said it learned, and how the comparison went. */
+	function rebuildNotes(row) {
+		try {
+			const parsed = JSON.parse(row.recreate_notes || "null");
+			return parsed && typeof parsed === "object" ? parsed : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * The rebuild: the real page and the copy of it side by side, what the copy scored, and
+	 * what the model understood about how the page is built. Only for designs that have a
+	 * URL on them — there is nothing to rebuild from a screenshot of someone's phone.
+	 */
+	function rebuildPanel(row) {
+		const state = rebuildOf(row);
+		if (!state || row.recreate_status === "unsupported") return null;
+
+		const wrap = el("div", "design-rebuild");
+		wrap.appendChild(text("h4", null, "The rebuild"));
+
+		if (row.recreate_status !== "built") {
+			wrap.appendChild(text("p", "design-desc empty",
+				row.recreate_error ||
+				(row.recreate_status === "building"
+					? "Building the page again from its own code. It gets scored against the photograph when it renders."
+					: "Queued. This page gets built again from its own code, then scored against the photograph.")));
+			wrap.appendChild(rebuildActions(row));
+			return wrap;
+		}
+
+		const notes = rebuildNotes(row);
+		const rounds = row.recreate_rounds > 1 ? ` after ${row.recreate_rounds} rounds` : "";
+		// The stored sentence leads with the overall score, which this line has already
+		// said. Build the breakdown from the three numbers instead of printing both.
+		const part = (label, value) => (typeof value === "number" ? `${label} ${Math.round(value * 100)}%` : "");
+		const breakdown = [part("pixels", notes?.pixel), part("layout", notes?.layout), part("palette", notes?.palette)]
+			.filter(Boolean)
+			.join(", ");
+		wrap.appendChild(text("p", "design-rebuild-score",
+			`${matchPct(row)} match${rounds}.${breakdown ? ` ${breakdown}.` : ""}`));
+		if (notes?.model) {
+			wrap.appendChild(text("p", "design-hint", `Built by ${notes.model}. ${notes.why ?? ""}`.trim()));
+		}
+
+		const pair = el("div", "design-rebuild-pair");
+		for (const [src, caption] of [
+			[`/api/designs/${encodeURIComponent(row.id)}/reference?v=${row.recreate_at}`, "the real page"],
+			[`/api/designs/${encodeURIComponent(row.id)}/recreation?v=${row.recreate_at}`, "rebuilt from its code"],
+		]) {
+			const figure = el("figure");
+			const shot = el("img");
+			shot.loading = "lazy";
+			shot.alt = caption;
+			shot.src = src;
+			shot.onerror = () => { figure.hidden = true; };
+			figure.append(shot, text("figcaption", null, caption));
+			pair.appendChild(figure);
+		}
+		wrap.appendChild(pair);
+
+		for (const [key, heading] of [["approach", "How this page is built"], ["uncertain", "Approximated"]]) {
+			const items = strings(notes?.[key]);
+			if (!items.length) continue;
+			const block = el("section", "design-spec-block");
+			block.appendChild(text("h4", null, heading));
+			const list = el("ul");
+			for (const item of items) list.appendChild(text("li", null, item));
+			block.appendChild(list);
+			wrap.appendChild(block);
+		}
+
+		wrap.appendChild(rebuildActions(row));
+		return wrap;
+	}
+
+	function rebuildActions(row) {
+		const actions = el("div", "design-actions");
+		const id = encodeURIComponent(row.id);
+		if (row.recreate_status === "built") {
+			const open = text("a", "settings-btn ghost", "Open the rebuilt page");
+			open.href = `/api/designs/${id}/recreation.html`;
+			open.target = "_blank";
+			open.rel = "noopener";
+			actions.appendChild(open);
+		}
+		// The page's own code, when the capture got it. This is the thing an agent reads
+		// when it is building something in this style and the summary is not enough.
+		for (const [action, label] of [["source.html", "Its markup"], ["source.css", "Its CSS"]]) {
+			const link = text("a", "settings-btn ghost", label);
+			link.href = `/api/designs/${id}/${action}`;
+			link.target = "_blank";
+			link.rel = "noopener";
+			actions.appendChild(link);
+		}
+		const again = text("button", "settings-btn ghost", row.recreate_status === "built" ? "Rebuild again" : "Rebuild");
+		again.type = "button";
+		again.disabled = llmBlocked() || row.recreate_status === "building";
+		again.onclick = async () => {
+			again.disabled = true;
+			const out = await api(`/api/designs/${id}/recreate`, {});
+			pollStalled = false;
+			if (out.ok) {
+				await refresh();
+				openDetail(row.id);
+				return;
+			}
+			again.replaceWith(text("span", "design-hint", out.error ?? "that could not be queued"));
+		};
+		actions.appendChild(again);
+		return actions;
 	}
 
 	function swatchStrip(colours) {

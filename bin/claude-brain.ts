@@ -250,6 +250,11 @@ async function cmdReorganize(rest: string[]): Promise<void> {
 	console.log(`apply with:  claude-brain reorganize --apply --plan ${planned.plan.runId}`);
 }
 
+/** Whatever the row says went wrong, for a command that has just been refused. */
+function getDesignError(store: typeof import("../src/design-store"), id: string): string {
+	return store.getDesign(id)?.recreate_error ?? "";
+}
+
 /** The design library: what the brain remembers about designs the user liked. */
 async function cmdDesign(rest: string[]): Promise<void> {
 	const store = await import("../src/design-store");
@@ -292,10 +297,43 @@ async function cmdDesign(rest: string[]): Promise<void> {
 	if (sub === "show") {
 		const { designBrief } = await import("../src/design-note");
 		console.log(designBrief([row]));
-		// The escape hatch: the brief gets an agent most of the way, and it can Read the
-		// image itself for whatever the words did not carry.
-		console.log(`\nimage: ${store.imagePath(row)}`);
-		if (row.note_path) console.log(`note:  ${row.note_path}`);
+		// The escape hatches, in order of how much they carry. The brief gets an agent most
+		// of the way; the rebuild is a working page in this design language; the source is
+		// the site's own code; the image is for whatever words and code both missed.
+		if (row.recreate_status === "built") {
+			console.log(`\nrebuilt: ${store.recreationHtmlPath(row.id)}  (${Math.round(row.recreate_score / 10)}% match)`);
+			console.log(`shot:    ${store.recreationShotPath(row.id)}`);
+		}
+		if (Bun.file(store.sourceHtmlPath(row.id)).size > 0) {
+			console.log(`markup:  ${store.sourceHtmlPath(row.id)}`);
+			console.log(`css:     ${store.sourceCssPath(row.id)}`);
+		}
+		const own = store.imagePath(row);
+		if (Bun.file(own).size > 0) console.log(`image:   ${own}`);
+		else if (Bun.file(store.referenceShotPath(row.id)).size > 0) {
+			console.log(`image:   ${store.referenceShotPath(row.id)}`);
+		}
+		if (row.note_path) console.log(`note:    ${row.note_path}`);
+		return;
+	}
+
+	if (sub === "recreate") {
+		const { retryRecreation } = await import("../src/design-recreate");
+		if (!retryRecreation(row.id)) {
+			console.error(getDesignError(store, row.id) || "this design cannot be rebuilt");
+			process.exit(1);
+		}
+		console.log(`rebuilding ${row.id} — this takes a few minutes; watch it in the dashboard`);
+		// The queue is in this process, so the CLI has to stay alive long enough for it.
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+		const { recreateDesign } = await import("../src/design-recreate");
+		await recreateDesign(row.id);
+		const after = store.getDesign(row.id);
+		console.log(
+			after?.recreate_status === "built"
+				? `done: ${Math.round((after.recreate_score ?? 0) / 10)}% match — ${store.recreationHtmlPath(row.id)}`
+				: `stopped: ${after?.recreate_error ?? "no result"}`,
+		);
 		return;
 	}
 	if (sub === "retry") {
@@ -660,7 +698,8 @@ switch (cmd) {
  designs — reference images the brain can describe back to you
   claude-brain design list [--all]
   claude-brain design add <path…> [--caption "…"]
-  claude-brain design show "<id or description>"   the description, then the image path
+  claude-brain design show "<id or description>"   the description, the rebuild, the source
+  claude-brain design recreate "<id or description>"  rebuild the page from its own code
   claude-brain design retry|restore|forget "<id or description>"
 
  reorganize — tidy the vault into topical folders (uses your own claude CLI)

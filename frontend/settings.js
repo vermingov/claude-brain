@@ -67,6 +67,7 @@ export function createSettingsTab(container) {
 		renderSync();
 		renderIntegration();
 		renderLlm();
+		renderRecreate();
 		renderIndex();
 	}
 
@@ -266,6 +267,126 @@ export function createSettingsTab(container) {
 				"While this is off, images are still stored and searchable by name and caption. " +
 				"They just have no description attached."));
 		}
+		wrap.appendChild(s);
+	}
+
+	// --- Rebuilding captured sites -------------------------------------------
+
+	const PLANS = [
+		["auto", "Detect from my Claude login"],
+		["max20", "Max 20×"],
+		["max5", "Max 5×"],
+		["pro", "Pro"],
+		["free", "Free"],
+		["api", "API key"],
+	];
+
+	/**
+	 * The one part of the brain that spends real money on a good model, so it says out
+	 * loud what it would use and why. Everything here is off the record otherwise: which
+	 * plan was detected, what headroom it thinks there is, which model that adds up to.
+	 */
+	function renderRecreate() {
+		const r = status.recreate;
+		if (!r) return;
+		const s = section(
+			"Rebuilding captured sites",
+			"Capturing a URL reads the page's own code. The brain then builds the page again from " +
+			"that code, using its tokens, its components and its motion, renders the copy and scores " +
+			"it against a photograph of the original. The score says whether the design was " +
+			"understood. The copy is what anything you build in that style starts from.",
+		);
+
+		s.appendChild(
+			toggle("Rebuild pages I capture", r.enabled, async (recreate) => {
+				await api("/api/config", { designs: { recreate } });
+				await refresh();
+			}),
+		);
+
+		if (!r.browser) {
+			s.appendChild(el("div", "sync-hint warn",
+				"No Chromium-based browser was found on this machine, so pages cannot be opened, " +
+				"photographed or compared. Install chromium, or point CLAUDE_BRAIN_BROWSER at one."));
+		}
+
+		if (r.enabled && r.browser) {
+			const rounds = el("div", "settings-row");
+			rounds.appendChild(el("label", "settings-label", "Attempts per rebuild"));
+			const input = el("input", "settings-input settings-input-narrow");
+			input.type = "number";
+			input.min = "1";
+			input.max = "4";
+			input.value = String(r.rounds ?? 2);
+			input.onchange = async () => {
+				await api("/api/config", { designs: { recreateRounds: Number(input.value) || 1 } });
+				await refresh();
+			};
+			rounds.appendChild(input);
+			s.appendChild(rounds);
+			s.appendChild(el("p", "settings-sub",
+				"Each attempt is one call. The model sees its own last try next to the photograph and " +
+				"corrects it. Whichever attempt scores best is the one kept."));
+
+			s.appendChild(
+				toggle("Let the rebuild load web fonts while it renders", r.network, async (recreateNetwork) => {
+					await api("/api/config", { designs: { recreateNetwork } });
+					await refresh();
+				}),
+			);
+		}
+
+		if (r.model) {
+			s.appendChild(el("div", "vault-current ok",
+				`<span class="dot"></span>${escapeHtml(r.model)}. ${escapeHtml(r.why ?? "")}`));
+		}
+
+		const plan = el("div", "settings-row");
+		plan.appendChild(el("label", "settings-label", "Claude plan"));
+		const select = el("select", "settings-input settings-input-narrow");
+		for (const [value, label] of PLANS) {
+			const option = el("option", null, escapeHtml(label));
+			option.value = value;
+			if ((status.llm?.plan ?? "auto") === value) option.selected = true;
+			select.appendChild(option);
+		}
+		select.onchange = async () => {
+			await api("/api/config", { llm: { plan: select.value } });
+			await refresh();
+		};
+		plan.appendChild(select);
+		s.appendChild(plan);
+		s.appendChild(el("p", "settings-sub",
+			"The Claude CLI reports a Max subscription without saying whether it is the 5× or the 20× " +
+			"plan, so pick it here once if you are on 20×. Pro gets Sonnet, Max 5× gets Opus at high " +
+			"effort, Max 20× gets Fable."));
+
+		s.appendChild(
+			toggle("Pick the model from my plan", status.llm?.autoModel !== false, async (autoModel) => {
+				await api("/api/config", { llm: { autoModel } });
+				await refresh();
+			}),
+		);
+
+		const usage = el("div", "settings-row");
+		usage.appendChild(el("label", "settings-label", "Usage command"));
+		const usageInput = el("input", "settings-input");
+		usageInput.type = "text";
+		usageInput.placeholder = 'prints {"daily":40,"weekly":25,"fableWeekly":10} as percent used';
+		usageInput.value = status.llm?.usageCommand ?? "";
+		usageInput.onchange = async () => {
+			await api("/api/config", { llm: { usageCommand: usageInput.value.trim() } });
+			await refresh();
+		};
+		usage.appendChild(usageInput);
+		s.appendChild(usage);
+		s.appendChild(el("p", "settings-sub",
+			"Nothing on this machine publishes your live rate limits, so the brain cannot see them. " +
+			"Point this at anything that prints them and it steps down to a cheaper model when you " +
+			"are running low: below 60% of the day, or below 50% of either weekly allowance. Left " +
+			"empty, it goes by its own daily budget instead." +
+			(r.headroom?.source ? ` Currently: ${escapeHtml(r.headroom.source)}.` : "")));
+
 		wrap.appendChild(s);
 	}
 

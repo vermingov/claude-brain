@@ -91,6 +91,15 @@ export interface DesignRow {
 	mood: string;
 	created: number;
 	extracted: number;
+	/** The rebuild, for a design captured from a URL. See design-recreate.ts. */
+	recreate_status: string;
+	/** Per mille, so the column is an integer: 874 is an 87.4% match. */
+	recreate_score: number;
+	recreate_rounds: number;
+	recreate_error: string;
+	/** Raw JSON: what the model said it learned, and how the comparison went. */
+	recreate_notes: string;
+	recreate_at: number;
 }
 
 const EXTENSION: Record<ImageMime, string> = {
@@ -112,7 +121,7 @@ export function designId(bytes: Uint8Array): string {
 }
 
 function ensureDirs(): void {
-	for (const dir of [DESIGN_DIR, THUMB_DIR, RENDER_DIR]) mkdirSync(dir, { recursive: true });
+	for (const dir of [DESIGN_DIR, THUMB_DIR, RENDER_DIR, RECREATE_DIR]) mkdirSync(dir, { recursive: true });
 }
 
 /** Absolute path of the original upload. The extension is nominal — every reader sniffs. */
@@ -128,6 +137,70 @@ export function thumbPath(id: string): string {
 
 export function renderPath(id: string): string {
 	return join(RENDER_DIR, `${id}.webp`);
+}
+
+/* --- The rebuild -----------------------------------------------------------
+ * A design captured from a URL gets built again from what was measured, and the rebuild
+ * is rendered and scored against a screenshot of the real page (design-recreate.ts). Those
+ * files live here with the rest of a design's bytes, and their names are defined here
+ * rather than there so that the cleanup path can list them without importing the pipeline
+ * that makes them.
+ */
+export const RECREATE_DIR = join(DESIGN_DIR, "recreations");
+
+/** The document the model wrote. Also the thing an agent reads later to build in this style. */
+export function recreationHtmlPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.html`);
+}
+
+/** The rebuild, rendered. This is the picture the library card shows. */
+export function recreationShotPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.png`);
+}
+
+export function recreationThumbPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.thumb.png`);
+}
+
+/** The real page, rendered — kept so the two can always be compared again. */
+export function referenceShotPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.reference.png`);
+}
+
+/* The page's own frontend, as it ended up in the browser. Too large for a prompt and too
+ * useful to throw away: the rebuild's author opens it when the summary is not enough, and
+ * so can the user. */
+export function sourceHtmlPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.source.html`);
+}
+
+export function sourceCssPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.source.css`);
+}
+
+/** The shader taken off the page, and the runtime that compiles it back into the rebuild. */
+export function shadersPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.shaders.json`);
+}
+
+export function heroRuntimePath(id: string): string {
+	return join(RECREATE_DIR, `${id}.hero.js`);
+}
+
+/** Every file a rebuild owns, including the scratch names a killed round can leave. */
+export function recreationFiles(id: string): string[] {
+	return [
+		recreationHtmlPath(id),
+		recreationShotPath(id),
+		recreationThumbPath(id),
+		referenceShotPath(id),
+		sourceHtmlPath(id),
+		sourceCssPath(id),
+		shadersPath(id),
+		heroRuntimePath(id),
+		join(RECREATE_DIR, `${id}.candidate.png`),
+		join(RECREATE_DIR, `${id}.candidate.html`),
+	];
 }
 
 /* --- References ------------------------------------------------------------
@@ -302,7 +375,7 @@ async function writeBlob(path: string, bytes: Uint8Array): Promise<void> {
  */
 export function sweepPartFiles(): number {
 	let removed = 0;
-	for (const dir of [DESIGN_DIR, THUMB_DIR, RENDER_DIR]) {
+	for (const dir of [DESIGN_DIR, THUMB_DIR, RENDER_DIR, RECREATE_DIR]) {
 		let names: string[];
 		try {
 			names = readdirSync(dir);
@@ -574,6 +647,12 @@ export interface DesignPatch {
 	height?: number;
 	thumb?: boolean;
 	render?: boolean;
+	recreateStatus?: string;
+	recreateScore?: number;
+	recreateRounds?: number;
+	recreateError?: string;
+	recreateNotes?: string;
+	recreateAt?: number;
 }
 
 const COLUMN_OF: Record<keyof DesignPatch, string> = {
@@ -594,6 +673,12 @@ const COLUMN_OF: Record<keyof DesignPatch, string> = {
 	height: "height",
 	thumb: "thumb",
 	render: "render",
+	recreateStatus: "recreate_status",
+	recreateScore: "recreate_score",
+	recreateRounds: "recreate_rounds",
+	recreateError: "recreate_error",
+	recreateNotes: "recreate_notes",
+	recreateAt: "recreate_at",
 };
 
 export function updateDesign(id: string, patch: DesignPatch): void {
@@ -714,6 +799,10 @@ export function forgetDesign(
 	const removes = [imagePath(row)];
 	if (row.thumb) removes.push(thumbPath(id));
 	if (row.render) removes.push(renderPath(id));
+	// The rebuild and the two renders behind it. Listed unconditionally and filtered by
+	// existsSync below, exactly like the blobs above: a dry run that understates what it
+	// leaves behind is the one thing this plan must not do.
+	removes.push(...recreationFiles(id));
 
 	const root = vaultRoot();
 	const keeps: string[] = [];
