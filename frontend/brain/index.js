@@ -326,8 +326,8 @@ export function createBrainTab(container) {
 			{ name: "fireGain", size: 1 },
 			{ name: "arriveAt", size: 1 },
 		];
-		// How bushy each cell grows: one basal dendrite per few links, clamped in the shader.
-		const branches = Float32Array.from(graph.nodes, (node) => 2 + Math.min(4, Math.round(Math.sqrt(node.connections))));
+		// How many processes a cell grows: more links, busier neuron. Clamped in the shader.
+		const branches = Float32Array.from(graph.nodes, (node) => 3 + Math.min(6, Math.round(Math.sqrt(node.connections * 1.6))));
 		const cells = createSpriteLayer(scene, {
 			name: "cells",
 			count: n,

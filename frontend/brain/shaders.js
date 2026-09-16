@@ -83,11 +83,8 @@ float popFlash(float born) {
 	return born < 0.0 ? 0.0 : exp(-born * 1.9);
 }`;
 
-/**
- * How much bigger the drawn cell is than its soma. The soma stays `size` — that is what the
- * pointer hits and what the layout spaced the notes by — and the arbor reaches out past it.
- */
-const ARBOR = 3.4;
+/** How far the quad reaches past the soma, in soma radii: room for the processes. */
+const ARBOR = 3.2;
 
 Effect.ShadersStore.brainCellVertexShader = `
 precision highp float;
@@ -96,13 +93,13 @@ attribute vec3 position; attribute vec2 corner; attribute vec4 tint; attribute f
 attribute float fireAt; attribute float fireGain; attribute float arriveAt; attribute float branches;
 uniform mat4 view; uniform mat4 projection; uniform float time;
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
-varying vec2 vUp; varying float vDetail; varying float vBranches; varying float vSeed;
+varying float vDetail; varying float vBranches; varying float vPhase;
 ${SPIKE}
 ${POP}
 ${ARRIVAL}
 void main() {
 	vTint = tint; vCorner = corner; vDepth = 0.0; vFire = 0.0; vArrive = 0.0;
-	vUp = vec2(0.0, 1.0); vDetail = 0.0; vBranches = branches; vSeed = 0.0;
+	vDetail = 0.0; vBranches = branches; vPhase = 0.0;
 	if (size <= 0.0) { ${CULL} return; }
 	float born = time - arriveAt;
 	float pop = popScale(born);
@@ -110,129 +107,101 @@ void main() {
 	float fire = spike(time - fireAt) * fireGain;
 	vec3 world = position + arrivalPush(position, time);
 	vec4 viewPos = view * vec4(world, 1.0);
-	viewPos.xy += corner * size * ARBOR * pop * (1.0 + 0.5 * fire);
+	viewPos.xy += corner * size * ARBOR * pop * (1.0 + 0.4 * fire);
 	gl_Position = projection * viewPos;
 	vDepth = -viewPos.z; vFire = fire; vArrive = popFlash(born);
 
-	// Every note sits on the cortex, so "away from the middle of the brain" is the way a
-	// real pyramidal cell points: apex and apical dendrite toward the surface, basal
-	// dendrites and axon down into the white matter. The whole sheet ends up combed the
-	// same way, which is what a cortex actually looks like.
-	vec3 outward = (view * vec4(normalize(position + vec3(0.0, 0.0, 0.001)), 0.0)).xyz;
-	float lean = length(outward.xy);
-	vUp = lean > 0.001 ? outward.xy / lean : vec2(0.0, 1.0);
-	// Pointing at or away from the camera, the arbor is foreshortened to nearly nothing;
-	// drawing it at full length there would make it swing about as the camera turns.
-	vSeed = lean;
+	// Every cell turned a different way, so a field of them does not read as wallpaper.
+	vPhase = fract(sin(dot(position.xz, vec2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
 
-	// Detail falls away with apparent size: a cell a few pixels across gets a soma and
-	// nothing else, which is most of them in the overview and all of the cost.
+	// Detail by apparent size: a cell a few pixels across is a lit speck and nothing more,
+	// which is most of them in the overview and all of the cost.
 	float apparent = size * ARBOR * projection[1][1] / max(-viewPos.z, 1.0);
-	vDetail = clamp((apparent - 0.012) / 0.05, 0.0, 1.0);
+	vDetail = clamp((apparent - 0.01) / 0.05, 0.0, 1.0);
 }`;
 
 /**
- * A cell at rest is membrane, not light: rim-lit, hollow in the middle, so a thousand of
- * them read as tissue you can see through rather than a field of dots. Firing is the only
- * thing that crosses the bloom threshold.
- */
-/**
- * A pyramidal cell, drawn procedurally in the quad.
+ * A neuron, drawn procedurally in the quad.
  *
- * The shape is the one a Golgi stain shows: a teardrop soma with its apex toward the
- * cortical surface, one thick apical dendrite rising from that apex and splitting into a
- * tuft, a spray of shorter basal dendrites from the base, and a single thin axon running
- * the other way. How many basal dendrites a cell grows is how many notes link to it, so a
- * hub is visibly a bushier cell and an orphan is a bare soma — the picture says what the
- * graph says without a legend for it.
+ * Multipolar, the way one looks down a microscope: a lumpy soma with a bright nucleus, and
+ * processes leaving it in every direction, tapering as they go and splitting once further
+ * out. Beads of light sit along them — the vesicles that make these images look alive —
+ * and the whole cell carries a halo, because a neuron under fluorescence is lit from
+ * inside rather than lit from a lamp.
  *
- * Everything is signed distance, so the processes taper and join smoothly and the whole
- * arbor antialiases against one pixel width.
+ * Built in polar coordinates rather than from a list of line segments: the angle to the
+ * nearest process is one modulo, so eight branching processes cost about what one line
+ * would, and the count can vary per cell. How many a cell grows is how many notes link to
+ * it, so a hub is visibly a busier cell.
  */
 Effect.ShadersStore.brainCellFragmentShader = `
 precision highp float;
 #define ARBOR ${ARBOR}
 varying vec4 vTint; varying vec2 vCorner; varying float vDepth; varying float vFire; varying float vArrive;
-varying vec2 vUp; varying float vDetail; varying float vBranches; varying float vSeed;
+varying float vDetail; varying float vBranches; varying float vPhase;
 ${FOG}
 
-/** Distance to a line that thins from radius r0 at a to radius r1 at b. */
-float process(vec2 p, vec2 a, vec2 b, float r0, float r1) {
-	vec2 pa = p - a;
-	vec2 ba = b - a;
-	float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-	return length(pa - ba * h) - mix(r0, r1, h);
-}
-
-float smin(float a, float b, float k) {
-	float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-	return mix(b, a, h) - k * h * (1.0 - h);
-}
+const float TAU = 6.2831853;
+/** Where the processes end, in soma radii. */
+const float REACH = 3.0;
+/** Past this fraction of the reach, each process has split in two. */
+const float SPLIT = 0.5;
 
 void main() {
-	// Into the cell's own frame: y along the cortical normal, soma radius 1.
-	vec2 right = vec2(vUp.y, -vUp.x);
-	vec2 q = vec2(dot(vCorner, right), dot(vCorner, vUp)) * ARBOR;
+	vec2 q = vCorner * ARBOR;
+	float r = length(q);
+	if (r > REACH + 0.25) discard;
+	float a = atan(q.y, q.x) + vPhase;
 
-	// The soma: a circle pulled into a point at the apex. Squeezing x in proportion to y
-	// above the middle is all a teardrop is.
-	float taper = 1.0 + 0.55 * max(q.y, 0.0);
-	float d = length(vec2(q.x * taper, q.y * 0.92)) - 0.95;
+	// The soma: a circle with a slow lump in it, so it is a cell and not a ball bearing.
+	float soma = r - (1.0 + 0.1 * sin(a * 3.0 + vPhase) + 0.05 * sin(a * 7.0));
 
-	// Foreshortening: seen end-on there is no length to draw, and a full arbor would swing
-	// around as the camera moved.
-	float reach = vDetail * (0.35 + 0.65 * vSeed);
-	if (reach > 0.02) {
-		// The apical dendrite, thickest of the processes, and its tuft.
-		vec2 apex = vec2(0.0, 0.8);
-		vec2 top = apex + vec2(0.0, 1.85 * reach);
-		d = smin(d, process(q, apex, top, 0.26, 0.1), 0.18);
-		d = smin(d, process(q, top, top + vec2(-0.5, 0.55) * reach, 0.09, 0.03), 0.1);
-		d = smin(d, process(q, top, top + vec2(0.45, 0.6) * reach, 0.09, 0.03), 0.1);
+	// The processes. Fold the angle onto the nearest spoke, and the distance to that spoke
+	// is how far across the process this fragment is.
+	float spokes = clamp(floor(vBranches), 3.0, 9.0);
+	float step1 = TAU / spokes;
+	float near1 = abs(sin(mod(a + step1 * 0.5, step1) - step1 * 0.5)) * r;
+	// Beyond the split each process has become two, which is one more modulo at twice the
+	// frequency and half the offset.
+	float step2 = step1 * 0.5;
+	float near2 = abs(sin(mod(a + step2 * 0.5, step2) - step2 * 0.5)) * r;
+	float split = smoothstep(REACH * SPLIT, REACH * (SPLIT + 0.22), r);
+	float across = mix(near1, near2, split);
 
-		// Basal dendrites, fanned below the base. One per few links, so the arbor thickens
-		// with the note's place in the graph.
-		vec2 base = vec2(0.0, -0.55);
-		float count = clamp(vBranches, 2.0, 6.0);
-		for (int i = 0; i < 6; i++) {
-			if (float(i) >= count) break;
-			float t = (float(i) + 0.5) / count;
-			float angle = mix(-2.5, -0.65, t);
-			vec2 dir = vec2(cos(angle), sin(angle));
-			// A kink partway along, so they are not a starburst of straight spokes.
-			vec2 mid = base + dir * 0.75 * reach;
-			vec2 tip = mid + normalize(dir + vec2(0.0, -0.45)) * 0.7 * reach;
-			d = smin(d, process(q, base, mid, 0.2, 0.11), 0.14);
-			d = smin(d, process(q, mid, tip, 0.11, 0.02), 0.09);
-		}
+	// Thick where they leave the soma, hair-fine at the tips.
+	float along = clamp(r / REACH, 0.0, 1.0);
+	float width = mix(0.15, 0.022, along) * (1.0 - 0.35 * split);
+	float process = max(across - width, r - REACH);
 
-		// The axon: one, thin, and longer than anything else, straight down into the white.
-		d = smin(d, process(q, base, base + vec2(0.12, -3.0) * reach, 0.085, 0.045), 0.1);
-	}
+	float d = min(soma, process);
+	// Far away there is no arbor to resolve, only the soma.
+	d = mix(soma, d, vDetail);
 
-	float edge = max(fwidth(d), 0.012);
+	float edge = max(fwidth(d), 0.01);
 	float coverage = 1.0 - smoothstep(-edge, edge, d);
-	if (coverage <= 0.004) discard;
 
-	// The soma is the solid part; the finer the process, the fainter it draws, which is how
-	// these look stained and keeps a thousand arbors from filling the view with lines.
-	float body = 1.0 - smoothstep(-0.95, 0.15, d);
-	float ink = mix(0.42, 1.0, body);
+	// Lit from inside. The nucleus is the brightest thing in the cell and the only part
+	// that crosses the bloom threshold at rest.
+	float nucleus = smoothstep(0.55, 0.05, r);
+	// Vesicles strung along the processes: round, not banded, so they read as beads rather
+	// than as rungs on a ladder — narrow across the process as well as along it.
+	float onProcess = smoothstep(1.05, 1.3, r) * vDetail;
+	float round = exp(-pow(across / max(width, 0.02), 2.0) * 2.2);
+	float beads = pow(max(sin(r * 9.0 + vPhase * 2.0), 0.0), 44.0) * onProcess * round * coverage;
+	// The halo: what makes a cell read as glowing rather than as a shape cut out of black.
+	float halo = exp(-r * 1.9) * 0.16;
 
-	// Membrane, not a dot: lit across the soma and brightest at its rim. Measured against
-	// the soma's own radius — over the whole arbor the curve flattens out and the cell goes
-	// nearly transparent.
-	float across = clamp(length(q) / 1.05, 0.0, 1.0);
-	float facing = sqrt(max(1.0 - across * across, 0.0));
-	vec3 normal = normalize(vec3(q / 1.05, facing + 0.2));
-	float lambert = 0.45 + 0.55 * max(dot(normal, normalize(vec3(-0.35, 0.55, 0.76))), 0.0);
-	float rim = pow(1.0 - facing, 2.2);
+	float lit = coverage * (0.42 + 0.7 * nucleus) + beads * 0.85 + halo;
+	if (lit <= 0.004) discard;
 
-	vec3 resting = vTint.rgb * lambert;
-	vec3 firing = mix(vTint.rgb, vec3(1.0), 0.45) * 2.8;
-	vec3 color = mix(resting, firing, clamp(vFire, 0.0, 1.0));
+	vec3 base = vTint.rgb;
+	vec3 core = mix(base, vec3(1.0), 0.7);
+	vec3 color = base * (0.55 + 0.45 * coverage) + core * (nucleus * 0.95 + beads * 1.5);
+	vec3 firing = mix(base, vec3(1.0), 0.5) * 3.0;
+	color = mix(color, firing, clamp(vFire, 0.0, 1.0));
 	color = mix(color, vec3(1.0, 0.96, 0.9) * 3.2, clamp(vArrive, 0.0, 1.0));
-	float alpha = clamp(vTint.a * (0.45 + 0.8 * rim) * ink + vFire * 0.9 + vArrive, 0.0, 1.0) * coverage;
+
+	float alpha = clamp(vTint.a * lit * 1.15 + vFire * 0.9 + vArrive, 0.0, 1.0);
 	gl_FragColor = vec4(mix(fogColor, color, fogFactor(vDepth)), alpha);
 }`;
 
