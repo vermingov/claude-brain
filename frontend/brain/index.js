@@ -13,24 +13,20 @@ import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { DefaultRenderingPipeline } from "@babylonjs/core/PostProcesses/RenderPipeline/Pipelines/defaultRenderingPipeline";
 import { createCamera } from "./camera.js";
 import { buildConduction, planRoute, planVolley } from "./cascade.js";
-import { CELL_ALPHA, createEmphasis, HEAT_ALPHA } from "./emphasis.js";
-import { createImpulseLayer } from "./impulses.js";
+import { createEmphasis } from "./emphasis.js";
 import { createLabels } from "./labels.js";
 import { createLegend } from "./legend.js";
 import { watchActivity } from "./live.js";
 import { createPanel } from "./panel.js";
 import { createPicker } from "./picking.js";
 import { createSearch } from "./search.js";
-import { createSpriteLayer } from "./sprites.js";
-import { createSynapseLayer } from "./synapses.js";
 import { createDust } from "./dust.js";
+import { createField } from "./field.js";
 import { arrivalRange, createArrivals } from "./arrivals.js";
 
 /** Outer space: no blue in it, so distance fades to nothing rather than to a colour. */
 const BACKGROUND = new Color4(0, 0, 0, 1);
 const PICK_INTERVAL_MS = 50;
-/** The flare around a firing cell, as a multiple of the cell's own radius. */
-const FLARE_SCALE = 6;
 /** Below this, after the fly-in has settled, the post-processing steps down once. */
 const LOW_FPS = 40;
 const QUALITY_CHECK_MS = 6000;
@@ -39,7 +35,6 @@ const LABEL_HOLD_MS = 4000;
 const STATUS_HOLD_MS = 6000;
 /** Search hits that get a title; past this it is a wall of text, not a label. */
 const MAX_SEARCH_LABELS = 12;
-const NEVER = -1e9;
 
 const VIA = { mcp: "MCP", cli: "CLI", hook: "session hook", ui: "dashboard" };
 const ACTION = { recall: "recall", path: "path", explain: "explain", affected: "affected" };
@@ -138,10 +133,9 @@ export function createBrainTab(container) {
 	let indexByPath = new Map();
 	let radii = [];
 	let excitability = null;
-	let cellFireAt = null;
-	let cellGain = null;
-	let cellArriveAt = null;
 	let arrivals = null;
+	/** Timers for the hops of the volley in flight, so a new one cancels the old. */
+	let volley = [];
 	let firedLabels = new Set();
 	let labelTimer = null;
 	let statusTimer = null;
@@ -187,28 +181,7 @@ export function createBrainTab(container) {
 
 	function restyle() {
 		if (!layers) return;
-		const n = graph.nodes.length;
-		const cellTints = new Float32Array(n * 4);
-		const cellSizes = new Float32Array(n);
-		const flareTints = new Float32Array(n * 4);
-		const flareSizes = new Float32Array(n);
-		for (let i = 0; i < n; i++) {
-			const node = graph.nodes[i];
-			const state = emphasis.nodeState(i);
-			const tint = emphasis.tintOf(node);
-			if (state === "hidden") continue;
-			const alpha = CELL_ALPHA[state] + (state === "normal" ? HEAT_ALPHA * (node.activation ?? 0) : 0);
-			cellTints.set([tint[0], tint[1], tint[2], alpha], i * 4);
-			cellSizes[i] = radii[i];
-			// The flare carries the lobe's colour; the shader decides whether it is there.
-			flareTints.set([tint[0], tint[1], tint[2], 0.85], i * 4);
-			flareSizes[i] = radii[i] * FLARE_SCALE;
-		}
-		layers.cells.set("tint", cellTints);
-		layers.cells.set("size", cellSizes);
-		layers.flares.set("tint", flareTints);
-		layers.flares.set("size", flareSizes);
-		layers.synapses.restyle(emphasis.edgeState, emphasis.tintOf);
+		layers.field.restyle((index) => emphasis.nodeState(index));
 		layers.labels.show(labelSet());
 	}
 
@@ -218,19 +191,24 @@ export function createBrainTab(container) {
 		if (text !== restingStatus) statusTimer = setTimeout(() => (statsEl.textContent = restingStatus), STATUS_HOLD_MS);
 	}
 
-	/** Write a planned volley into the layers. One buffer upload each; the GPU runs it. */
+	/**
+	 * Play a planned volley.
+	 *
+	 * The cascade plans in absolute time — a hop three links out happens two seconds from
+	 * now — and every note is lit when its moment arrives rather than being written with it.
+	 * A note's afterglow and every signal running out of it are computed against its clock,
+	 * so a clock pointing into the future switches all of that off until it catches up.
+	 */
 	function play(plan) {
 		if (plan.fires.length === 0) return;
+		const now = performance.now() / 1000;
+		for (const timer of volley) clearTimeout(timer);
+		volley = [];
 		for (const fire of plan.fires) {
-			cellFireAt[fire.node] = fire.at;
-			cellGain[fire.node] = fire.gain;
+			const delay = Math.max(0, (fire.at - now) * 1000);
+			if (delay < 16) layers.field.light(fire.node, fire.gain);
+			else volley.push(setTimeout(() => layers?.field.light(fire.node, fire.gain), delay));
 		}
-		layers.cells.set("fireAt", cellFireAt);
-		layers.cells.set("fireGain", cellGain);
-		layers.flares.set("fireAt", cellFireAt);
-		layers.flares.set("fireGain", cellGain);
-		layers.synapses.conduct(plan.impulses);
-		layers.impulses.fire(plan.impulses);
 
 		// The first few notes to fire name themselves, then the brain goes quiet again.
 		firedLabels = new Set(plan.fires.slice(0, 6).map((fire) => fire.node));
@@ -250,11 +228,9 @@ export function createBrainTab(container) {
 	function land(indices) {
 		const now = performance.now() / 1000;
 		for (const index of indices) {
-			cellArriveAt[index] = now;
+			layers.field.arrive(index);
 			arrivals.add(graph.nodes[index], now);
 		}
-		layers.cells.set("arriveAt", cellArriveAt);
-		layers.flares.set("arriveAt", cellArriveAt);
 		play(planVolley(conduction, indices.slice(0, 8), { now, passes: emphasis.edgeVisible, limit: 120 }));
 		setStatus(`${indices.length} new note${indices.length === 1 ? "" : "s"} in the vault`);
 	}
@@ -308,12 +284,7 @@ export function createBrainTab(container) {
 		emphasis = createEmphasis(graph);
 		conduction = buildConduction(graph);
 		const n = graph.nodes.length;
-		radii = graph.nodes.map((node) => 2.4 + Math.sqrt(node.connections + 1) * 0.95);
 		excitability = Float32Array.from(graph.nodes, (node) => node.activation ?? 0);
-		cellFireAt = new Float32Array(n).fill(NEVER);
-		cellGain = new Float32Array(n).fill(1);
-		// Nothing has landed yet: a note that was already here must not pop on first sight.
-		cellArriveAt = new Float32Array(n).fill(NEVER);
 		arrivals = createArrivals();
 		const spread = [...graph.nodes.map((node) => Math.hypot(node.x, node.y, node.z))].sort((a, b) => a - b);
 		const reach = arrivalRange(spread[Math.floor(spread.length * 0.95)] ?? 0);
@@ -321,47 +292,16 @@ export function createBrainTab(container) {
 		const positions = new Float32Array(n * 3);
 		graph.nodes.forEach((node, i) => positions.set([node.x, node.y, node.z], i * 3));
 
-		const firing = [
-			{ name: "fireAt", size: 1 },
-			{ name: "fireGain", size: 1 },
-			{ name: "arriveAt", size: 1 },
-		];
-		// How many processes a cell grows: more links, busier neuron. Clamped in the shader.
-		const branches = Float32Array.from(graph.nodes, (node) => 3 + Math.min(6, Math.round(Math.sqrt(node.connections * 1.6))));
-		const cells = createSpriteLayer(scene, {
-			name: "cells",
-			count: n,
-			vertex: "brainCell",
-			fragment: "brainCell",
-			blend: "alpha",
-			attributes: [...firing, { name: "branches", size: 1 }],
+		const field = createField(scene, graph, {
 			arrivalRange: reach,
-			renderingGroup: 1,
+			visible: emphasis.nodeVisible,
+			tintOf: emphasis.tintOf,
 		});
-		const flares = createSpriteLayer(scene, {
-			name: "flares",
-			count: n,
-			vertex: "brainFlare",
-			fragment: "brainGlow",
-			blend: "add",
-			attributes: firing,
-			arrivalRange: reach,
-			renderingGroup: 2,
-		});
-		for (const layer of [cells, flares]) {
-			layer.set("position", positions);
-			layer.set("fireAt", cellFireAt);
-			layer.set("fireGain", cellGain);
-			layer.set("arriveAt", cellArriveAt);
-		}
-		cells.set("branches", branches);
+		radii = field.radii;
 		layers = {
 			dust: createDust(scene, spread[Math.floor(spread.length * 0.95)] ?? 0),
-			synapses: createSynapseLayer(scene, graph, reach),
-			cells,
-			flares,
-			impulses: createImpulseLayer(scene, graph, emphasis.tintOf),
-			labels: createLabels(scene, graph, radii),
+			field,
+			labels: createLabels(scene, graph, field.radii),
 		};
 		picker = createPicker(scene, engine, view.camera, graph, radii, emphasis.nodeVisible);
 		panel = createPanel(container, graph, { onNavigate: focusOn, onClose: closePanel });
@@ -475,19 +415,13 @@ export function createBrainTab(container) {
 		const dt = engine.getDeltaTime() / 1000;
 		if (layers) {
 			const seconds = now / 1000;
-			layers.cells.setTime(seconds);
-			layers.flares.setTime(seconds);
-			layers.impulses.setTime(seconds);
-			layers.synapses.setTime(seconds);
+			layers.field.setTime(seconds);
+			layers.field.setCamera(view.camera.globalPosition);
 			layers.dust.setTime(seconds);
 			layers.dust.follow(view.camera.globalPosition);
 			// One small uniform, and only while something is still settling.
 			const settling = arrivals.pack(seconds);
-			if (settling) {
-				for (const layer of [layers.cells, layers.flares, layers.impulses, layers.synapses]) {
-					layer.setArrivals(settling.data, settling.count);
-				}
-			}
+			if (settling) layers.field.setArrivals(settling.data, settling.count);
 			if (!qualityChecked && now - loadedAt > QUALITY_CHECK_MS) {
 				qualityChecked = true;
 				if (engine.getFps() < LOW_FPS) quality.lighten();

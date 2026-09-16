@@ -4,11 +4,6 @@
 
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 
-/** How solid a cell is at rest. Tissue, not a dot. */
-export const CELL_ALPHA = { normal: 0.2, dim: 0.07, hi: 0.6 };
-/** A note that is recalled often sits slightly denser, without lighting up. */
-export const HEAT_ALPHA = 0.06;
-
 export function createEmphasis(graph) {
 	const { nodes, edges, categories } = graph;
 	const tintByCategory = new Map(
