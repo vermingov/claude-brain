@@ -19,7 +19,7 @@ optdepends=('claude-code: LLM-assisted vault reorganisation and design descripti
 options=('!strip' '!debug')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('ebfb8aa2ab3eff0df6655f74020f3623fbe6e4de9469a0c51bd6c35c74e9f078')
+sha256sums=('74d8a5766b3fa352a7e5b3a072246569321a500e928736868bba16ad56acdf19')
 
 build() {
 	cd "$pkgname-$pkgver"
