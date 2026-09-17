@@ -36,6 +36,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { CANON_WALKER } from "./dom-recording";
 
 /** Ceilings. A hero scene is a few megabytes; anything past this is a game. */
 const MAX_TOTAL_BUFFER_BYTES = 24 * 1024 * 1024;
@@ -1208,6 +1209,21 @@ export function replayEssentials(frame: RippedFrame, keepSamples: boolean): Part
 }
 
 const RUNTIME_SOURCE = readFileSync(join(import.meta.dir, "runtime", "webgl-replay.js"), "utf-8");
+const DOM_PLAYER_SOURCE = readFileSync(join(import.meta.dir, "runtime", "dom-player.js"), "utf-8");
+
+/**
+ * The one script a rebuild carries: the behaviour tapes played against the transplanted DOM, and
+ * the replay engine when the page had a scene. Both are this package's code; what they are given
+ * is data — tapes, a frame, and a behaviour that has been through the port's checks.
+ */
+export function rebuildRuntime(options: { tapes?: unknown; scene?: { frame: RippedFrame; behaviour?: string } }): string {
+	const parts = ["// Written by claude-brain: the rebuild's runtime."];
+	if (options.tapes) {
+		parts.push("(() => {", CANON_WALKER, DOM_PLAYER_SOURCE, `startDomPlayer(${JSON.stringify(options.tapes)});`, "})();");
+	}
+	if (options.scene) parts.push(replayRuntime(options.scene.frame, "", { inline: true, behaviour: options.scene.behaviour }));
+	return parts.join("\n");
+}
 
 /**
  * The script that draws the captured frame again, at the canvas's real size.

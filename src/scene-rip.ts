@@ -17,6 +17,7 @@
 //   the scripts     every script the page ran, where the scene's own code is to be found
 
 import { type Page, withPage } from "./cdp";
+import { INLINE_SCRIPTS, SCRIPT_URLS } from "./page-transplant";
 import { type Recording, SKIP_DRAWS, VIRTUAL_CLOCK, readLarge, runTo, sceneStart, uniformLog } from "./parity-hooks";
 import { RIPPER_HOOK_SCRIPT, RIPPER_STASH_SCRIPT, type RippedFrame, ripperSliceScript } from "./webgl-ripper";
 
@@ -96,12 +97,8 @@ export async function ripScene(
 				(await page.evaluate<number>(
 					`(() => { const rip = window.__brainRip; const c = rip && rip.lastGl && rip.lastGl.canvas; return c ? Array.from(document.querySelectorAll("canvas")).indexOf(c) : -1; })()`,
 				)) ?? -1;
-			const scripts =
-				(await page.evaluate<string[]>(
-					`Array.from(new Set([...performance.getEntriesByType("resource").map((e) => e.name).filter((n) => /\\.m?js(\\?|$)/.test(n)), ...Array.from(document.scripts).map((s) => s.src).filter(Boolean)]))`,
-				)) ?? [];
-			const inlineScripts =
-				(await page.evaluate<string>(`Array.from(document.scripts).filter((s) => !s.src).map((s) => s.textContent).join("\\n").slice(0, 4000000)`)) ?? "";
+			const scripts = (await page.evaluate<string[]>(SCRIPT_URLS)) ?? [];
+			const inlineScripts = (await page.evaluate<string>(INLINE_SCRIPTS)) ?? "";
 			return { frame, canvasIndex, recording, scripts, inlineScripts };
 		},
 		{ pin },

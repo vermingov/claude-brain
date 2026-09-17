@@ -31,8 +31,9 @@
 // will not turn; the WebGL scene is replaced by this package's replay engine, and classes a
 // page toggles on visibility are handed to that runtime by data attribute.
 
-import { type StoredAsset, collectFonts, storeFetchedAsset } from "./design-assets";
+import { type StoredAsset, collectFonts } from "./design-assets";
 import type { Page } from "./cdp";
+import { type PageResources, pageResources } from "./page-resources";
 import { type FetchLimits, guardedFetch } from "./url-guard";
 
 const MAX_SHEET_BYTES = 4 * 1024 * 1024;
@@ -40,9 +41,6 @@ const SHEET_LIMITS: FetchLimits = { maxBytes: MAX_SHEET_BYTES, timeoutMs: 15_000
 /** Sheets a page loads from a CDN it cannot read: counted, but bounded by bytes. */
 const MAX_CROSS_ORIGIN_SHEETS = 150;
 const MAX_CROSS_ORIGIN_BYTES = 16 * 1024 * 1024;
-/** A whole page's imagery, which is more than a manifest for a prompt ever needed. */
-const MAX_TRANSPLANT_ASSETS = 400;
-const MAX_TRANSPLANT_BYTES = 90 * 1024 * 1024;
 
 export interface TransplantRule {
 	/** The rule's text, already wrapped in the grouping rules that held it. */
@@ -73,6 +71,68 @@ export interface TransplantCapture {
 	classes: string[];
 	icon: string;
 }
+
+/**
+ * In-page: a stylesheet's source text as an index of its rules, so a rule can be written out the
+ * way the sheet wrote it rather than the way this engine serialises it back.
+ *
+ * The CSSOM loses things on the way back to text. A shorthand holding var() whose longhand is
+ * then set on its own — `padding: var(--s) var(--s) 0; padding-bottom: 0` — comes back as
+ * `padding-top: ; padding-right: ; padding-left: ;`, and the padding is gone. Properties and values
+ * this engine does not support, which the browser viewing the rebuild may, are not there at all.
+ *
+ * Rules are keyed by the grouping rules around them and their prelude, both with whitespace,
+ * quotes and case taken out, since the CSSOM normalises those; a key seen twice is told apart by
+ * order. Only rules at the top level or inside at-rules are indexed: a nested rule stays inside
+ * the text of the rule that holds it.
+ */
+export const SOURCE_RULES = String.raw`
+const ruleKey = (context, prelude) =>
+	[...context, prelude].map((part) => part.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\s+/g, "").replace(/["']/g, "").replace(/::/g, ":").toLowerCase()).join("\u0001");
+const sourceRules = (text) => {
+	const index = new Map();
+	let i = 0;
+	const list = (context) => {
+		let start = i;
+		let depth = 0;
+		while (i < text.length) {
+			const c = text[i];
+			if (c === "/" && text[i + 1] === "*") {
+				const end = text.indexOf("*/", i + 2);
+				i = end < 0 ? text.length : end + 2;
+				continue;
+			}
+			if (c === '"' || c === "'") {
+				for (i++; i < text.length && text[i] !== c; i += text[i] === "\\" ? 2 : 1);
+				i++;
+				continue;
+			}
+			if (c === "\\") { i += 2; continue; }
+			if (c === "(" || c === "[") depth++;
+			else if ((c === ")" || c === "]") && depth > 0) depth--;
+			else if (depth === 0 && c === ";") start = i + 1;
+			else if (depth === 0 && c === "}") return;
+			else if (depth === 0 && c === "{") {
+				const prelude = text.slice(start, i).replace(/\/\*[\s\S]*?\*\//g, "").trim();
+				const open = i++;
+				list(context && prelude.startsWith("@") ? context.concat(prelude) : null);
+				if (context && prelude) {
+					const key = ruleKey(context, prelude);
+					const whole = prelude + " " + text.slice(open, i + 1);
+					if (index.has(key)) index.get(key).push(whole);
+					else index.set(key, [whole]);
+				}
+				i++;
+				start = i;
+				continue;
+			}
+			i++;
+		}
+	};
+	list([]);
+	return index;
+};
+`;
 
 /**
  * Read the page. `extraSheets` are cross-origin sheets fetched on this side, passed back in as
@@ -112,27 +172,51 @@ export function transplantScript(extraSheets: Array<{ href: string; text: string
 	};
 
 	// ---- rules ----------------------------------------------------------------------------
+	${SOURCE_RULES}
+	// Each sheet's own text, indexed. A linked sheet is fetched again, from the cache as a rule; an
+	// inline one is its element's text; one built from script has no text, and its rules are
+	// written as the CSSOM serialises them.
+	const sourceOf = async (sheet, href) => {
+		try {
+			if (sheet.ownerNode && sheet.ownerNode.tagName === "STYLE") return sourceRules(sheet.ownerNode.textContent || "");
+			if (!href) return null;
+			const response = await fetch(href, { credentials: "same-origin", cache: "force-cache" });
+			return response.ok ? sourceRules(await response.text()) : null;
+		} catch (e) {
+			return null;
+		}
+	};
+	// The k-th rule with this key in the source, for the k-th one the CSSOM has.
+	const written = (source, seen, context, prelude, fallback) => {
+		if (!source) return fallback;
+		const key = ruleKey(context, prelude);
+		const k = seen.get(key) || 0;
+		seen.set(key, k + 1);
+		const list = source.get(key);
+		return list && list[k] ? list[k] : fallback;
+	};
 	const GLOBAL = /^@(keyframes|-webkit-keyframes|property|font-face|counter-style|font-feature-values|font-palette-values|page|namespace)\b/i;
-	const walk = (rules, href, wrap) => {
+	const walk = async (rules, href, wrap, source, seen, context) => {
 		for (const rule of Array.from(rules)) {
 			const text = rule.cssText;
 			if (rule instanceof CSSStyleRule) {
 				const parts = splitTop(rule.selectorText || "");
 				const matched = parts.some(matches);
 				const classes = matched ? [] : Array.from(new Set(parts.flatMap(classesOf)));
-				out.rules.push({ css: wrap(text), href, matched, classes });
+				out.rules.push({ css: wrap(written(source, seen, context, rule.selectorText || "", text)), href, matched, classes });
 			} else if (typeof CSSImportRule !== "undefined" && rule instanceof CSSImportRule) {
 				let inner = null;
 				try { inner = rule.styleSheet && rule.styleSheet.cssRules; } catch (e) { inner = null; }
-				if (inner) walk(inner, rule.styleSheet.href || href, wrap);
+				const innerHref = (rule.styleSheet && rule.styleSheet.href) || href;
+				if (inner) await walk(inner, innerHref, wrap, await sourceOf(rule.styleSheet, innerHref), new Map(), []);
 				else if (rule.href) out.unreadable.push(new URL(rule.href, href || location.href).href);
 			} else if (GLOBAL.test(text)) {
-				out.globals.push({ css: text, href });
+				out.globals.push({ css: written(source, seen, context, text.slice(0, text.indexOf("{")).trim() || text.replace(/;\s*$/, ""), text), href });
 			} else if (rule.cssRules) {
 				// @media, @supports, @container, @layer, @scope, @starting-style: whatever the
 				// grouping, its prelude is everything before the first brace.
 				const prelude = text.slice(0, text.indexOf("{")).trim();
-				walk(rule.cssRules, href, (inner) => wrap(prelude + " { " + inner + " }"));
+				await walk(rule.cssRules, href, (inner) => wrap(prelude + " { " + inner + " }"), source, seen, context.concat(prelude));
 			} else if (/^@layer\b/i.test(text)) {
 				out.globals.push({ css: text, href });
 			}
@@ -142,14 +226,14 @@ export function transplantScript(extraSheets: Array<{ href: string; text: string
 	for (const sheet of sheets) {
 		let rules = null;
 		try { rules = sheet.cssRules; } catch (e) { rules = null; }
-		if (rules) walk(rules, sheet.href || "", (t) => t);
+		if (rules) await walk(rules, sheet.href || "", (t) => t, await sourceOf(sheet, sheet.href || ""), new Map(), []);
 		else if (sheet.href) out.unreadable.push(sheet.href);
 	}
 	for (const extra of EXTRA) {
 		try {
 			const sheet = new CSSStyleSheet();
 			sheet.replaceSync(extra.text);
-			walk(sheet.cssRules, extra.href, (t) => t);
+			await walk(sheet.cssRules, extra.href, (t) => t, sourceRules(extra.text), new Map(), []);
 		} catch (e) { /* a sheet this engine will not parse */ }
 	}
 
@@ -161,7 +245,7 @@ export function transplantScript(extraSheets: Array<{ href: string; text: string
 			if (el.shadowRoot) {
 				shadowRoots.push(el.shadowRoot);
 				const adopted = el.shadowRoot.adoptedStyleSheets || [];
-				if (adopted.length) {
+				if (adopted.length && !el.shadowRoot.querySelector(":scope > style[data-brain-adopted]")) {
 					const style = document.createElement("style");
 					style.setAttribute("data-brain-adopted", "");
 					style.textContent = adopted.map((s) => Array.from(s.cssRules).map((r) => r.cssText).join("\n")).join("\n");
@@ -201,6 +285,9 @@ export function transplantScript(extraSheets: Array<{ href: string; text: string
 	const serialised = document.body.getHTML
 		? document.body.getHTML({ serializableShadowRoots: true, shadowRoots })
 		: document.body.innerHTML;
+	// The behaviour recorder numbers the DOM at this instant, so its first change and this
+	// serialisation share a baseline.
+	if (window.__domRecorder && !window.__domRecorder.on) window.__domRecorder.start();
 	const template = document.createElement("template");
 	template.innerHTML = serialised;
 	clean(template.content, false);
@@ -217,6 +304,25 @@ export function transplantScript(extraSheets: Array<{ href: string; text: string
 	out.ok = true;
 	return out;
 })()`;
+}
+
+/** In-page: the addresses of every script the page loaded. */
+export const SCRIPT_URLS = `Array.from(new Set([...performance.getEntriesByType("resource").map((e) => e.name).filter((n) => /\\.m?js(\\?|$)/.test(n)), ...Array.from(document.scripts).map((s) => s.src).filter(Boolean)]))`;
+/** In-page: the text of every inline script, bounded. */
+export const INLINE_SCRIPTS = `Array.from(document.scripts).filter((s) => !s.src).map((s) => s.textContent).join("\\n").slice(0, 4000000)`;
+
+const SCRIPT_LIMITS: FetchLimits = { maxBytes: 8 * 1024 * 1024, timeoutMs: 15_000, stallMs: 8_000, accept: ["javascript", "ecmascript", "text/", "application/octet-stream"] };
+const MAX_SCRIPTS = 80;
+
+/** All of a page's JavaScript as one text: where the classes it adds later are named. */
+export async function pageScriptText(page: Page): Promise<string> {
+	const urls = (await page.evaluate<string[]>(SCRIPT_URLS)) ?? [];
+	const parts = [(await page.evaluate<string>(INLINE_SCRIPTS)) ?? ""];
+	for (const url of urls.slice(0, MAX_SCRIPTS)) {
+		const res = await guardedFetch(url, SCRIPT_LIMITS);
+		if (!("reject" in res)) parts.push(new TextDecoder().decode(res.bytes));
+	}
+	return parts.join("\n");
 }
 
 /**
@@ -239,10 +345,10 @@ export async function captureTransplant(page: Page): Promise<TransplantCapture |
 	if (extra.length === 0) return first;
 	const second = await page.evaluate<TransplantCapture>(transplantScript(extra), 180_000);
 	if (!second?.ok) return first;
-	// What is still unread is what could not be fetched here either.
+	// The second read is for the rules alone. The document is the first read's: that is the
+	// instant the behaviour recorder numbered, and the page has moved on since.
 	const fetched = new Set(extra.map((e) => e.href));
-	second.unreadable = second.unreadable.filter((href) => !fetched.has(href));
-	return second;
+	return { ...first, rules: second.rules, globals: second.globals, unreadable: second.unreadable.filter((href) => !fetched.has(href)) };
 }
 
 /**
@@ -331,14 +437,11 @@ export interface TransplantOptions {
 
 export interface Transplanted {
 	html: string;
-	assets: StoredAsset[];
+	/** What the document and its rules pointed at, local now; the tapes go through the same. */
+	resources: PageResources;
 	fonts: StoredAsset[];
 	rules: number;
 }
-
-const URL_ATTRIBUTES = /\s(src|poster|href|xlink:href)="([^"]+)"/g;
-const SRCSET = /\s(srcset|imagesrcset)="([^"]+)"/g;
-const CSS_URL = /url\(\s*(["']?)([^"')]+)\1\s*\)/g;
 
 /** The rebuild document: the page's DOM and kept rules, its resources local. */
 export async function assembleTransplant(capture: TransplantCapture, options: TransplantOptions): Promise<Transplanted> {
@@ -353,47 +456,14 @@ export async function assembleTransplant(capture: TransplantCapture, options: Tr
 	let body = options.transformBody ? options.transformBody(capture.body) : capture.body;
 
 	// Every remote resource the document or its rules point at, fetched once and rewritten.
-	// Style attributes carry their quotes as &quot;, so they are decoded to be read and
-	// re-encoded after.
-	const styleAttributes = (text: string, rewrite: (css: string) => string) =>
-		text.replace(/\sstyle="([^"]*)"/g, (_whole, value: string) => ` style="${rewrite(value.replace(/&quot;/g, '"')).replace(/"/g, "&quot;")}"`);
-	const wanted = new Set<string>();
-	for (const m of body.matchAll(URL_ATTRIBUTES)) if (m[1] !== "href") wanted.add(m[2]!);
-	for (const m of body.matchAll(SRCSET)) for (const candidate of m[2]!.split(",")) wanted.add(candidate.trim().split(/\s+/)[0]!);
-	styleAttributes(body, (value) => {
-		for (const m of value.matchAll(CSS_URL)) wanted.add(m[2]!);
-		return value;
-	});
-	for (const m of body.matchAll(CSS_URL)) wanted.add(m[2]!);
-	for (const m of css.matchAll(CSS_URL)) wanted.add(m[2]!);
-	if (capture.icon) wanted.add(capture.icon);
-	const local = new Map<string, string>();
-	const assets: StoredAsset[] = [];
-	let budget = MAX_TRANSPLANT_BYTES;
-	for (const raw of wanted) {
-		if (assets.length >= MAX_TRANSPLANT_ASSETS || budget <= 0) break;
-		const decoded = raw.replace(/&amp;/g, "&");
-		if (/^(data:|#|blob:)/i.test(decoded)) continue;
-		let absolute: string;
-		try {
-			absolute = new URL(decoded, capture.url).href;
-		} catch {
-			continue;
-		}
-		if (!/^https?:/i.test(absolute) || local.has(raw)) continue;
-		const stored = await storeFetchedAsset(absolute);
-		if (!stored) continue;
-		budget -= stored.bytes;
-		assets.push(stored);
-		local.set(raw, stored.href);
-	}
-	const swap = (value: string) => local.get(value) ?? value;
-	const swapCss = (text: string) => text.replace(CSS_URL, (whole, quote: string, value: string) => (local.has(value) ? `url(${quote}${local.get(value)}${quote})` : whole));
-	body = styleAttributes(body, swapCss)
-		.replace(URL_ATTRIBUTES, (whole, name: string, value: string) => (name === "href" ? whole : ` ${name}="${swap(value)}"`))
-		.replace(SRCSET, (_whole, name: string, value: string) => ` ${name}="${value.split(",").map((c) => { const [u, ...d] = c.trim().split(/\s+/); return [swap(u!), ...d].join(" "); }).join(", ")}"`);
-	body = swapCss(body);
-	css = swapCss(css);
+	const resources = pageResources(capture.url);
+	resources.noteMarkup(body);
+	resources.noteCss(css);
+	if (capture.icon) resources.noteAttribute("src", capture.icon);
+	await resources.download();
+	body = resources.markup(body);
+	css = resources.css(css);
+	const icon = capture.icon ? resources.localOf(capture.icon) : undefined;
 
 	const attrs = (list: Array<[string, string]>) => list.map(([k, v]) => ` ${k}="${v.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"`).join("");
 	const escapeText = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
@@ -404,20 +474,18 @@ export async function assembleTransplant(capture: TransplantCapture, options: Tr
 		'<meta charset="utf-8">',
 		`<title>${escapeText(capture.title)}</title>`,
 		'<meta name="viewport" content="width=device-width, initial-scale=1">',
-		capture.icon && local.has(capture.icon) ? `<link rel="icon" href="${local.get(capture.icon)}">` : "",
+		icon ? `<link rel="icon" href="${icon}">` : "",
 		"<style>",
 		fonts.css,
 		css.replace(/<\/style/gi, "<\\/style"),
 		"</style>",
 		"</head>",
-		`<body${attrs(capture.bodyAttributes)}>`,
-		body,
-		options.tail ?? "",
-		"</body>",
-		"</html>",
-		"",
 	]
 		.filter((line) => line !== "")
-		.join("\n");
-	return { html, assets, fonts: fonts.files, rules: rules.length };
+		.join("\n")
+		// Nothing between the tags and the content, and nothing after: whitespace inside <body>,
+		// or after </body> or </html>, is parsed into the body as a text node, and a text node the
+		// page never had shifts the numbering the behaviour recorder relies on.
+		.concat(`\n<body${attrs(capture.bodyAttributes)}>${body}${options.tail ?? ""}</body></html>`);
+	return { html, resources, fonts: fonts.files, rules: rules.length };
 }

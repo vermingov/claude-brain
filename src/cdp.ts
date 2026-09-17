@@ -71,6 +71,7 @@ export class Page {
 	private readonly socket: WebSocket;
 	private readonly sessionId: string;
 	private readonly pending = new Map<number, Pending>();
+	private readonly listeners = new Map<string, Set<(params: Record<string, unknown>) => void>>();
 	private nextId = 1;
 	/** Requests in flight, so "the network went quiet" is a fact rather than a guess. */
 	private inFlight = 0;
@@ -84,7 +85,7 @@ export class Page {
 	}
 
 	private onMessage(data: string): void {
-		let msg: { id?: number; method?: string; result?: Record<string, unknown>; error?: { message?: string } };
+		let msg: { id?: number; method?: string; params?: Record<string, unknown>; result?: Record<string, unknown>; error?: { message?: string } };
 		try {
 			msg = JSON.parse(data);
 		} catch {
@@ -99,6 +100,7 @@ export class Page {
 			else waiter.resolve(msg.result ?? {});
 			return;
 		}
+		if (msg.method) for (const listener of this.listeners.get(msg.method) ?? []) listener(msg.params ?? {});
 		switch (msg.method) {
 			case "Page.loadEventFired":
 				this.loaded = true;
@@ -113,6 +115,14 @@ export class Page {
 				this.lastActivity = Date.now();
 				break;
 		}
+	}
+
+	/** Call `listener` with each event of this protocol method; the returned function stops it. */
+	on(method: string, listener: (params: Record<string, unknown>) => void): () => void {
+		const set = this.listeners.get(method) ?? new Set();
+		set.add(listener);
+		this.listeners.set(method, set);
+		return () => set.delete(listener);
 	}
 
 	send(method: string, params: Record<string, unknown> = {}, timeoutMs = COMMAND_TIMEOUT_MS): Promise<Record<string, unknown>> {
