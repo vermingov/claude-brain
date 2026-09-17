@@ -676,7 +676,7 @@ interface Round {
  * How much of the page's behaviour one rebuild is allowed to watch. Smaller than the numbers a
  * harness would use: this runs in a queue behind whatever else the user asked for.
  */
-const REBUILD_EXPLORE = { idleFrames: 180, dwellFrames: 90, watchFrames: 600, patienceFrames: 300, revisitFrames: 900, probesPerScreen: 6 };
+const REBUILD_EXPLORE = { idleFrames: 180, dwellFrames: 90, patienceFrames: 300, revisitFrames: 1_200 };
 
 /** Where a ripped scene is kept, so rebuilding a page twice does not rip it twice. */
 function scenePath(id: string): string {

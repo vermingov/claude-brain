@@ -88,6 +88,8 @@ const LOOP_REPEATS = 3;
 const LOOP_MIN_MS = 2_000;
 /** Activity that ended longer ago than this before the watching stopped, had stopped… */
 const STILL_GOING_MS = 1_500;
+/** …unless it was still within this many turns of its own cycle. */
+const MISSED_CYCLES = 1.5;
 /** …unless it had run so long that a pause this share of its length is nothing. */
 const RAN_SHARE = 0.05;
 /** Changes closer together than this are one moment. */
@@ -280,21 +282,41 @@ const sameness = (op: RecordedOp, tree: ComponentTree) =>
 	JSON.stringify([op[1], tree.stableId(op[2] as number), ...op.slice(3, op[1] === "c" ? 4 : (PLAYED_LENGTH[op[1] as string] ?? op.length))]);
 
 /**
+ * How often this behaviour comes round: the slowest thing in it that keeps happening.
+ *
+ * Measured per piece of state, not across the ops as a whole, because one turn of a carousel is
+ * a burst — a class off one panel, a class on the next, a subtree swapped, half a dozen styles —
+ * and the gaps inside that burst say a few hundred milliseconds where the beat is five seconds.
+ * The panel that changes every five seconds is the beat; the styles that move with it are not.
+ */
+function rhythmOf(ops: RecordedOp[]): number {
+	const times = new Map<string, number[]>();
+	for (const op of ops) {
+		const key = stateKey(op) ?? `${op[1]}:${op[2]}`;
+		times.set(key, [...(times.get(key) ?? []), op[0]]);
+	}
+	let slowest = 0;
+	for (const moments of times.values()) {
+		if (moments.length < 3) continue;
+		const gaps = moments
+			.slice(1)
+			.map((t, i) => t - moments[i]!)
+			.filter((gap) => gap > MOMENT_MS)
+			.sort((a, b) => a - b);
+		if (gaps.length) slowest = Math.max(slowest, gaps[gaps.length >> 1]!);
+	}
+	return slowest;
+}
+
+/**
  * Whether activity was still going when the watching stopped. The quiet at the end is judged
- * against the behaviour's own rhythm — the typical gap between the moments it changed something,
- * several changes in one moment counting once — and against how long it had run: two quiet
- * seconds end a one-second flourish, not five minutes of twinkling.
+ * against the behaviour's own rhythm and against how long it had run: two quiet seconds end a
+ * one-second flourish, not five minutes of twinkling.
  */
 function stillGoing(ops: RecordedOp[], until: number): boolean {
 	if (ops.length < 2) return false;
-	const gaps = ops
-		.slice(1)
-		.map((op, i) => op[0] - ops[i]![0])
-		.filter((gap) => gap > MOMENT_MS)
-		.sort((a, b) => a - b);
-	const typical = gaps.length ? gaps[gaps.length >> 1]! : 0;
 	const ran = ops[ops.length - 1]![0] - ops[0]![0];
-	return until - ops[ops.length - 1]![0] <= Math.max(STILL_GOING_MS, 3 * typical, RAN_SHARE * ran);
+	return until - ops[ops.length - 1]![0] <= Math.max(STILL_GOING_MS, MISSED_CYCLES * rhythmOf(ops), RAN_SHARE * ran);
 }
 
 /**

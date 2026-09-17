@@ -32,9 +32,14 @@ const MAX_VIDEO_BYTES = 12 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 28 * 1024 * 1024;
 const FETCH_CONCURRENCY = 4;
 
-/** Type is the design, so the page's own faces come down too — a handful of small files. */
-const MAX_FONTS = 32;
+/** Type is the design, so the page's own faces come down too. A family from a font service is
+ *  a dozen subset files per weight, and the page's text is in one or two of them. */
+const MAX_FONTS = 64;
 const MAX_FONT_BYTES = 1024 * 1024;
+/** What a face may arrive as. woff2 is what a browser is given; the rest is what servers send
+ *  to anything they do not recognise, and it renders the same. */
+const FONT_FORMATS = new Set(["woff2", "woff", "ttf", "otf"]);
+
 const FONT_LIMITS: FetchLimits = {
 	maxBytes: MAX_FONT_BYTES,
 	timeoutMs: 15_000,
@@ -110,6 +115,10 @@ function extensionFor(bytes: Uint8Array, contentType: string, url: string): stri
 	const magic = String.fromCharCode(...bytes.subarray(0, 4));
 	if (magic === "wOF2") return "woff2";
 	if (magic === "wOFF") return "woff";
+	// TrueType and OpenType, by their own headers. Google Fonts hands these to anything it does
+	// not recognise as a browser, and a face dropped for its container is a page in Arial.
+	if (magic === "\u0000\u0001\u0000\u0000" || magic === "true" || magic === "ttcf") return "ttf";
+	if (magic === "OTTO") return "otf";
 	const sniffed = sniffMime(bytes);
 	if (sniffed) return EXTENSION[sniffed] ?? null;
 	const declared = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
@@ -233,7 +242,16 @@ export async function collectFonts(sourceCss: string): Promise<{ css: string; fi
 	const files: StoredAsset[] = [];
 	const byUrl = new Map<string, string>();
 	const rewritten: string[] = [];
-	for (const face of fontFaces(sourceCss)) {
+	// Latin first. A Google Fonts sheet lists a dozen subsets per family — cyrillic, greek,
+	// vietnamese, latin-ext, latin — and the budget below is a count of files. Taken in the
+	// order written, it can be spent on alphabets the page never shows a character of, and the
+	// one subset the text is actually in is the one that gets dropped.
+	const wanted = (face: { text: string }) => {
+		const range = /unicode-range:\s*([^;}]+)/i.exec(face.text)?.[1] ?? "";
+		if (!range) return 0;
+		return /u\+0{0,2}(2[0-9a-f]|3[0-9a-f]|4[0-9a-f]|5[0-9a-f]|6[0-9a-f]|7[0-9a-f])/i.test(range) ? 0 : 1;
+	};
+	for (const face of [...fontFaces(sourceCss)].sort((a, b) => wanted(a) - wanted(b))) {
 		let text = face.text;
 		for (const { written, absolute } of face.sources) {
 			let href = byUrl.get(absolute);
@@ -241,7 +259,7 @@ export async function collectFonts(sourceCss: string): Promise<{ css: string; fi
 				const res = await guardedFetch(absolute, FONT_LIMITS);
 				if ("reject" in res || res.bytes.length === 0) continue;
 				const ext = extensionFor(res.bytes, "", "");
-				if (ext !== "woff2" && ext !== "woff") continue;
+				if (!ext || !FONT_FORMATS.has(ext)) continue;
 				const file = `${hashOf(res.bytes)}.${ext}`;
 				const path = join(ASSET_DIR, file);
 				if (Bun.file(path).size !== res.bytes.length) await Bun.write(path, res.bytes);

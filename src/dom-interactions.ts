@@ -25,6 +25,10 @@ const MISSED_BEATS = 1.5;
 const MOMENT_MS = 50;
 /** Two clicked elements this close in the tree, or closer, are the same control: tabs, a toggle. */
 const CONTROL_DISTANCE = 3;
+/** A control is a handful of things that share a state. More than this and it is not a control. */
+const CONTROL_MEMBERS = 12;
+/** State touched by this share of all the clicks belongs to the page, not to any one control. */
+const PAGE_WIDE = 0.3;
 
 /**
  * The harness wrote a marker before each input. A change that follows it, up to the next marker,
@@ -140,7 +144,21 @@ function moving(rhythm: Rhythm | undefined, t: number): boolean {
 
 /** Clicks grouped into controls, each mapped to every state key its control touches. */
 function controlsOf(clicks: Array<{ target: number; ops: RecordedOp[] }>, tree: ComponentTree): Map<object, Set<string>> {
-	const keyOf = (op: RecordedOp) => stateKey(op);
+	// State that nearly every click touches is the page's, not a control's: a layer that follows
+	// the pointer, a class on the body. Left in, it ties every control on the page into one, and
+	// then each of them carries the state of all the others — which is how a rebuild of a page of
+	// interactive blocks came out twenty megabytes.
+	const touchedBy = new Map<string, number>();
+	for (const click of clicks) {
+		for (const key of new Set(click.ops.map(stateKey))) {
+			if (key) touchedBy.set(key, (touchedBy.get(key) ?? 0) + 1);
+		}
+	}
+	const pageWide = new Set([...touchedBy].filter(([, n]) => n > Math.max(2, clicks.length * PAGE_WIDE)).map(([key]) => key));
+	const keyOf = (op: RecordedOp) => {
+		const key = stateKey(op);
+		return key && pageWide.has(key) ? null : key;
+	};
 	const parentOf = clicks.map((_, i) => i);
 	const root = (i: number): number => (parentOf[i] === i ? i : (parentOf[i] = root(parentOf[i]!)));
 	const join = (i: number, j: number) => (parentOf[root(i)] = root(j));
@@ -182,7 +200,9 @@ function controlsOf(clicks: Array<{ target: number; ops: RecordedOp[] }>, tree: 
 	const out = new Map<object, Set<string>>();
 	clicks.forEach((click, i) => {
 		const r = root(i);
-		if ((members.get(r) ?? 0) > 1) out.set(click, keys.get(r)!);
+		const size = members.get(r) ?? 0;
+		// One member is not a control, and a group the size of a page is not one either.
+		if (size > 1 && size <= CONTROL_MEMBERS) out.set(click, keys.get(r)!);
 	});
 	return out;
 }

@@ -201,7 +201,18 @@ export interface GuardedResponse {
 
 const MAX_HOPS = 3;
 
-const UA = "claude-brain (local design capture; contact: the person running this)";
+/**
+ * Browser-shaped, and still says what it is.
+ *
+ * A server that decides what to send from the User-Agent will send its oldest fallback to a
+ * string it does not recognise: Google Fonts hands TrueType to "claude-brain" and WOFF2 to a
+ * browser, and a capture that takes the fallback is a page in the wrong type. The engine token
+ * is the one this machine actually renders with — the same Chromium the capture drives — and
+ * this package's own name is appended rather than hidden, so a host reading its logs can see
+ * what came and who to complain to.
+ */
+const UA =
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 claude-brain (local design capture; contact: the person running this)";
 
 function proxyConfigured(): boolean {
 	for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) {

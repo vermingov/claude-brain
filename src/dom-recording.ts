@@ -228,18 +228,38 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 		}
 		return found;
 	};
-	// Where to put the pointer for a target now: pages move while they are probed — a demo
-	// re-renders, a panel opens — and a point read a few probes ago may be over something else.
-	// Null when the target is gone, off screen, or covered.
+	// Where to put the pointer for a target now, and what will actually receive the click there.
+	//
+	// Pages move while they are probed — a demo re-renders, a panel opens — so a point read a few
+	// probes ago may be over something else. And a control is often covered: a card lays a
+	// transparent overlay across everything inside it, so the button at that point is not the
+	// topmost element. Skipping those meant probing four things on a page with seventy-five; what
+	// the pointer would hit is the honest thing to probe, so that is what comes back.
 	recorder.pointAt = (id) => {
 		const el = recorder.targets && recorder.targets.get(id);
 		if (!el || !el.isConnected) return null;
 		const r = el.getBoundingClientRect();
 		if (r.width < 8 || r.height < 8 || r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) return null;
-		const x = Math.round(Math.min(Math.max(r.left + r.width / 2, 1), innerWidth - 2));
-		const y = Math.round(Math.min(Math.max(r.top + r.height / 2, 1), innerHeight - 2));
-		const hit = document.elementFromPoint(x, y);
-		return hit && (hit === el || el.contains(hit)) ? [x, y] : null;
+		const at = (fx, fy) => [
+			Math.round(Math.min(Math.max(r.left + r.width * fx, 1), innerWidth - 2)),
+			Math.round(Math.min(Math.max(r.top + r.height * fy, 1), innerHeight - 2)),
+		];
+		// The middle first, then four points inside it. A page that lays something across itself —
+		// a custom cursor layer, a card's own overlay — covers the middle of everything, and
+		// taking the topmost element instead would probe that one layer and call the page done.
+		const spots = [at(0.5, 0.5), at(0.25, 0.25), at(0.75, 0.25), at(0.25, 0.75), at(0.75, 0.75)];
+		let covered = null;
+		for (const [x, y] of spots) {
+			const hit = document.elementFromPoint(x, y);
+			if (!hit) continue;
+			if (hit === el || el.contains(hit)) return [x, y, id];
+			if (!covered) {
+				const over = recorder.ids.get(hit);
+				if (over !== undefined) covered = [x, y, over];
+			}
+		}
+		// Covered everywhere. Whatever is on top is what a person clicking here would get.
+		return covered;
 	};
 
 	// What has changed in a band of the page since a given op, so a sweep can tell whether what it
@@ -247,9 +267,9 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 	// was re-rendered, which is what is being watched.
 	const inBand = (index, top, bottom, visit) => {
 		for (let i = Math.max(0, index); i < recorder.ops.length; i++) {
-			const id = recorder.ops[i][2];
-			const box = recorder.boxes.get(id);
-			if (!box || (box[0] < bottom && box[1] > top)) visit(id);
+			const op = recorder.ops[i];
+			const box = recorder.boxes.get(op[2]);
+			if (!box || (box[0] < bottom && box[1] > top)) visit(op[2], op);
 		}
 	};
 	/** Which nodes changed in the band: the page's own background churn, when read from elsewhere. */
@@ -266,6 +286,57 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 			if (!ignore.has(id)) n++;
 		});
 		return n;
+	};
+	// How many times the same thing has changed — the most any one attribute, property, text run
+	// or subtree has been set since that op. Three times is two turns of whatever it is doing,
+	// which is the point at which a cycle can be read as a cycle rather than guessed at.
+	recorder.repeatsBesides = (index, top, bottom, known) => {
+		const ignore = new Set(known);
+		const counts = new Map();
+		let most = 0;
+		inBand(index, top, bottom, (id, op) => {
+			if (ignore.has(id)) return;
+			const key = op[1] + ":" + id + ":" + (op[1] === "a" || op[1] === "p" ? op[3] : "");
+			const n = (counts.get(key) || 0) + 1;
+			counts.set(key, n);
+			if (n > most) most = n;
+		});
+		return most;
+	};
+
+	// While the harness is probing, the page is held where it is: a link is followed by letting
+	// the page's own handler run and refusing only the browser's default, and window.open is
+	// answered with nothing. A probe is meant to find out what a control does here, not to leave.
+	const holdClick = (event) => {
+		const link = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+		const href = link && link.getAttribute("href");
+		if (href && !href.startsWith("#")) event.preventDefault();
+	};
+	const holdSubmit = (event) => event.preventDefault();
+	recorder.hold = (on) => {
+		if (on) {
+			document.addEventListener("click", holdClick, true);
+			document.addEventListener("submit", holdSubmit, true);
+			if (!recorder.held) {
+				// The page's own router is held too. A block that opens itself by pushing a route
+				// leaves the document alone but changes the address, and an address that changed is
+				// something a harness then wants to undo — which is how going "back" from a route
+				// the page had replaced landed on the blank page the tab started at.
+				recorder.held = { open: window.open, push: history.pushState, replace: history.replaceState };
+				window.open = () => null;
+				history.pushState = () => {};
+				history.replaceState = () => {};
+			}
+			return;
+		}
+		document.removeEventListener("click", holdClick, true);
+		document.removeEventListener("submit", holdSubmit, true);
+		if (recorder.held) {
+			window.open = recorder.held.open;
+			history.pushState = recorder.held.push;
+			history.replaceState = recorder.held.replace;
+			recorder.held = null;
+		}
 	};
 
 	recorder.start = () => {
@@ -367,14 +438,18 @@ export interface ExploreOptions {
 	/** How far each scroll step moves, as a share of the viewport, and how long it rests. */
 	stepShare?: number;
 	dwellFrames?: number;
-	/** The longest the sweep stays with a screen that is still changing, and how long it waits
-	 * after the last thing changed before moving on. */
-	watchFrames?: number;
+	/** How long the sweep waits after the last thing changed before moving on, and how many times
+	 * something has to repeat before it has been seen enough. */
 	patienceFrames?: number;
+	repeatsWanted?: number;
+	/** A stop for a page where something changes forever without ever repeating. Not a budget. */
+	watchFrames?: number;
 	/** The longest a section still going when the sweep left it is watched for again. */
 	revisitFrames?: number;
-	/** How many elements per screen are hovered and clicked. 0 skips interaction. */
-	probesPerScreen?: number;
+	/** The most elements a whole page may be probed at; 0 skips interaction entirely. Every
+	 * candidate on a screen is probed — a page of interactive blocks has dozens in one screen and
+	 * taking eight of them is taking a tenth of the page. */
+	probeLimit?: number;
 	/** Called as the page is driven, with what is happening and how far through it is. */
 	onProgress?: (stage: string, progress: number, detail?: string) => void;
 }
@@ -387,6 +462,45 @@ export interface ExploreOptions {
 export async function explore(page: Page, options: ExploreOptions): Promise<DomRecording | null> {
 	const { viewport } = options;
 	const say = options.onProgress ?? (() => {});
+
+	// The recording is carried out of the page as it is made, not read at the end. A page can
+	// take the document away — a probe lands on something that navigates, a script replaces the
+	// window — and everything recorded in a fresh document is nothing: one click on bencho.dev
+	// put the tab on about:blank and five minutes of watching went with it. Whatever has already
+	// been pulled is already safe, and a document that goes away just ends the visit early.
+	const kept: DomRecording = { base: 0, end: 0, viewport, ops: [], scroll: [], rects: [], dropped: 0 };
+	let alive = true;
+	// What has been carried out already. The page keeps its own copy — the sweep points at ops by
+	// index while it decides whether a screen is still moving, and taking them out from under it
+	// would move the ground it is standing on.
+	let takenOps = 0;
+	let takenScroll = 0;
+	const pull = async (): Promise<boolean> => {
+		if (!alive) return false;
+		const json = await readLarge(
+			page,
+			`(() => {
+				const r = window.__domRecorder;
+				if (!r || !r.on || r.base === undefined) return null;
+				return { base: r.base, end: Date.now(), ops: r.ops.slice(${takenOps}), scroll: r.scroll.slice(${takenScroll}), dropped: r.dropped, rects: ${kept.rects.length ? "null" : "r.rects"} };
+			})()`,
+		);
+		const taken = json ? (JSON.parse(json) as DomRecording & { rects: DomRecording["rects"] | null }) : null;
+		if (!taken) {
+			// The document this was recording is gone; what was pulled before it went still stands.
+			alive = false;
+			return false;
+		}
+		kept.base = kept.base || taken.base;
+		kept.end = taken.end;
+		kept.dropped = taken.dropped;
+		if (taken.rects?.length) kept.rects = taken.rects;
+		kept.ops.push(...taken.ops);
+		kept.scroll.push(...taken.scroll);
+		takenOps += taken.ops.length;
+		takenScroll += taken.scroll.length;
+		return true;
+	};
 	const idle = options.idleFrames ?? 300;
 	const dwell = options.dwellFrames ?? 120;
 	const step = Math.round(viewport.height * (options.stepShare ?? 0.6));
@@ -395,14 +509,21 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 
 	say("settling at the top of the page", 0);
 	await advance(idle);
+	await pull();
 	const height = (await page.evaluate<number>("document.documentElement.scrollHeight")) ?? viewport.height;
 	// Down the page, staying with a screen while something new is moving in it. New matters: a star
 	// field twinkles whether or not anyone is there, and waiting for it to stop would mean waiting
 	// for the whole page. So on arrival the sweep notes which nodes in this band were changing while
 	// it was elsewhere — the background — and then counts only changes to anything else. A demo that
 	// steps once every ten seconds keeps the sweep there; the stars around it do not.
-	const watch = options.watchFrames ?? 1_500;
+	// There is no clock on how long a screen may be watched. The sweep leaves when what is moving
+	// has come round twice — a carousel that turns every five seconds through five panels takes
+	// most of a minute to say that, and a marquee says it in a second — or when it stops. The
+	// number below is a stop for a page where something changes forever without repeating, so a
+	// capture cannot be held open by one; it is not a budget, and nothing normal reaches it.
+	const watch = options.watchFrames ?? 36_000;
 	const patience = options.patienceFrames ?? 480;
+	const repeats = options.repeatsWanted ?? 3;
 	const opsLength = async () => (await page.evaluate<number>("window.__domRecorder.ops.length")) ?? 0;
 	const busy: Array<{ y: number; changes: number }> = [];
 	let elsewhere = 0;
@@ -413,7 +534,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		const band = `${y}, ${y + viewport.height}`;
 		const background = (await page.evaluate<number[]>(`window.__domRecorder.movers(${elsewhere}, ${band})`)) ?? [];
 		const others = JSON.stringify(background);
-		let [waited, quiet, changes, sawNew] = [0, 0, 0, false];
+		let [waited, quiet, changes, sawNew, seen] = [0, 0, 0, false, 0];
 		do {
 			const mark = await opsLength();
 			await advance(dwell);
@@ -426,9 +547,11 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 			} else {
 				quiet += dwell;
 			}
-		} while (waited < watch && (sawNew ? quiet < patience : waited < dwell));
+			seen = (await page.evaluate<number>(`window.__domRecorder.repeatsBesides(${arrival}, ${band}, ${others})`)) ?? 0;
+		} while (waited < watch && seen < repeats && (sawNew ? quiet < patience : waited < dwell));
 		elsewhere = arrival;
 		if (waited >= watch) busy.push({ y, changes });
+		if (!(await pull())) return kept.ops.length ? kept : null;
 	}
 	await advance(dwell);
 	say("reading back up", 0.56);
@@ -446,56 +569,104 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		say("watching what is still moving", 0.62 + 0.1 * (index / Math.max(1, watching.length)), `${index + 1} of ${watching.length}`);
 		await page.evaluate(`window.scrollTo(0, ${y}); true`);
 		await advance(revisit);
+		if (!(await pull())) return kept.ops.length ? kept : null;
 	}
 	// Interaction: in each screen, hover what looks interactive, move away, click it. Every probe
 	// is announced with a marker so its effects can be told from what was already moving.
-	const probes = options.probesPerScreen ?? 8;
-	if (probes > 0) {
-		// The document, not the fragment: a tab that is a link to #design changes the hash and is
-		// still the same page.
-		const documentUrl = async () => ((await page.evaluate<string>("location.href")) ?? "").split("#")[0];
-		const origin = await documentUrl();
+	const probeLimit = options.probeLimit ?? 500;
+	const probed = new Set<number>();
+	if (probeLimit > 0) {
 		const away = { x: 2, y: viewport.height - 2 };
-		// Nothing a probe does may take the recording's document away: a navigation to a new
-		// document is failed at the network before it can replace this one.
+		// Wait on the page rather than on a clock: most things do nothing when touched and need no
+		// time at all, and the few that start something get as long as they keep going.
+		const settle = async (floor: number, cap: number) => {
+			let waited = 0;
+			let seen = await opsLength();
+			await advance(floor);
+			waited += floor;
+			while (waited < cap) {
+				const now = await opsLength();
+				if (now === seen) return;
+				seen = now;
+				await advance(18);
+				waited += 18;
+			}
+		};
+		// Nothing a probe does may take the recording's document away. A navigation is answered
+		// with 204 No Content, which a browser treats as "nothing to show here" and stays where it
+		// is. Failing the request instead can commit an empty document — one click on bencho.dev
+		// put the tab on about:blank — and everything recorded in this document goes with it.
 		const unblock = page.on("Fetch.requestPaused", (params) => {
-			page.send("Fetch.failRequest", { requestId: params.requestId, errorReason: "Aborted" }).catch(() => {});
+			page.send("Fetch.fulfillRequest", { requestId: params.requestId, responseCode: 204, responseHeaders: [] }).catch(() => {});
 		});
 		await page.send("Fetch.enable", { patterns: [{ resourceType: "Document", requestStage: "Request" }] });
+		await page.evaluate("window.__domRecorder.hold(true); true");
 		probing: for (let y = 0; y < height; y += viewport.height) {
-			say("hovering and clicking what looks interactive", 0.72 + 0.27 * (y / height), `${Math.round((y / height) * 100)}% of the way down`);
 			await page.evaluate(`window.scrollTo(0, ${y}); true`);
 			// Whatever this screen reveals on arrival plays out before anything is touched.
 			await advance(120);
-			const targets = (await page.evaluate<number[]>(`window.__domRecorder.interactive(${probes})`)) ?? [];
-			for (const id of targets) {
-				const point = await page.evaluate<[number, number] | null>(`window.__domRecorder.pointAt(${id})`);
-				if (!point) continue;
-				const [x, cy] = point;
-				await page.evaluate(`window.__domRecorder.mark("hover", ${id}); true`);
+			// The list is read again before every probe. Touching one thing re-renders others —
+			// a block that starts playing replaces its own contents — and a list read once goes
+			// stale after the first click: every element in it is detached, nothing can be aimed
+			// at, and a page with seventy-five controls gets four of them probed.
+			for (let round = 0; round < probeLimit; round++) {
+				if (probed.size >= probeLimit) break probing;
+				const targets = (await page.evaluate<number[]>(`window.__domRecorder.interactive(${probeLimit})`)) ?? [];
+				let point: [number, number, number] | null = null;
+				for (const id of targets) {
+					if (probed.has(id)) continue;
+					point = await page.evaluate<[number, number, number] | null>(`window.__domRecorder.pointAt(${id})`);
+					if (point && !probed.has(point[2])) {
+						probed.add(id);
+						break;
+					}
+					// Nothing to aim at, or whatever is on top has been probed already.
+					probed.add(id);
+					point = null;
+				}
+				if (!point) break;
+				const [x, cy, hit] = point;
+				probed.add(hit);
+				say(
+					"hovering and clicking what looks interactive",
+					0.72 + 0.27 * Math.min(1, probed.size / Math.max(1, targets.length)),
+					`${probed.size} of ${targets.length} on this screen`,
+				);
+				await page.evaluate(`window.__domRecorder.mark("hover", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y: cy });
-				await advance(24);
-				await page.evaluate(`window.__domRecorder.mark("leave", ${id}); true`);
+				await settle(12, 120);
+				await page.evaluate(`window.__domRecorder.mark("leave", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: away.x, y: away.y });
-				await advance(18);
-				await page.evaluate(`window.__domRecorder.mark("click", ${id}); true`);
+				await settle(12, 90);
+				await page.evaluate(`window.__domRecorder.mark("click", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y: cy, button: "left", clickCount: 1 });
 				await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y: cy, button: "left", clickCount: 1 });
-				await advance(90);
-				await page.evaluate(`window.__domRecorder.mark("end", ${id}); true`);
+				await settle(24, 300);
+				await page.evaluate(`window.__domRecorder.mark("end", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: away.x, y: away.y });
-				// A click the page's own router turned into a navigation, without a new document: what
-				// it did is not behaviour of this page. It is marked for discarding, and undone.
-				if ((await documentUrl()) !== origin) {
-					await page.evaluate(`window.__domRecorder.mark("navigated", ${id}); history.back(); true`);
-					await advance(90);
-					await page.evaluate(`window.__domRecorder.mark("resumed", ${id}); true`);
-					if ((await documentUrl()) !== origin) break probing;
+				// A probe puts the page back as it found it. One click opening a dialog is the end of
+				// the visit otherwise: everything behind it stops answering to a pointer, and the rest
+				// of the page — seventy of the seventy-five things on it — never gets touched.
+				const opened = await page.evaluate<boolean>(`!!document.querySelector("dialog[open], [aria-modal=true], [role=dialog]")`);
+				if (opened) {
+					for (const type of ["keyDown", "keyUp"] as const) {
+						await page.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 });
+					}
+					await advance(30);
+				}
+				// Everything up to here is out of the page already, so a click that takes the document
+				// away costs this probe, not the visit. Whether it did is asked of the recorder rather
+				// than of the address: an address can change while the document stays, and it is the
+				// document this is recording.
+				if (!(await pull())) {
+					say("the page took its document away; keeping what was recorded", 0.99, `${probed.size} probed`);
+					break probing;
 				}
 				// A fragment link may have scrolled; the next probe is for this screen.
 				await page.evaluate(`if (Math.abs(scrollY - ${y}) > 2) window.scrollTo(0, ${y}); true`);
 			}
 		}
+		await page.evaluate("if (window.__domRecorder && window.__domRecorder.hold) window.__domRecorder.hold(false); true").catch(() => ({}));
 		await page.send("Fetch.disable").catch(() => ({}));
 		unblock();
 		await page.evaluate("window.scrollTo(0, 0); true");
@@ -503,9 +674,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	await advance(30);
 
 	say("reading the recording out of the page", 0.99);
-	const json = await readLarge(
-		page,
-		`(() => { const r = window.__domRecorder; r.on = false; return { base: r.base, end: Date.now(), viewport: { width: innerWidth, height: innerHeight }, ops: r.ops, scroll: r.scroll, rects: r.rects, dropped: r.dropped }; })()`,
-	);
-	return json ? (JSON.parse(json) as DomRecording) : null;
+	await pull();
+	await page.evaluate("if (window.__domRecorder) window.__domRecorder.on = false; true").catch(() => ({}));
+	return kept.ops.length ? kept : null;
 }
