@@ -76,6 +76,18 @@ export const FRAME_SCALE = 0.5;
  */
 export const WEBGL_HOOK_SCRIPT = String.raw`(() => {
 	if (window.__brainGl) return;
+	// A WebGL canvas throws its pixels away after each frame unless asked not to, and
+	// toDataURL on one comes back blank. The capture needs to read what the canvas drew —
+	// photographing the rectangle instead catches everything the page put on top of it, which
+	// is how a hero ended up with the site's own headline baked into its background. Asking
+	// for it here, before the page makes its context, is the only moment it can be asked.
+	const getContext = HTMLCanvasElement.prototype.getContext;
+	HTMLCanvasElement.prototype.getContext = function (type, attributes) {
+		if (/webgl/i.test(String(type))) {
+			return getContext.call(this, type, Object.assign({}, attributes || {}, { preserveDrawingBuffer: true }));
+		}
+		return getContext.apply(this, arguments);
+	};
 	const rec = {
 		shaders: [],
 		uniforms: new Map(),
@@ -218,6 +230,20 @@ export function isQuadShader(capture: WebglCapture): boolean {
  * unnaturalness of running the sequence backwards. Preloaded before the first swap, so the
  * animation does not stutter its way through the first cycle.
  */
+/** In-page: what the n-th canvas is showing, as a data URL, or "" when it cannot be read. */
+export function canvasPixelsScript(index: number, type = "image/jpeg", quality = 0.74): string {
+	return `(() => {
+		try {
+			const canvas = document.querySelectorAll("canvas")[${index}];
+			if (!canvas || !canvas.width || !canvas.height) return "";
+			return canvas.toDataURL(${JSON.stringify(type)}, ${quality});
+		} catch (e) {
+			// A canvas holding an image from somewhere else is tainted and will not be read.
+			return "";
+		}
+	})()`;
+}
+
 export function framePlayerRuntime(frameHrefs: string[], intervalMs: number): string {
 	return `// Written by claude-brain. These frames were photographed off the captured page.
 (() => {
@@ -236,6 +262,12 @@ export function framePlayerRuntime(frameHrefs: string[], intervalMs: number): st
 
 	let index = 0;
 	let step = 1;
+	// One frame filling the element. Without this the browser's defaults apply — repeat, at
+	// the image's own size — and a hero whose frames are smaller than it is comes out as a
+	// mosaic of little copies of itself.
+	target.style.backgroundRepeat = "no-repeat";
+	target.style.backgroundSize = "100% 100%";
+	target.style.backgroundPosition = "center";
 	const paint = () => {
 		target.style.backgroundImage = "url(" + FRAMES[index] + ")";
 		index += step;

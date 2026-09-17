@@ -79,7 +79,7 @@ export interface PageSnapshot {
 	/** Transition and animation declarations seen on rendered elements. */
 	motion: Array<{ value: string; count: number }>;
 	/** Canvas and video: pixels no stylesheet can describe. The caller photographs these. */
-	surfaces: Array<{ kind: string; label: string; x: number; y: number; w: number; h: number; detail: string }>;
+	surfaces: Array<{ kind: string; label: string; x: number; y: number; w: number; h: number; detail: string; index: number }>;
 	/** Everything the page draws that is not text: images, video, icons, backgrounds. */
 	assets: Array<{ url: string; kind: string; role: string; width: number; height: number; alt: string }>;
 	/** Inline SVG, which is an asset that needs no downloading — it is already here. */
@@ -606,6 +606,9 @@ export const SNAPSHOT_SCRIPT = String.raw`(() => {
 	// as an asset, which is the only way a rebuild can have the hero of a page like this.
 	const surfaces = [];
 	try {
+		// Canvases are numbered in document order, so what one of them draws can be read off
+		// the element itself rather than photographed through everything drawn over it.
+		const canvases = Array.from(document.querySelectorAll("canvas"));
 		for (const el of Array.from(document.querySelectorAll("canvas, video"))) {
 			if (surfaces.length >= 4) break;
 			const box = el.getBoundingClientRect();
@@ -626,6 +629,7 @@ export const SNAPSHOT_SCRIPT = String.raw`(() => {
 				x: Math.round(box.left), y: Math.round(box.top + window.scrollY),
 				w: Math.round(box.width), h: Math.round(box.height),
 				detail: detail,
+				index: tag === "canvas" ? canvases.indexOf(el) : -1,
 			});
 		}
 	} catch (e) { /* a page that redefines querySelectorAll */ }

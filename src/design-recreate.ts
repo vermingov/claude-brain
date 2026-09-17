@@ -56,7 +56,9 @@ import {
 import { NO_BROWSER, findBrowser, screenshot } from "./headless";
 import { startJob } from "./jobs";
 import { rebuildPage } from "./page-rebuild";
-import { withPage } from "./cdp";
+import { ripScene } from "./scene-rip";
+import type { RippedFrame } from "./webgl-ripper";
+import { type Page, withPage } from "./cdp";
 import { type StoredAsset, collectAssets, renderAssetManifest, storeAssetBytes, storeVideoBytes } from "./design-assets";
 import { type PageSnapshot, SNAPSHOT_SCRIPT, renderSnapshot, trimSnapshotText } from "./page-snapshot";
 import { canonicalUrl, resolveAndGate } from "./url-guard";
@@ -65,6 +67,7 @@ import {
 	FRAME_COUNT,
 	FRAME_INTERVAL_MS,
 	FRAME_SCALE,
+	canvasPixelsScript,
 	type WebglCapture,
 	WEBGL_HOOK_SCRIPT,
 	WEBGL_READ_SCRIPT,
@@ -392,14 +395,7 @@ async function readPage(url: string, empty: PageEvidence, job: ReturnType<typeof
 			if (webgl?.ok && !isQuadShader(webgl) && surface) {
 				for (let i = 0; i < FRAME_COUNT; i++) {
 					job.step(`frame ${i + 1} of ${FRAME_COUNT}`, 0.45 + 0.25 * (i / FRAME_COUNT));
-					const frame = await page.screenshot({
-						width: VIEWPORT.width,
-						height: VIEWPORT.height,
-						clip: { x: surface.x, y: surface.y, width: surface.w, height: surface.h },
-						format: "jpeg",
-						quality: 74,
-						scale: FRAME_SCALE,
-					});
+					const frame = await surfacePixels(page, surface);
 					if (frame) frames.push(frame);
 					await Bun.sleep(FRAME_INTERVAL_MS);
 				}
@@ -411,12 +407,8 @@ async function readPage(url: string, empty: PageEvidence, job: ReturnType<typeof
 			// the black rectangle a stylesheet reading leaves there.
 			const stills: Array<{ bytes: Uint8Array; surface: PageSnapshot["surfaces"][number] }> = [];
 			for (const surface of snap?.surfaces ?? []) {
-				const clip = await page.screenshot({
-					width: VIEWPORT.width,
-					height: VIEWPORT.height,
-					clip: { x: surface.x, y: surface.y, width: surface.w, height: surface.h },
-				});
-				if (clip) stills.push({ bytes: clip, surface });
+				const pixels = await surfacePixels(page, surface, "image/png");
+				if (pixels) stills.push({ bytes: pixels, surface });
 			}
 			return { snap, shot, stills, webgl, frames };
 		},
@@ -542,6 +534,27 @@ export async function attachPageShot(
 	return true;
 }
 
+/**
+ * What a surface is showing. A canvas is read off the element itself; photographing its
+ * rectangle through the debugging protocol catches everything the page draws on top of it,
+ * which is how a hero background came back with the site's own headline in it. A video, and a
+ * canvas holding an image from another origin, cannot be read that way and are photographed.
+ */
+async function surfacePixels(page: Page, surface: PageSnapshot["surfaces"][number], type = "image/jpeg"): Promise<Uint8Array | null> {
+	if (surface.kind === "canvas" && surface.index >= 0) {
+		const dataUrl = (await page.evaluate<string>(canvasPixelsScript(surface.index, type, type === "image/png" ? 1 : 0.74))) ?? "";
+		const comma = dataUrl.indexOf(",");
+		if (dataUrl.startsWith("data:image/") && comma > 0) return new Uint8Array(Buffer.from(dataUrl.slice(comma + 1), "base64"));
+	}
+	const shot = await page.screenshot({
+		width: VIEWPORT.width,
+		height: VIEWPORT.height,
+		clip: { x: surface.x, y: surface.y, width: surface.w, height: surface.h },
+		...(type === "image/jpeg" ? { format: "jpeg" as const, quality: 74, scale: FRAME_SCALE } : {}),
+	});
+	return shot ?? null;
+}
+
 /** Both halves, for callers that just want the page on the board. */
 export async function capturePageShot(designId: string, url: string): Promise<{ ok: boolean; detail: string; snapshot: string }> {
 	const evidence = await capturePageEvidence(url);
@@ -665,6 +678,58 @@ interface Round {
  */
 const REBUILD_EXPLORE = { idleFrames: 180, dwellFrames: 90, watchFrames: 600, patienceFrames: 300, revisitFrames: 900, probesPerScreen: 6 };
 
+/** Where a ripped scene is kept, so rebuilding a page twice does not rip it twice. */
+function scenePath(id: string): string {
+	return join(RECREATE_DIR, `${id}.scene.json`);
+}
+
+/**
+ * The page's WebGL scene, taken rather than filmed: every draw call with its shaders, its
+ * geometry and its uniforms, plus samples of how those uniforms moved while the scene ran. The
+ * replay engine draws that back, and the samples are what make it move — no model is asked
+ * anything, and nothing of the page over the canvas ends up in it.
+ *
+ * Filming was the fallback before this, and it shows: a photograph of the canvas rectangle has
+ * whatever the page paints on top of it baked in, and twenty of them are a slideshow of the
+ * hero rather than the hero. That is kept, below, for a scene this cannot rip.
+ *
+ * A visit of its own, because the rip needs the page on a virtual clock from its first frame.
+ */
+async function rippedScene(id: string, url: string, job: ReturnType<typeof startJob>): Promise<{ frame: RippedFrame; canvas: number } | undefined> {
+	const kept = Bun.file(scenePath(id));
+	if (kept.size > 0) {
+		try {
+			const saved = JSON.parse(await kept.text()) as { frame: RippedFrame | null; canvas: number };
+			// A remembered failure counts: waiting ninety seconds for a scene that is not there,
+			// on every rebuild of the same page, is ninety seconds nobody asked for.
+			if (saved?.frame?.ok) return { frame: saved.frame, canvas: saved.canvas };
+			if (saved && saved.frame === null) return undefined;
+		} catch {
+			// A half-written scene from a killed rebuild: take it again.
+		}
+	}
+	// Only worth a visit when there is something on the page that draws. The capture's shader
+	// reading says so outright; failing that, the markup it kept says whether a canvas exists.
+	const sawShaders = Bun.file(shadersPath(id)).size > 0;
+	const sawCanvas = sawShaders || /<canvas\b/i.test(await Bun.file(sourceHtmlPath(id)).text().catch(() => ""));
+	if (!sawCanvas) return undefined;
+
+	job.stage("taking the page's WebGL scene", 0.03, "its draw calls, shaders and uniforms");
+	const vetted = canonicalUrl(url);
+	if ("reject" in vetted) return undefined;
+	const gate = await resolveAndGate(vetted.hostname);
+	if ("reject" in gate) return undefined;
+	const rip = await ripScene(vetted.href, VIEWPORT, gate.addresses[0] ? { host: vetted.hostname, address: gate.addresses[0] } : null);
+	if (!rip.ok) {
+		console.log(`[designs] ${id}: the scene could not be taken (${rip.reject}) — falling back to what was photographed`);
+		await Bun.write(scenePath(id), JSON.stringify({ frame: null, canvas: -1, why: rip.reject }));
+		return undefined;
+	}
+	const scene = { frame: rip.rip.frame, canvas: Math.max(0, rip.rip.canvasIndex) };
+	await Bun.write(scenePath(id), JSON.stringify(scene));
+	return scene;
+}
+
 /** Where the hero the capture wrote is kept once a rebuild has composed its own runtime over it. */
 function capturedHeroPath(id: string): string {
 	return join(RECREATE_DIR, `${id}.hero.capture.js`);
@@ -704,11 +769,16 @@ async function rebuildFromPage(id: string, url: string): Promise<{ ok: boolean; 
 }
 
 async function rebuildRun(id: string, url: string, job: ReturnType<typeof startJob>): Promise<{ ok: boolean; detail: string }> {
+	// The scene first: with one, the rebuild's canvas is the replay engine's and the page's
+	// filmed frames are not needed. Without one — no WebGL, or a scene this cannot take — the
+	// hero the capture wrote rides along instead.
+	const scene = await rippedScene(id, url, job);
 	const result = await rebuildPage(url, {
 		runtimeHref: `${id}.hero.js`,
 		viewport: VIEWPORT,
 		explore: REBUILD_EXPLORE,
-		hero: await capturedHero(id),
+		scene: scene ? { frame: scene.frame, canvas: scene.canvas } : undefined,
+		hero: scene ? undefined : await capturedHero(id),
 		onProgress: (stage, progress, detail) => job.stage(stage, progress, detail),
 	});
 	if ("error" in result) return { ok: false, detail: result.error };
@@ -732,11 +802,12 @@ async function rebuildRun(id: string, url: string, job: ReturnType<typeof startJ
 	const { rules, assets, tapes, interactions, loops, ops, seconds } = result.stats;
 	const notes: RecreateNotes = {
 		approach: [
+			scene ? "its WebGL scene taken draw call by draw call, and replayed by this package's engine" : "",
 			`${rules} of the page's own CSS rules, kept inside the media and container queries that held them`,
 			`${assets} images, videos and fonts downloaded and rewritten to local paths`,
 			`${ops} changes its script made to the page, recorded over ${seconds} s and filed into ${tapes} tapes${loops ? `, ${loops} of them looping` : ""}`,
 			interactions ? `${interactions} things that answer a hover or a click` : "nothing on the page answered a hover or a click",
-		],
+		].filter(Boolean),
 		uncertain: result.tapes.skipped ? Object.entries(result.tapes.skipped).map(([why, n]) => `${n} recorded changes dropped: ${why}`) : [],
 		model: "the page itself",
 		why: "A transplant needs no model: the DOM, the rules and the behaviour are the page's own.",

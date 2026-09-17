@@ -138,7 +138,7 @@ function snapshot(): PageSnapshot {
 		components: [{ label: "primary button — button.btn", html: "<button class=btn>Go</button>", rules: [".btn:hover{opacity:.8}"] }],
 		keyframes: ["@keyframes fade { from { opacity: 0 } }"],
 		animations: [{ name: "fade", duration: "1s", easing: "ease-out forwards", on: "div.hero", count: 2 }],
-		surfaces: [{ kind: "canvas", label: "in the hero canvas", x: 0, y: 0, w: 1200, h: 900, detail: "WebGL2 canvas, drawn every frame" }],
+		surfaces: [{ kind: "canvas", label: "in the hero canvas", x: 0, y: 0, w: 1200, h: 900, detail: "WebGL2 canvas, drawn every frame", index: 0 }],
 		motion: [{ value: "opacity 150ms ease", count: 5 }],
 		assets: [{ url: "https://example.com/a.png", kind: "image", role: "in the header", width: 40, height: 40, alt: "logo" }],
 		icons: [{ label: "in the nav 16x16", svg: "<svg></svg>" }],
