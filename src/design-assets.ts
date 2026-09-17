@@ -282,6 +282,44 @@ export function renderAssetManifest(assets: StoredAsset[]): string {
 	return lines.join("\n");
 }
 
+/** One resource a transplanted page points at: an image, a poster, a video, an icon. */
+const RESOURCE_LIMITS: FetchLimits = {
+	maxBytes: MAX_VIDEO_BYTES,
+	timeoutMs: 30_000,
+	stallMs: 10_000,
+	accept: ["image/", "video/", "application/octet-stream", "binary/octet-stream"],
+};
+
+/**
+ * Fetch one resource by URL and keep it under the same content-addressed name as everything
+ * else. What the bytes are is decided by sniffing them, not by the URL: an image optimiser
+ * endpoint says nothing about its format in its path.
+ */
+export async function storeFetchedAsset(url: string): Promise<StoredAsset | null> {
+	mkdirSync(ASSET_DIR, { recursive: true });
+	const res = await guardedFetch(url, RESOURCE_LIMITS);
+	if ("reject" in res || res.bytes.length === 0) return null;
+	const ext = extensionFor(res.bytes, res.contentType, url);
+	if (!ext || ext === "woff2" || ext === "woff") return null;
+	let bytes = res.bytes;
+	if (ext === "svg") bytes = sanitizeSvg(bytes);
+	if ((ext !== "mp4" && ext !== "webm") && bytes.length > MAX_IMAGE_BYTES) return null;
+	const file = `${hashOf(bytes)}.${ext}`;
+	const path = join(ASSET_DIR, file);
+	if (Bun.file(path).size !== bytes.length) await Bun.write(path, bytes);
+	return {
+		href: `${ASSET_HREF}/${file}`,
+		file,
+		kind: ext === "mp4" || ext === "webm" ? "video" : "image",
+		role: "",
+		width: 0,
+		height: 0,
+		alt: "",
+		bytes: bytes.length,
+		from: url,
+	};
+}
+
 /**
  * File bytes this package produced rather than fetched: a canvas photographed through the
  * debugging protocol, which is the only way to get the pixels of a WebGL hero into a

@@ -19,7 +19,7 @@ import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { type Page, withPage } from "../../src/cdp";
 import { type RippedFrame, replayRuntime } from "../../src/webgl-ripper";
-import { install, lastMount, readLarge, runTo, sceneStart } from "./hooks";
+import { install, lastMount, readLarge, runTo, sceneStart } from "../../src/parity-hooks";
 
 const [command, ...rest] = process.argv.slice(2);
 const positional = rest.filter((a, i) => !a.startsWith("--") && !(rest[i - 1]?.startsWith("--") && !isFlag(rest[i - 1]!)));

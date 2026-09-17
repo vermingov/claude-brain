@@ -938,12 +938,16 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 	// Time dilation, for the entrance only. Both clocks and the frame timestamp are slowed
 	// together — a page that reads any one of them sees a consistent, slower world — and put
 	// back the moment the scene settles.
+	//
+	// Not under a virtual clock. There the page already sees exactly 1/60 s per frame however
+	// slowly frames are drawn, which is what dilation was approximating; slowing that clock as
+	// well would record an entrance eight times longer than the page's.
 	const realNow = performance.now.bind(performance);
 	const startedReal = realNow();
-	rip.rate = ${INTRO_TIME_RATE};
+	rip.rate = window.__vclock ? 1 : ${INTRO_TIME_RATE};
 	rip.realNow = realNow;
 	const dilate = (real) => startedReal + (real - startedReal) * rip.rate;
-	try {
+	if (!window.__vclock) try {
 		performance.now = () => dilate(realNow());
 		// Date.now is deliberately left alone. Animation reads performance.now or the frame
 		// timestamp; the capture's own deadlines read Date.now, and slowing that made every

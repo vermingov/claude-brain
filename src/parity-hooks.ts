@@ -12,7 +12,7 @@
 //   uniform log     at each draw, the named uniforms are read back off the GPU with
 //                   getUniform, keyed by frame, framebuffer and viewport.
 
-import type { Page } from "../../src/cdp";
+import type { Page } from "./cdp";
 
 export const VIRTUAL_CLOCK = String.raw`(() => {
 	if (window.__vclock) return;
@@ -56,10 +56,14 @@ export const SKIP_DRAWS = String.raw`(() => {
  * the draw then happens. The scene's first frame is the first draw to the screen that declares
  * a watched uniform, and the clock holds there so a harness polling for it misses nothing.
  */
-export function uniformLog(watch: string[]): string {
+export function uniformLog(watch: string[] | "all"): string {
 	return String.raw`(() => {
 	if (window.__uniformLog) return;
 	const WATCH = ${JSON.stringify(watch)};
+	const ALL = WATCH === "all";
+	// With every uniform watched, only changes are written: a pass's first frame carries all of
+	// its values and later frames carry what moved. expandRecording() puts them back.
+	const lastByPass = [];
 	const log = { frames: [], sceneStart: -1 };
 	window.__uniformLog = log;
 	const info = new WeakMap();
@@ -80,7 +84,7 @@ export function uniformLog(watch: string[]): string {
 				const u = gl.getActiveUniform(program, i);
 				if (!u) continue;
 				const name = u.name.replace(/\[0\]$/, "");
-				if (WATCH.includes(name)) entry.locations[name] = gl.getUniformLocation(program, name);
+				if (ALL || WATCH.includes(name)) entry.locations[name] = gl.getUniformLocation(program, name);
 			}
 			info.set(program, entry);
 			return entry;
@@ -106,6 +110,19 @@ export function uniformLog(watch: string[]): string {
 							const v = this.getUniform(program, entry.locations[n]);
 							u[n] = typeof v === "number" || typeof v === "boolean" ? [Number(v)] : Array.from(v);
 						}
+						if (ALL) {
+							const slot = row.draws.length;
+							const last = lastByPass[slot];
+							if (last && last.p === entry.id) {
+								for (const n of Object.keys(u)) {
+									const a = u[n], b = last.u[n];
+									if (b && a.length === b.length && a.every((x, i) => x === b[i])) delete u[n];
+									else last.u[n] = a;
+								}
+							} else {
+								lastByPass[slot] = { p: entry.id, u: Object.assign({}, u) };
+							}
+						}
 						let fbo = 0;
 						if (bound) { fbo = fboIds.get(bound) || nextFbo++; fboIds.set(bound, fbo); }
 						const vp = this.getParameter(this.VIEWPORT);
@@ -123,7 +140,7 @@ export function uniformLog(watch: string[]): string {
 })()`;
 }
 
-export async function install(page: Page, watch: string[]): Promise<void> {
+export async function install(page: Page, watch: string[] | "all"): Promise<void> {
 	await page.addInitScript(VIRTUAL_CLOCK);
 	await page.addInitScript(SKIP_DRAWS);
 	await page.addInitScript(uniformLog(watch));
@@ -183,4 +200,66 @@ export async function readLarge(page: Page, expression: string): Promise<string>
 		out += (await page.evaluate<string>(`window.__big.slice(${from}, ${from + 1_000_000})`, 60_000)) ?? "";
 	}
 	return out;
+}
+
+export interface RecordedPass {
+	p: number;
+	fbo: number;
+	vp: [number, number];
+	cw: number;
+	ch: number;
+	u: Record<string, number[]>;
+}
+export interface Recording {
+	sceneStart: number;
+	mount: number;
+	frames: Array<{ f: number; draws: RecordedPass[] }>;
+	innerWidth: number;
+	innerHeight: number;
+	mouse: Array<[number, number, number]>;
+}
+
+/**
+ * A change-only recording with every value put back: each pass carries forward what it held
+ * the frame before, unless the program in that slot changed, in which case it starts over.
+ */
+export function expandRecording(recording: Recording): Recording {
+	const held: Array<{ p: number; u: Record<string, number[]> }> = [];
+	const frames = recording.frames.map((row) => ({
+		f: row.f,
+		draws: row.draws.map((pass, slot) => {
+			const before = held[slot];
+			const u = before && before.p === pass.p ? { ...before.u, ...pass.u } : { ...pass.u };
+			held[slot] = { p: pass.p, u };
+			return { ...pass, u };
+		}),
+	}));
+	return { ...recording, frames };
+}
+
+/**
+ * How far apart two recordings are when the second is shifted by `offset` frames: the worst
+ * difference in any non-clock uniform, over a sample of frames. Used to line two runs up
+ * without knowing anything about the scene — the offset with the smallest error is the one
+ * where both mounted.
+ */
+export function alignmentError(a: Recording, b: Recording, offset: number, clocks: string[], sample = 240): number {
+	const rowsA = new Map(a.frames.map((r) => [r.f - a.mount, r]));
+	const rowsB = new Map(b.frames.map((r) => [r.f - b.mount + offset, r]));
+	let worst = 0;
+	let seen = 0;
+	for (let k = 0; k < sample; k++) {
+		const x = rowsA.get(k), y = rowsB.get(k);
+		if (!x || !y) continue;
+		seen++;
+		for (let pass = 0; pass < Math.min(x.draws.length, y.draws.length); pass++) {
+			for (const [name, values] of Object.entries(x.draws[pass]!.u)) {
+				if (clocks.includes(name)) continue;
+				const other = y.draws[pass]!.u[name];
+				if (!other) continue;
+				for (let i = 0; i < values.length; i++) worst = Math.max(worst, Math.abs(values[i]! - (other[i] ?? Number.NaN)) || 0);
+			}
+		}
+	}
+	return seen === 0 ? Number.POSITIVE_INFINITY : worst;
 }

@@ -496,6 +496,9 @@ function browserEnv(canvas) {
 			}
 			new ResizeObserver(() => handler(size())).observe(canvas);
 		},
+		onScroll: (handler) => window.addEventListener("scroll", () => handler(window.scrollX, window.scrollY), { passive: true }),
+		onPointerDown: (handler) => window.addEventListener("pointerdown", (e) => handler(e.clientX, e.clientY, e.button)),
+		onPointerUp: (handler) => window.addEventListener("pointerup", (e) => handler(e.clientX, e.clientY, e.button)),
 		onInView: (handler) => {
 			if (typeof IntersectionObserver === "undefined") {
 				handler(true);
