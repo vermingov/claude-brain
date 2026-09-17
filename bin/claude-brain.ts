@@ -600,6 +600,76 @@ async function cmdContext(): Promise<void> {
 	console.log(await contextDigest());
 }
 
+/**
+ * Update the installed package, from inside the thing being updated.
+ *
+ * The package lives on the AUR, which means the update is a `yay` or `paru` away — but that
+ * asks for a password, so it has to run in the user's own terminal with its input attached,
+ * not in the daemon. This command is that terminal: it reads what is published, compares it
+ * with what is running, hands over to whichever helper is installed, and restarts the user
+ * service afterwards so the new code is what answers.
+ *
+ * A checkout linked with packaging/dev-link.sh is left alone: updating the package there
+ * changes nothing that runs, and saying so is more useful than a no-op.
+ */
+async function cmdUpdate(rest: string[]): Promise<void> {
+	const running = await installedVersion();
+	const linked = Bun.file(`${process.env.HOME}/.local/bin/claude-brain`).size > 0;
+	const published = await publishedVersion();
+
+	console.log(`installed ${running ?? "unknown"}${published ? `, published ${published}` : ", could not read what is published"}`);
+	if (linked) {
+		console.log("this machine runs a checkout (packaging/dev-link.sh), so the package is not what answers here.");
+		console.log("update it with: git -C <checkout> pull");
+		return;
+	}
+	if (!published || published === running) {
+		console.log(published ? "already up to date" : "nothing to compare against; try again when the AUR is reachable");
+		return;
+	}
+	const helper = ["yay", "paru"].find((name) => Bun.which(name));
+	if (!helper) {
+		console.log("no AUR helper found. Either install one, or:");
+		console.log("  git clone https://aur.archlinux.org/claude-brain.git && cd claude-brain && makepkg -si");
+		return;
+	}
+	if (!rest.includes("--yes")) console.log(`running ${helper} -S claude-brain — it will ask for your password`);
+	const install = Bun.spawn([helper, "-S", "--needed", "claude-brain"], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	if ((await install.exited) !== 0) {
+		console.log("the update did not finish; nothing was changed");
+		return;
+	}
+	// systemd does not restart a user service when its files change underneath it, so the old
+	// code would keep serving the new dashboard — the exact mismatch the stale banner warns about.
+	const restart = Bun.spawn(["systemctl", "--user", "restart", "claude-brain"], { stdout: "inherit", stderr: "inherit" });
+	await restart.exited;
+	console.log(`updated to ${published}`);
+}
+
+/** What is running here, read from the package this file belongs to. */
+async function installedVersion(): Promise<string | null> {
+	try {
+		const raw = await Bun.file(new URL("../package.json", import.meta.url).pathname).text();
+		return (JSON.parse(raw) as { version?: string }).version ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/** What the AUR has, which is where this package is published. */
+async function publishedVersion(): Promise<string | null> {
+	try {
+		const res = await fetch("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=claude-brain", { signal: AbortSignal.timeout(10_000) });
+		if (!res.ok) return null;
+		const body = (await res.json()) as { results?: Array<{ Version?: string }> };
+		const version = body.results?.[0]?.Version ?? null;
+		// The AUR carries the package release too — 0.9.11-1 — and this compares source versions.
+		return version ? version.split("-")[0]! : null;
+	} catch {
+		return null;
+	}
+}
+
 async function cmdStatus(): Promise<void> {
 	const res = await api("/api/status");
 	if (res) {
@@ -671,12 +741,16 @@ switch (cmd) {
 	case "status":
 		await cmdStatus();
 		break;
+	case "update":
+		await cmdUpdate(rest);
+		break;
 	case "reindex":
 		console.log(JSON.stringify(await (await import("../src/indexer")).reindex()));
 		break;
 	default:
 		console.log(`usage:
   claude-brain                       open the brain UI
+  claude-brain update                update the installed package and restart the service
 
  recall
   claude-brain recall "<query>" [k] [-p <folder>] [-e <n>] [--full]

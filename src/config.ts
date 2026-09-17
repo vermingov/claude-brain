@@ -79,7 +79,9 @@ const DEFAULTS: BrainConfig = {
 	llm: {
 		enabled: false,
 		model: "haiku",
-		dailyBudgetUsd: 2,
+		// No cap by default: what the CLI reports per call is only money on an API key, and a
+		// subscription that stops itself at two notional dollars a day is broken, not careful.
+		dailyBudgetUsd: 0,
 		binaryPath: null,
 		autoModel: true,
 		plan: "auto",

@@ -341,6 +341,13 @@ export function createSettingsTab(container) {
 				`<span class="dot"></span>${escapeHtml(r.model)}. ${escapeHtml(r.why ?? "")}`));
 		}
 
+		// The one thing people ask when a job says it stopped for money: whose money, and why.
+		s.appendChild(el("p", "settings-sub",
+			"Every call goes through the <code>claude</code> CLI on this machine, so it is your own " +
+			"Claude account doing the work. On Pro or Max nothing is billed per call — the cost the " +
+			"CLI reports is what those tokens would have cost on the API — so this brain's own daily " +
+			"cap (<code>llm.dailyBudgetUsd</code>) applies to an API key only, and is off by default."));
+
 		const plan = el("div", "settings-row");
 		plan.appendChild(el("label", "settings-label", "Claude plan"));
 		const select = el("select", "settings-input settings-input-narrow");
@@ -384,7 +391,7 @@ export function createSettingsTab(container) {
 			"Nothing on this machine publishes your live rate limits, so the brain cannot see them. " +
 			"Point this at anything that prints them and it steps down to a cheaper model when you " +
 			"are running low: below 60% of the day, or below 50% of either weekly allowance. Left " +
-			"empty, it goes by its own daily budget instead." +
+			"empty, it goes by its own daily cap, which on a subscription is not a limit at all." +
 			(r.headroom?.source ? ` Currently: ${escapeHtml(r.headroom.source)}.` : "")));
 
 		wrap.appendChild(s);

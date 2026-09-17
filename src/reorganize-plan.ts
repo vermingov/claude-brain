@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CACHE_DIR, STATE_DIR, loadConfig, safeVaultFolder } from "./config";
-import { type ClaudeModel, askJson, isAvailable, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
+import { type ClaudeModel, askJson, budgetBindsNow, isAvailable, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
 import type { Inventory, InventoryNote } from "./reorganize-inventory";
 import { calendarShapedFolder, underAnyFolder, vaultNotePath } from "./vault-links";
 
@@ -332,7 +332,7 @@ export function estimateCost(inv: Inventory, opts: PlanOptions = {}): CostEstima
 
 	const price = PRICE_PER_MTOK[model];
 	const usd = (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
-	const remainingUsd = Math.max(0, loadConfig().llm.dailyBudgetUsd - spendTodayUsd());
+	const remainingUsd = budgetBindsNow() ? Math.max(0, loadConfig().llm.dailyBudgetUsd - spendTodayUsd()) : Number.POSITIVE_INFINITY;
 	return { notes, calls, tokens: inputTokens + outputTokens, model, usd, remainingUsd, fitsBudget: usd <= remainingUsd };
 }
 

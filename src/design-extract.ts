@@ -17,7 +17,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { askJson, status as claudeStatus, describeImagesJson, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
+import { askJson, budgetSpent, status as claudeStatus, describeImagesJson, sessionSpendUsd } from "./claude-cli";
 import { loadConfig, vaultReady, vaultRoot } from "./config";
 import { startJob } from "./jobs";
 import { type DesignSpec, normalizeSpec, writeDesignNote } from "./design-note";
@@ -457,13 +457,14 @@ async function describeDesign(row: DesignRow, id: string, job: ReturnType<typeof
 			});
 			return;
 		}
-		// A day's budget running out is not this design's fault, and spending its three
-		// attempts on it would leave a whole batch permanently failed over a spending cap.
-		if (spendTodayUsd() >= cfg.llm.dailyBudgetUsd) {
+		// A day's cap running out is not this design's fault, and spending its three attempts on
+		// it would leave a whole batch permanently failed over a spending cap. It only binds on
+		// an API key; a subscription is not billed per call (see budgetBinds).
+		if (await budgetSpent()) {
 			updateDesign(id, {
 				status: "queued",
 				nextAttemptAt: new Date().setHours(24, 0, 0, 0),
-				error: "today's LLM budget is spent — this picks up again tomorrow",
+				error: `this brain's own daily cap of $${cfg.llm.dailyBudgetUsd} is spent — it picks up again tomorrow, or raise it in Settings`,
 			});
 			armWake(Date.now());
 			return;

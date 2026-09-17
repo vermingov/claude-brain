@@ -29,7 +29,7 @@
 // make the whole ladder collapse to haiku for everybody who has not wired up a usage
 // command. The reason string always says which it was.
 
-import { type ClaudeModel, type Effort, spendTodayUsd, status as claudeStatus } from "./claude-cli";
+import { type ClaudeModel, type Effort, budgetBinds, spendTodayUsd, status as claudeStatus } from "./claude-cli";
 import { loadConfig } from "./config";
 
 export type Plan = "max20" | "max5" | "pro" | "free" | "api" | "unknown";
@@ -128,7 +128,9 @@ export async function readHeadroom(): Promise<Headroom> {
 		if (fromCommand) return fromCommand;
 	}
 
-	const budget = cfg.llm.dailyBudgetUsd;
+	// Only where the cap binds: on a subscription the dollars are notional, and reading them as
+	// an allowance would step the model down for nothing.
+	const budget = (await budgetBinds()) ? cfg.llm.dailyBudgetUsd : 0;
 	if (budget > 0) {
 		const left = Math.max(0, budget - spendTodayUsd());
 		return {

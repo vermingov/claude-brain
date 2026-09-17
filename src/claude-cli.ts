@@ -263,6 +263,37 @@ function remainingBudgetUsd(): number {
 	return Math.max(0, loadConfig().llm.dailyBudgetUsd - spendTodayUsd());
 }
 
+/**
+ * Whether a figure in dollars means anything on this account.
+ *
+ * The CLI reports `total_cost_usd` for every call it makes, and on a Pro or Max plan that is
+ * what those tokens would have cost on the API — a notional price. Nothing is billed per call;
+ * the plan's own rate limit is the real ceiling, and the usage command reads that. Enforcing a
+ * dollar cap there stops work over money nobody spent, which is exactly how a subscriber ends
+ * up looking at "today's LLM budget is spent" on the first afternoon.
+ *
+ * So the cap binds on an API key, where the calls are metered, and on nothing else.
+ */
+export async function budgetBinds(): Promise<boolean> {
+	const cfg = loadConfig();
+	if (cfg.llm.dailyBudgetUsd <= 0) return false;
+	if (cfg.llm.plan !== "auto") return cfg.llm.plan === "api";
+	// Imported here rather than at the top: the policy reads this module to decide a model.
+	const { detectPlan } = await import("./model-policy");
+	return (await detectPlan()) === "api";
+}
+
+/** The same question where there is no room to probe: the configured plan only. */
+export function budgetBindsNow(): boolean {
+	const cfg = loadConfig();
+	return cfg.llm.dailyBudgetUsd > 0 && cfg.llm.plan === "api";
+}
+
+/** Is today's cap spent, on an account where it binds at all? */
+export async function budgetSpent(): Promise<boolean> {
+	return (await budgetBinds()) && remainingBudgetUsd() <= 0;
+}
+
 // ---------------------------------------------------------------- cross-process lock
 
 /**
@@ -412,7 +443,7 @@ async function invoke(prompt: string, args: string[], opts: AskOptions): Promise
 
 	const st = await status();
 	if (!st.available || !st.binary) return blockedOutcome("unavailable");
-	if (remainingBudgetUsd() <= 0) return blockedOutcome("budget");
+	if (await budgetSpent()) return blockedOutcome("budget");
 	if (!(await acquireLock())) return blockedOutcome("busy");
 
 	const model = opts.model ?? loadConfig().llm.model;
@@ -477,10 +508,11 @@ async function invoke(prompt: string, args: string[], opts: AskOptions): Promise
 	}
 }
 
-function baseArgs(opts: AskOptions): string[] {
-	// The per-call ceiling is clamped to what is left of today's budget, so the CLI itself
-	// enforces the remainder instead of us discovering the overrun afterwards.
-	const budget = Math.min(opts.maxCostUsd ?? DEFAULT_MAX_COST_USD, remainingBudgetUsd());
+function baseArgs(opts: AskOptions, capped: boolean): string[] {
+	// The per-call ceiling is clamped to what is left of today's cap, so the CLI itself enforces
+	// the remainder instead of us discovering the overrun afterwards — where the cap binds.
+	const ceiling = opts.maxCostUsd ?? DEFAULT_MAX_COST_USD;
+	const budget = capped ? Math.min(ceiling, remainingBudgetUsd()) : ceiling;
 	const args = [
 		"-p",
 		"--output-format", "json",
@@ -574,7 +606,7 @@ export async function ask(prompt: string, opts: AskOptions = {}): Promise<string
 	if (!(await isAvailable())) return null;
 	return serialize(async () => {
 		if (opts.signal?.aborted) return null;
-		return (await invoke(prompt, baseArgs(opts), opts)).text;
+		return (await invoke(prompt, baseArgs(opts, await budgetBinds()), opts)).text;
 	});
 }
 
@@ -592,7 +624,7 @@ export async function askJson<T>(
 	if (!(await isAvailable())) return null;
 	return serialize(async () => {
 		if (opts.signal?.aborted) return null;
-		const args = [...baseArgs(opts), "--json-schema", JSON.stringify(schema)];
+		const args = [...baseArgs(opts, await budgetBinds()), "--json-schema", JSON.stringify(schema)];
 		const { envelope, text } = await invoke(prompt, args, opts);
 		if (!envelope || text === null) return null;
 		return (envelope.structured_output as T | undefined) ?? safeParse<T>(text);
@@ -660,7 +692,7 @@ export async function describeImagesJson<T extends { viewed: boolean }>(
 					.join("\n")}`;
 	return serialize(async () => {
 		if (options.signal?.aborted) return null;
-		const args = [...baseArgs(options), "--json-schema", JSON.stringify(schema)];
+		const args = [...baseArgs(options, await budgetBinds()), "--json-schema", JSON.stringify(schema)];
 		const { envelope, text } = await invoke(`Read ${listed}, then: ${instruction}`, args, options);
 		if (!envelope || text === null) return null;
 		if (envelope.permission_denials?.length) return null;
