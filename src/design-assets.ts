@@ -32,6 +32,16 @@ const MAX_VIDEO_BYTES = 12 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 28 * 1024 * 1024;
 const FETCH_CONCURRENCY = 4;
 
+/** Type is the design, so the page's own faces come down too — a handful of small files. */
+const MAX_FONTS = 32;
+const MAX_FONT_BYTES = 1024 * 1024;
+const FONT_LIMITS: FetchLimits = {
+	maxBytes: MAX_FONT_BYTES,
+	timeoutMs: 15_000,
+	stallMs: 8_000,
+	accept: ["font/", "application/font", "application/x-font", "application/octet-stream", "binary/octet-stream"],
+};
+
 const IMAGE_LIMITS: FetchLimits = {
 	maxBytes: MAX_IMAGE_BYTES,
 	timeoutMs: 15_000,
@@ -59,7 +69,7 @@ export interface StoredAsset {
 	/** The path the rebuild writes: `assets/<hash>.<ext>`. */
 	href: string;
 	file: string;
-	kind: "image" | "video";
+	kind: "image" | "video" | "font";
 	role: string;
 	width: number;
 	height: number;
@@ -97,6 +107,9 @@ export function sanitizeSvg(bytes: Uint8Array): Uint8Array {
 }
 
 function extensionFor(bytes: Uint8Array, contentType: string, url: string): string | null {
+	const magic = String.fromCharCode(...bytes.subarray(0, 4));
+	if (magic === "wOF2") return "woff2";
+	if (magic === "wOFF") return "woff";
 	const sniffed = sniffMime(bytes);
 	if (sniffed) return EXTENSION[sniffed] ?? null;
 	const declared = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
@@ -172,6 +185,77 @@ export async function collectAssets(refs: AssetRef[]): Promise<StoredAsset[]> {
 	};
 	await Promise.all(Array.from({ length: Math.min(FETCH_CONCURRENCY, ordered.length) }, worker));
 	return stored;
+}
+
+/**
+ * Every @font-face in a captured stylesheet, with each url() resolved against the sheet it
+ * came from. The capture writes one section per sheet, opened by a comment naming its URL.
+ */
+export function fontFaces(sourceCss: string): Array<{ text: string; sources: Array<{ written: string; absolute: string }> }> {
+	const faces: Array<{ text: string; sources: Array<{ written: string; absolute: string }> }> = [];
+	const sections = sourceCss.split(/\/\* --- (\S+) --- \*\//);
+	let base = "";
+	for (let i = 0; i < sections.length; i++) {
+		if (i % 2 === 1) {
+			base = sections[i]!;
+			continue;
+		}
+		for (const rule of sections[i]!.matchAll(/@font-face\s*\{[^}]*\}/g)) {
+			const sources: Array<{ written: string; absolute: string }> = [];
+			for (const match of rule[0].matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/g)) {
+				// data: fonts are already inline, and a relative URL with no sheet to anchor it
+				// cannot be fetched from anywhere meaningful.
+				if (match[1]!.startsWith("data:")) continue;
+				try {
+					sources.push({ written: match[0], absolute: new URL(match[1]!, base || undefined).href });
+				} catch {
+					/* unresolvable */
+				}
+			}
+			faces.push({ text: rule[0], sources });
+		}
+	}
+	return faces;
+}
+
+/**
+ * The page's own typefaces, and the @font-face rules that point at them.
+ *
+ * A rebuild set in "Inter" from a font CDN is not set in the Inter the page ships: another
+ * cut, other metrics, other stylistic sets, and every line of text lands a pixel or two off.
+ * The captured stylesheet is one section per sheet, each opened by a comment naming the sheet's
+ * URL, so every url() in a @font-face is resolved against the sheet it came from — which is
+ * what makes `../media/x.woff2` mean anything at all. Only woff2 and woff are kept: both are
+ * inert containers with a magic number, and that is the whole of what gets served back.
+ */
+export async function collectFonts(sourceCss: string): Promise<{ css: string; files: StoredAsset[] }> {
+	mkdirSync(ASSET_DIR, { recursive: true });
+	const files: StoredAsset[] = [];
+	const byUrl = new Map<string, string>();
+	const rewritten: string[] = [];
+	for (const face of fontFaces(sourceCss)) {
+		let text = face.text;
+		for (const { written, absolute } of face.sources) {
+			let href = byUrl.get(absolute);
+			if (!href && files.length < MAX_FONTS) {
+				const res = await guardedFetch(absolute, FONT_LIMITS);
+				if ("reject" in res || res.bytes.length === 0) continue;
+				const ext = extensionFor(res.bytes, "", "");
+				if (ext !== "woff2" && ext !== "woff") continue;
+				const file = `${hashOf(res.bytes)}.${ext}`;
+				const path = join(ASSET_DIR, file);
+				if (Bun.file(path).size !== res.bytes.length) await Bun.write(path, res.bytes);
+				href = `${ASSET_HREF}/${file}`;
+				byUrl.set(absolute, href);
+				files.push({ href, file, kind: "font", role: "font", width: 0, height: 0, alt: "", bytes: res.bytes.length, from: absolute });
+			}
+			if (href) text = text.replace(written, `url("${href}")`);
+		}
+		// A face whose files would not all come down is dropped rather than left pointing at
+		// someone else's server; the stack's fallbacks take over.
+		if (face.sources.every((source) => byUrl.has(source.absolute))) rewritten.push(text);
+	}
+	return { css: rewritten.join("\n"), files };
 }
 
 /**
@@ -251,7 +335,7 @@ export async function storeVideoBytes(
 
 /** Whether a name is one of ours, for the endpoint that serves these back. */
 export function validAssetFile(name: string): boolean {
-	return /^[0-9a-f]{16}\.(png|jpg|webp|gif|avif|svg|mp4|webm)$/.test(name);
+	return /^[0-9a-f]{16}\.(png|jpg|webp|gif|avif|svg|mp4|webm|woff2|woff)$/.test(name);
 }
 
 export function assetPath(file: string): string {
@@ -267,4 +351,6 @@ export const ASSET_MIME: Record<string, string> = {
 	svg: "image/svg+xml",
 	mp4: "video/mp4",
 	webm: "video/webm",
+	woff2: "font/woff2",
+	woff: "font/woff",
 };

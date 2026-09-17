@@ -34,6 +34,9 @@
 // will look flatter than the original; instanced draws are recorded but replayed as single
 // draws; and a texture uploaded from a video is frozen at the frame it was taken.
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 /** Ceilings. A hero scene is a few megabytes; anything past this is a game. */
 const MAX_TOTAL_BUFFER_BYTES = 24 * 1024 * 1024;
 const MAX_TEXTURES = 12;
@@ -175,8 +178,32 @@ export interface RippedFrame {
 	handles: number;
 	/** Extensions the page enabled, which the replay has to enable too. */
 	extensions: string[];
-	/** Render targets: a pass draws into one, a later pass samples its colour attachment. */
-	framebuffers: Array<{ id: number; handle: number; colour: number }>;
+	/**
+	 * Render targets: a pass draws into one, a later pass samples its colour attachment. The
+	 * formats are the page's own — a half-float buffer replayed as eight bits bands.
+	 */
+	framebuffers: Array<{
+		id: number;
+		handle: number;
+		colour: number;
+		colourFormat?: {
+			internalFormat: number;
+			format: number;
+			pixelType: number;
+			storage: boolean;
+			minFilter: number;
+			magFilter: number;
+			wrapS: number;
+			wrapT: number;
+		} | null;
+		/** The depth attachment's internal format; 0 when the target had none. */
+		depthFormat?: number;
+	}>;
+	/** What getContextAttributes() said: antialiasing, alpha, a preserved drawing buffer. */
+	contextAttributes?: Record<string, unknown> | null;
+	/** The canvas's CSS box at the kept frame, so pixel ratio and resolution uniforms are known. */
+	canvasCss?: { width: number; height: number } | null;
+	devicePixelRatio?: number;
 	draws: Array<{
 		/** Which recorded frame this draw belonged to; the earliest is setup. */
 		frame: number;
@@ -290,9 +317,31 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 		streaming: false,
 		streamBytes: 0,
 		extensions: {},
+		renderbuffers: new Map(), // WebGLRenderbuffer -> { internalFormat, samples }
+		lastGl: null,
+		contextAttributes: null,
+		canvasCss: null,
+		devicePixelRatio: 1,
 		note: "",
 	};
 	window.__brainRip = rip;
+
+	// The canvas as it is when a frame is kept: its buffer, its CSS box, the context it was
+	// made with. Read at the kept frame rather than the first draw, when a page is often still
+	// sizing itself.
+	const canvasFacts = () => {
+		try {
+			const gl = rip.lastGl;
+			if (!gl || !gl.canvas) return;
+			rip.canvas = { width: gl.canvas.width, height: gl.canvas.height };
+			if (gl.canvas.getBoundingClientRect) {
+				const box = gl.canvas.getBoundingClientRect();
+				rip.canvasCss = { width: box.width, height: box.height };
+			}
+			rip.devicePixelRatio = window.devicePixelRatio || 1;
+			rip.contextAttributes = gl.getContextAttributes ? gl.getContextAttributes() : null;
+		} catch (e) { /* a context that is gone */ }
+	};
 
 	let nextId = 1;
 	// The setter family for a GLSL type, so the replay does not have to guess from the
@@ -369,7 +418,8 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 			"bindTexture", "getUniformLocation", "drawArrays", "drawElements", "drawArraysInstanced",
 			"drawElementsInstanced", "clear", "bindFramebuffer", "framebufferTexture2D", "createTexture",
 			"activeTexture", "bindBufferBase", "bindBufferRange", "uniformBlockBinding",
-			"texStorage2D", "texSubImage2D", "getExtension"]) {
+			"texStorage2D", "texSubImage2D", "getExtension", "bindRenderbuffer", "renderbufferStorage",
+			"renderbufferStorageMultisample", "framebufferRenderbuffer"]) {
 			keep[name] = proto[name];
 		}
 
@@ -448,13 +498,50 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 					const entry = idOf(rip.framebuffers, boundFramebuffer);
 					// Colour attachment zero is the one a later pass samples.
 					if (attachment === 36064 /* COLOR_ATTACHMENT0 */) entry.colour = idOf(rip.textures, texture).id;
+					if (attachment === 36096 /* DEPTH_ATTACHMENT */ || attachment === 33306 /* DEPTH_STENCIL_ATTACHMENT */) {
+						entry.depthTexture = idOf(rip.textures, texture).id;
+					}
 				}
 			} catch (e) { /* ignore */ }
 			return keep.framebufferTexture2D.apply(this, arguments);
 		};
+		let boundRenderbuffer = null;
+		proto.bindRenderbuffer = function (target, renderbuffer) {
+			boundRenderbuffer = renderbuffer;
+			return keep.bindRenderbuffer.apply(this, arguments);
+		};
+		proto.renderbufferStorage = function (target, internalFormat) {
+			try { if (boundRenderbuffer) rip.renderbuffers.set(boundRenderbuffer, { internalFormat: internalFormat, samples: 0 }); } catch (e) { /* ignore */ }
+			return keep.renderbufferStorage.apply(this, arguments);
+		};
+		if (keep.renderbufferStorageMultisample) {
+			proto.renderbufferStorageMultisample = function (target, samples, internalFormat) {
+				try { if (boundRenderbuffer) rip.renderbuffers.set(boundRenderbuffer, { internalFormat: internalFormat, samples: samples }); } catch (e) { /* ignore */ }
+				return keep.renderbufferStorageMultisample.apply(this, arguments);
+			};
+		}
+		proto.framebufferRenderbuffer = function (target, attachment, renderbufferTarget, renderbuffer) {
+			try {
+				if (boundFramebuffer && renderbuffer && (attachment === 36096 || attachment === 33306)) {
+					idOf(rip.framebuffers, boundFramebuffer).depthRenderbuffer = renderbuffer;
+				}
+			} catch (e) { /* ignore */ }
+			return keep.framebufferRenderbuffer.apply(this, arguments);
+		};
 		proto.texImage2D = function () {
 			const result = keep.texImage2D.apply(this, arguments);
 			try {
+				// An allocation with no pixels is a render target being made. Its format is the
+				// only thing about it worth keeping, and a large one is still worth keeping.
+				if (boundTexture && arguments.length >= 9 && arguments[8] === null) {
+					const entry = idOf(rip.textures, boundTexture);
+					entry.internalFormat = arguments[2];
+					entry.width = arguments[3];
+					entry.height = arguments[4];
+					entry.format = arguments[6];
+					entry.pixelType = arguments[7];
+					return result;
+				}
 				if (!boundTexture || rip.textures.size >= ${MAX_TEXTURES}) return result;
 				const source = arguments[arguments.length - 1];
 				if (!source || typeof source !== "object") return result;
@@ -499,7 +586,9 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 		if (keep.texStorage2D) {
 			proto.texStorage2D = function (target, levels, internalFormat, width, height) {
 				try {
-					if (boundTexture && width * height <= 262144) {
+					// Every allocation's format, whatever its size: the pixels of a large texture
+					// are not kept, but a render target is replayed in the format it was made in.
+					if (boundTexture) {
 						const entry = idOf(rip.textures, boundTexture);
 						entry.width = width;
 						entry.height = height;
@@ -557,6 +646,7 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 					if (pname === 10242) entry.wrapS = value;
 					if (pname === 10243) entry.wrapT = value;
 					if (pname === 10241) entry.minFilter = value;
+					if (pname === 10240) entry.magFilter = value;
 				}
 			} catch (e) { /* ignore */ }
 			return keep.texParameteri.call(this, target, pname, value);
@@ -744,6 +834,7 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 					uniforms.push({ name: name, kind: glslKind(info.type), value: array.slice(0, 16), texture: sampler ? 1 : 0 });
 				}
 				rip.lastDrawFrame = rip.frames;
+				rip.lastGl = gl;
 				if (!rip.firstDrawAt) rip.firstDrawAt = performance.now();
 				if (rip.sampling) {
 					rip.sampling.draws.push(uniforms);
@@ -932,6 +1023,7 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 				rip.rate = 1;
 				rip.collectingSince = performance.now();
 				rip.reference = rip.draws;
+				canvasFacts();
 				rip.timeline.push({ at: performance.now(), uniforms: rip.draws.map((d) => d.uniforms) });
 				rip.draws = [];
 			} else {
@@ -943,6 +1035,7 @@ export const RIPPER_HOOK_SCRIPT = String.raw`(() => {
 				// so a photograph of the canvas and the replay of this frame are the same
 				// instant. Keeping the first instead put seventeen seconds between them.
 				rip.reference = rip.draws;
+				canvasFacts();
 				rip.draws = [];
 				const enough = rip.timeline.length >= ${TIMELINE_FRAMES} ||
 					performance.now() - rip.collectingSince >= ${TIMELINE_MS};
@@ -1009,16 +1102,34 @@ export const RIPPER_READ_SCRIPT = String.raw`(async () => {
 			storage: !!entry.storage,
 			wrapS: entry.wrapS || 0, wrapT: entry.wrapT || 0, minFilter: entry.minFilter || 0 });
 	}
+	const textureById = new Map();
+	for (const entry of rip.textures.values()) textureById.set(entry.id, entry);
 	const framebuffers = [];
 	for (const entry of rip.framebuffers.values()) {
 		if (!entry.colour) continue;
-		framebuffers.push({ id: entry.id, handle: entry.handle || 0, colour: entry.colour });
+		const colour = textureById.get(entry.colour) || {};
+		const renderbuffer = entry.depthRenderbuffer ? rip.renderbuffers.get(entry.depthRenderbuffer) : null;
+		const depthTexture = entry.depthTexture ? textureById.get(entry.depthTexture) : null;
+		framebuffers.push({
+			id: entry.id,
+			handle: entry.handle || 0,
+			colour: entry.colour,
+			colourFormat: colour.internalFormat ? {
+				internalFormat: colour.internalFormat, format: colour.format || 0, pixelType: colour.pixelType || 0,
+				storage: !!colour.storage, minFilter: colour.minFilter || 0, magFilter: colour.magFilter || 0,
+				wrapS: colour.wrapS || 0, wrapT: colour.wrapT || 0,
+			} : null,
+			depthFormat: renderbuffer ? renderbuffer.internalFormat : depthTexture ? (depthTexture.internalFormat || 33190) : 0,
+		});
 	}
 
 	return {
 		ok: rip.draws.length > 0 && programs.length > 0 && buffers.length > 0,
 		note: rip.note || (rip.draws.length === 0 ? "no frame was captured — the canvas may have stopped drawing" : ""),
 		canvas: rip.canvas,
+		canvasCss: rip.canvasCss,
+		devicePixelRatio: rip.devicePixelRatio,
+		contextAttributes: rip.contextAttributes,
 		webgl2: rip.webgl2,
 		programs: programs,
 		buffers: buffers,
@@ -1063,719 +1174,61 @@ export function ripperSliceScript(from: number, size: number): string {
 	return `(window.__brainPayload || "").slice(${from}, ${from + size})`;
 }
 
+/** Options for the generated hero script. */
+export interface ReplayOptions {
+	/** Report what each pass left at the centre of the canvas, into window.__report. */
+	debug?: boolean;
+	/** Keep every uniform exactly as captured, clock included, for comparing one instant. */
+	freeze?: boolean;
+	/**
+	 * A behaviour ported from the page's own code: a script that sets window.__heroBehaviour.
+	 * Without one the runtime models the motion from the capture's samples.
+	 */
+	behaviour?: string;
+	/**
+	 * Carry the frame inside the script instead of fetching it. A rebuild served into a
+	 * sandbox has an opaque origin, and a fetch from one is a CORS request the file route
+	 * would refuse; a script tag is not.
+	 */
+	inline?: boolean;
+}
+
 /**
- * The runtime that draws the captured frame again, every frame, at the canvas's real size.
- *
- * This is why ripping beats filming: the geometry and the shaders are here, so the scene is
- * rasterised at whatever resolution the viewer's window happens to be, and the uniforms that
- * drive it can keep moving. A projection matrix is corrected for the new aspect ratio rather
- * than being replayed at the aspect it was captured at, which is the difference between a
- * page that resizes and a picture that crops.
+ * The part of a capture the replay draws from. The call stream and the uniform locations are
+ * the capture's working notes, and a behaviour that drives the scene has no use for the
+ * sampled motion either — together that is three quarters of the file.
  */
-export function replayRuntime(frame: RippedFrame, dataHref: string, debug = false, freeze = false, useStream = false): string {
-	// A switch, not a second copy of the runtime. Debugging a replay against a harness that
-	// only resembles the shipped code is how a bug gets fixed in the wrong place.
-	const report = debug
-		? `window.__report = window.__report || []; const say = (m) => window.__report.push(String(m));`
-		: "const say = () => {};";
-	const readback = debug
-		? `if (!window.__reported) {
-				const px = new Uint8Array(4);
-				gl.readPixels(Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-				say("after p" + call.program + " target" + call.target + " centre=" + Array.from(px).join(",") + " err=" + gl.getError() + " fb=" + gl.checkFramebufferStatus(gl.FRAMEBUFFER));
-			}`
-		: "";
-	return `// Written by claude-brain. The frame below was recorded from the captured page's own
-// WebGL calls and is drawn again here: same geometry, same shaders, same uniforms.
-(() => {
-	const canvas = document.querySelector("canvas[data-hero-scene]");
-	if (!canvas) return;
+export function replayEssentials(frame: RippedFrame, keepSamples: boolean): Partial<RippedFrame> {
+	const { stream: _stream, locationNames: _names, intro, timeline, pointer, ...scene } = frame;
+	return keepSamples ? { ...scene, intro, timeline, pointer } : scene;
+}
 
-	fetch(${JSON.stringify(dataHref)})
-		.then((res) => res.json())
-		.then((frame) => run(frame))
-		.catch((err) => console.warn("[hero] the captured frame could not be loaded:", err));
+const RUNTIME_SOURCE = readFileSync(join(import.meta.dir, "runtime", "webgl-replay.js"), "utf-8");
 
-	function run(frame) {
-		${report}
-		const gl = (frame.webgl2 && canvas.getContext("webgl2", { alpha: true, antialias: true })) || canvas.getContext("webgl", { alpha: true, antialias: true });
-		if (!gl) return;
-
-		// Frozen: keep every uniform exactly as captured, including the clock, so this draws
-		// the one instant the rip recorded. That is the only way to compare a moving scene
-		// against a moving original and have the number mean something. Declared here because
-		// the motion, pointer and stream setup below all consult it.
-		const FREEZE = ${freeze ? "true" : "false"};
-
-		for (const name of frame.extensions || []) {
-			try { gl.getExtension(name); } catch (e) { /* not available in this browser */ }
-		}
-		// Float and half-float uploads have to arrive in the matching typed array, or the
-		// call is an INVALID_OPERATION however correct the bytes are.
-		const asPixels = (bytes, pixelType) => {
-			if (pixelType === 0x1406 /* FLOAT */) return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
-			if (pixelType === 0x140B /* HALF_FLOAT */ || pixelType === 0x8D61 /* HALF_FLOAT_OES */) {
-				return new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-			}
-			if (pixelType === 0x1405 /* UNSIGNED_INT */) return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
-			if (pixelType === 0x1403 /* UNSIGNED_SHORT */) return new Uint16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-			return bytes;
-		};
-
-		const decode = (base64) => {
-			const binary = atob(base64);
-			const bytes = new Uint8Array(binary.length);
-			for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-			return bytes;
-		};
-
-		// Each buffer's target is decided before anything is uploaded, because a WebGL buffer
-		// binds to one target for life: bind it to ARRAY_BUFFER and then to
-		// ELEMENT_ARRAY_BUFFER and the second bind is an INVALID_OPERATION that poisons every
-		// draw after it. Uploading everything as ARRAY_BUFFER first and "fixing up" the index
-		// buffers afterwards is exactly that mistake, and it renders a perfectly captured
-		// frame as a black rectangle with no failing call to point at.
-		const targetOf = new Map();
-		for (const draw of frame.draws) {
-			if (draw.indexBuffer) targetOf.set(draw.indexBuffer, gl.ELEMENT_ARRAY_BUFFER);
-			for (const ubo of draw.ubos || []) if (!targetOf.has(ubo.buffer)) targetOf.set(ubo.buffer, gl.UNIFORM_BUFFER);
-			for (const attrib of draw.attribs) if (!targetOf.has(attrib.buffer)) targetOf.set(attrib.buffer, gl.ARRAY_BUFFER);
-		}
-
-		const buffers = new Map();
-		for (const entry of frame.buffers) {
-			const target = targetOf.get(entry.id) || gl.ARRAY_BUFFER;
-			if (target === gl.UNIFORM_BUFFER && !gl.bindBufferBase) continue;
-			const buffer = gl.createBuffer();
-			gl.bindBuffer(target, buffer);
-			gl.bufferData(target, decode(entry.data), target === gl.UNIFORM_BUFFER ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
-			buffers.set(entry.id, buffer);
-		}
-
-		const textures = new Map();
-		for (const entry of frame.textures) {
-			const texture = gl.createTexture();
-			gl.bindTexture(gl.TEXTURE_2D, texture);
-			if (entry.data) {
-				// Straight back as it was uploaded, and allocated the way it was allocated:
-				// a texture the page made immutable with texStorage2D cannot be respecified
-				// with texImage2D.
-				const pixels = asPixels(decode(entry.data), entry.pixelType);
-				if (entry.storage && gl.texStorage2D) {
-					gl.texStorage2D(gl.TEXTURE_2D, 1, entry.internalFormat, entry.width, entry.height);
-					gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, entry.width, entry.height,
-						entry.format || gl.RGBA, entry.pixelType || gl.UNSIGNED_BYTE, pixels);
-				} else {
-					gl.texImage2D(gl.TEXTURE_2D, 0, entry.internalFormat || gl.RGBA, entry.width, entry.height, 0,
-						entry.format || gl.RGBA, entry.pixelType || gl.UNSIGNED_BYTE, pixels);
-				}
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, entry.wrapS || gl.CLAMP_TO_EDGE);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, entry.wrapT || gl.CLAMP_TO_EDGE);
-				// A float texture is only filterable where the extension says so.
-				const isFloat = entry.pixelType === 0x1406 || entry.pixelType === 0x140B || entry.pixelType === 0x8D61;
-				const filter = isFloat && !gl.getExtension("OES_texture_float_linear") ? gl.NEAREST : gl.LINEAR;
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
-				textures.set(entry.id, texture);
-				continue;
-			}
-			// One opaque pixel until the image decodes, so the first frames are not black.
-			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
-			const image = new Image();
-			image.onload = () => {
-				gl.bindTexture(gl.TEXTURE_2D, texture);
-				gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, entry.wrapS || gl.CLAMP_TO_EDGE);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, entry.wrapT || gl.CLAMP_TO_EDGE);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-			};
-			image.src = entry.source;
-			textures.set(entry.id, texture);
-		}
-
-		// Render targets, sized to the canvas and re-sized with it. A pass that drew into a
-		// framebuffer draws into one here too, and the pass that sampled it finds the result
-		// where it expects to.
-		// Each target keeps the size the page rendered it at, taken from the viewport of the
-		// pass that drew into it.
-		const targetSize = new Map();
-		for (const call of frame.draws) {
-			if (!call.target) continue;
-			const vp = call.state.viewport;
-			if (vp && vp[2] && vp[3]) targetSize.set(call.target, { width: vp[2], height: vp[3] });
-		}
-
-		const targets = new Map();
-		const sizeTargets = () => {
-			for (const entry of frame.framebuffers) {
-				let target = targets.get(entry.id);
-				if (!target) {
-					target = { fbo: gl.createFramebuffer(), tex: gl.createTexture() };
-					targets.set(entry.id, target);
-					textures.set(entry.colour, target.tex);
-				}
-				const size = targetSize.get(entry.id) || { width: canvas.width, height: canvas.height };
-				// Scaled with the canvas, and for the same reason. These are the passes that
-				// cost the most — a full-surface effect drawn at the size the capture happened
-				// to run at — so leaving them pinned there means shrinking the canvas buys
-				// almost nothing: measured at 1.6 MP against 0.27 MP, the frame rate moved by
-				// less than a fifth because the offscreen work never changed.
-				target.width = Math.max(1, Math.round(size.width * quality));
-				target.height = Math.max(1, Math.round(size.height * quality));
-				gl.bindTexture(gl.TEXTURE_2D, target.tex);
-				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, target.width, target.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-				gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
-				gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target.tex, 0);
-				// Depth, or the geometry pass draws itself in the wrong order.
-				if (!target.depth) target.depth = gl.createRenderbuffer();
-				gl.bindRenderbuffer(gl.RENDERBUFFER, target.depth);
-				gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, target.width, target.height);
-				gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, target.depth);
-			}
-			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-		};
-
-		const compile = (type, source) => {
-			const shader = gl.createShader(type);
-			gl.shaderSource(shader, source);
-			gl.compileShader(shader);
-			if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-				console.warn("[hero] shader:", gl.getShaderInfoLog(shader));
-				return null;
-			}
-			return shader;
-		};
-		const programs = new Map();
-		for (const entry of frame.programs) {
-			const vs = compile(gl.VERTEX_SHADER, entry.vertex);
-			const fs = compile(gl.FRAGMENT_SHADER, entry.fragment);
-			if (!vs || !fs) continue;
-			const program = gl.createProgram();
-			gl.attachShader(program, vs);
-			gl.attachShader(program, fs);
-			gl.linkProgram(program);
-			if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-				console.warn("[hero] link:", gl.getProgramInfoLog(program));
-				continue;
-			}
-			programs.set(entry.id, program);
-		}
-		say("setup: buffers=" + buffers.size + " programs=" + programs.size + " err=" + gl.getError());
-		if (programs.size === 0) return;
-
-		let aspectScale = 1;
-		// How much of the requested resolution this machine actually gets. A ripped scene is
-		// somebody else's shader budget running on hardware it was never measured against, so
-		// rather than pick a number, the loop times itself and settles where the frames land.
-		let quality = 1;
-		let sinceCheck = 0;
-		let checkStart = 0;
-		const adapt = (now) => {
-			if (!checkStart) { checkStart = now; return; }
-			sinceCheck++;
-			// Judged on elapsed time, not a frame count. A fixed number of frames means the
-			// machine that is struggling waits longest for help: at two frames a second a
-			// thirty-frame window is fifteen seconds of the lag we are trying to fix.
-			const elapsed = now - checkStart;
-			if (elapsed < 500 || sinceCheck < 5) return;
-			const fps = (sinceCheck * 1000) / elapsed;
-			sinceCheck = 0;
-			checkStart = now;
-			// Hysteresis either side of the target, so a scene that lands near the boundary
-			// settles instead of resizing every half second.
-			const before = quality;
-			if (fps < 40 && quality > 0.4) quality = Math.max(0.4, quality * 0.8);
-			else if (fps > 56 && quality < 1) quality = Math.min(1, quality * 1.1);
-			if (quality !== before) { fit(); sizeTargets(); }
-		};
-		const fit = () => {
-			const rect = canvas.getBoundingClientRect();
-			// Device pixel ratio is not the whole story. These scenes were captured from a hero
-			// box a few hundred pixels tall and are mostly full-surface shader passes, so cost
-			// is per pixel and the buffer is what decides whether this runs. Stretched to a
-			// 2560-wide window at ratio 2 that is a 14.7 megapixel buffer — and the offscreen
-			// targets are sized to match, so every pass pays it again. The original never draws
-			// a tenth of that. So the ratio is capped, and then the whole buffer is held under
-			// a pixel budget: a small canvas stays sharp, a full-screen one stops asking the
-			// GPU for work nobody can see.
-			const MAX_PIXELS = 2600000;
-			let dpr = Math.min(window.devicePixelRatio || 1, 2);
-			const wanted = rect.width * dpr * rect.height * dpr;
-			if (wanted > MAX_PIXELS) dpr *= Math.sqrt(MAX_PIXELS / wanted);
-			// The budget above is a guess about a machine we cannot see. This is the part that
-			// knows: quality is what the frame timer below has decided this GPU can hold, so a
-			// scene that is too expensive here gets smaller until it runs instead of staying
-			// sharp and dropping frames.
-			dpr *= quality;
-			canvas.width = Math.max(1, Math.round(rect.width * dpr));
-			canvas.height = Math.max(1, Math.round(rect.height * dpr));
-			gl.viewport(0, 0, canvas.width, canvas.height);
-			// The projection matrix was captured at the page's aspect ratio, and it is rebuilt
-			// for ours rather than scaled by a ratio. A perspective matrix holds f/aspect in
-			// [0] and f in [5], so the exact correction is [0] = [5] / aspect — which is what
-			// makes the scene compose the same way at any window shape instead of drifting.
-			aspectScale = canvas.width / (canvas.height || 1);
-		};
-		window.addEventListener("resize", () => { fit(); sizeTargets(); });
-		fit();
-		sizeTargets();
-
-		// --- the call stream -------------------------------------------------------
-		// Whatever the engine did between frames arrives as the calls it made. The captured
-		// frame establishes the state; the stream then applies the page's own per-frame
-		// changes on top, which is how motion the sampler never modelled comes back.
-		const handles = new Map();
-		for (const entry of frame.buffers) if (entry.handle) handles.set(entry.handle, buffers.get(entry.id));
-		for (const entry of frame.textures) if (entry.handle) handles.set(entry.handle, textures.get(entry.id));
-		for (const entry of frame.framebuffers) {
-			const target = targets.get(entry.id);
-			if (entry.handle && target) handles.set(entry.handle, target.fbo);
-		}
-		for (const entry of frame.programs) if (entry.handle) handles.set(entry.handle, programs.get(entry.id));
-
-		// A uniform location is per-program, so the stream's handle is resolved by looking the
-		// name up again on the program this replay compiled.
-		const locations = new Map();
-		for (const entry of frame.locationNames || []) {
-			const program = handles.get(entry.program);
-			if (!program) continue;
-			const location = gl.getUniformLocation(program, entry.name);
-			if (location) locations.set(entry.handle, location);
-		}
-
-		// A uniform location, an attribute slot and a block index are all fixed for the life
-		// of the program they belong to. The replay was asking the driver for them again for
-		// every uniform of every draw of every frame — on a scene with a few dozen draws that
-		// is tens of thousands of synchronous queries a second, and it is why a rebuilt hero
-		// crawled on hardware that runs the original at sixty. Asked once, then remembered.
-		const lookups = new WeakMap();
-		const lookup = (program, kind, name, resolve) => {
-			let store = lookups.get(program);
-			if (!store) { store = { uniform: new Map(), attrib: new Map(), block: new Map() }; lookups.set(program, store); }
-			const cached = store[kind];
-			if (!cached.has(name)) cached.set(name, resolve());
-			return cached.get(name);
-		};
-		const uniformLocation = (program, name) =>
-			lookup(program, "uniform", name, () => gl.getUniformLocation(program, name));
-		const attribLocation = (program, name) =>
-			lookup(program, "attrib", name, () => gl.getAttribLocation(program, name));
-		const blockIndex = (program, name) =>
-			lookup(program, "block", name, () => gl.getUniformBlockIndex(program, name));
-
-		const ARRAYS = {
-			Float32Array: Float32Array, Uint8Array: Uint8Array, Uint16Array: Uint16Array,
-			Uint32Array: Uint32Array, Int8Array: Int8Array, Int16Array: Int16Array, Int32Array: Int32Array,
-		};
-		const decodeArg = (arg) => {
-			if (arg === null || typeof arg === "number" || typeof arg === "boolean") return arg;
-			if (arg.drop) return null;
-			if (arg.data !== undefined) {
-				const bytes = decode(arg.data);
-				const Ctor = ARRAYS[arg.kind] || Uint8Array;
-				return Ctor === Uint8Array ? bytes : new Ctor(bytes.buffer, bytes.byteOffset, bytes.byteLength / Ctor.BYTES_PER_ELEMENT);
-			}
-			if (arg.handle !== undefined) {
-				// A location first — the two id spaces overlap and a uniform call always wants
-				// a location, never a buffer.
-				return locations.get(arg.handle) ?? handles.get(arg.handle) ?? null;
-			}
-			return null;
-		};
-
-		// The stream split into frames, so it can be played at the viewer's frame rate rather
-		// than all at once.
-		const streamFrames = [];
-		// Off unless asked for. Replaying raw calls against state this runtime set up is a
-		// sharper tool than it looks: one unresolved handle becomes a null argument, a null
-		// argument to bindBuffer unbinds the geometry, and the next frame draws a flat
-		// polygon where the scene was. It stays behind a switch until every call it makes can
-		// be resolved.
-		if (${useStream ? "true" : "false"} && !FREEZE && frame.stream && frame.stream.length) {
-			let current = [];
-			for (const call of frame.stream) {
-				if (call.f === "__frame") {
-					if (current.length) streamFrames.push(current);
-					current = [];
-					continue;
-				}
-				current.push(call);
-			}
-			if (current.length) streamFrames.push(current);
-		}
-
-		const playFrame = (calls) => {
-			for (const call of calls) {
-				const fn = gl[call.f];
-				if (typeof fn !== "function") continue;
-				// A call whose object this replay never created is skipped rather than made
-				// with a null in place of it: passing null to bindBuffer or useProgram is a
-				// valid call that unbinds, which corrupts everything drawn after it.
-				let resolvable = true;
-				for (const arg of call.a) {
-					if (arg && typeof arg === "object" && arg.handle !== undefined) {
-						if (!locations.has(arg.handle) && !handles.has(arg.handle)) resolvable = false;
-					}
-					if (arg && typeof arg === "object" && arg.drop) resolvable = false;
-				}
-				if (!resolvable) continue;
-				const args = call.a.map(decodeArg);
-				// A uniform or draw whose object went missing would throw; skipping it keeps
-				// the rest of the frame.
-				try { fn.apply(gl, args); } catch (e) { /* an argument this replay has no object for */ }
-			}
-		};
-
-		const started = performance.now();
-		const isClock = (name) => !FREEZE && /^(u_?)?(time|itime|elapsed|frame)$/i.test(name);
-		const isResolution = (name) => /resolution|viewportsize|screensize/i.test(name);
-		const isProjection = (name) => /projection/i.test(name);
-
-		const asNumber = (x) => (typeof x === "number" ? x : x === "Infinity" ? Infinity : x === "-Infinity" ? -Infinity : Number.NaN);
-
-		// What moves, and how. Every uniform is looked up across the captured samples; the
-		// ones that actually change get a little function of time, and the rest are constants
-		// set once. A value that only ever moves one way is extrapolated at the rate it was
-		// moving — which is exactly right for a drift and close enough for an ease — while
-		// anything that turns around is looped through its samples instead of being flung off
-		// to infinity.
-		// The entrance, then the loop. Each animated uniform gets the intro samples first and
-		// the settled ones after, so the replay arrives the way the page arrives instead of
-		// opening in its resting state.
-		const intro = new Map();
-		let introSpan = 0;
-		if (!FREEZE && frame.intro && frame.intro.length > 1) {
-			introSpan = frame.intro[frame.intro.length - 1].t || 0;
-			for (let d = 0; d < frame.draws.length; d++) {
-				for (const uniform of frame.draws[d].uniforms) {
-					const samples = [];
-					for (const entry of frame.intro) {
-						const found = (entry.uniforms[d] || []).find((u) => u.name === uniform.name);
-						if (found) samples.push({ t: entry.t, value: found.value.map(asNumber) });
-					}
-					if (samples.length < 2) continue;
-					let moves = false;
-					const first = samples[0].value;
-					const last = samples[samples.length - 1].value;
-					for (let i = 0; i < first.length; i++) if (Math.abs(last[i] - first[i]) > 1e-6) moves = true;
-					if (moves) intro.set(d + ":" + uniform.name, samples);
-				}
-			}
-		}
-
-		const alongSamples = (samples, at) => {
-			let index = 0;
-			while (index < samples.length - 2 && samples[index + 1].t < at) index++;
-			const a = samples[index];
-			const b = samples[index + 1] || a;
-			const gap = b.t - a.t || 1;
-			const mix = Math.min(1, Math.max(0, (at - a.t) / gap));
-			return a.value.map((v, i) => v + ((b.value[i] ?? v) - v) * mix);
-		};
-
-		const motion = new Map();
-		// The page's own clock, as it was at each sample. Animation on these pages is a
-		// function of that clock, not of wall time, so replaying against it is what makes the
-		// motion line up rather than merely move.
-		const clockAt = (uniformsForFrame) => {
-			for (const draw of uniformsForFrame || []) {
-				for (const u of draw || []) {
-					if (/^(u_?)?(time|itime|elapsed)$/i.test(u.name) && u.value.length === 1) return asNumber(u.value[0]);
-				}
-			}
-			return null;
-		};
-		if (!FREEZE && frame.timeline && frame.timeline.length > 1) {
-			const span = frame.timeline[frame.timeline.length - 1].t || 1;
-			for (let d = 0; d < frame.draws.length; d++) {
-				for (const uniform of frame.draws[d].uniforms) {
-					const samples = [];
-					for (const entry of frame.timeline) {
-						const found = (entry.uniforms[d] || []).find((u) => u.name === uniform.name);
-						if (found) samples.push({ t: entry.t, value: found.value.map(asNumber) });
-					}
-					if (samples.length < 2) continue;
-					const first = samples[0].value;
-					const last = samples[samples.length - 1].value;
-					let moves = false;
-					for (let i = 0; i < first.length; i++) if (Math.abs(last[i] - first[i]) > 1e-6) moves = true;
-					if (!moves) continue;
-					// Monotonic in every component, or not.
-					let monotonic = true;
-					for (let i = 0; i < first.length && monotonic; i++) {
-						let sign = 0;
-						for (let k = 1; k < samples.length; k++) {
-							const delta = samples[k].value[i] - samples[k - 1].value[i];
-							if (Math.abs(delta) < 1e-9) continue;
-							const s = delta > 0 ? 1 : -1;
-							if (sign && s !== sign) { monotonic = false; break; }
-							sign = s;
-						}
-					}
-					motion.set(d + ":" + uniform.name, { samples, span, monotonic });
-				}
-			}
-		}
-
-		// What the pointer drives. A uniform counts as pointer-driven when it differs across
-		// the cursor samples, which were all taken within a second of each other — so time
-		// cannot explain the difference and the cursor can.
-		const pointerMotion = new Map();
-		if (!FREEZE && frame.pointer && frame.pointer.length > 2) {
-			for (let d = 0; d < frame.draws.length; d++) {
-				for (const uniform of frame.draws[d].uniforms) {
-					const samples = [];
-					for (const stop of frame.pointer) {
-						const found = (stop.uniforms[d] || []).find((u) => u.name === uniform.name);
-						if (found) samples.push({ x: stop.x, y: stop.y, value: found.value.map(asNumber) });
-					}
-					if (samples.length < 3) continue;
-					let spread = 0;
-					for (let i = 0; i < samples[0].value.length; i++) {
-						let lo = Infinity;
-						let hi = -Infinity;
-						for (const sample of samples) {
-							lo = Math.min(lo, sample.value[i]);
-							hi = Math.max(hi, sample.value[i]);
-						}
-						spread = Math.max(spread, hi - lo);
-					}
-					if (spread > 1e-5) pointerMotion.set(d + ":" + uniform.name, samples);
-				}
-			}
-		}
-
-		// Where the viewer's cursor is, eased. The original follows the mouse with a spring;
-		// snapping straight to the raw position reads as jitter rather than as following.
-		const cursor = { x: 0.5, y: 0.5, toX: 0.5, toY: 0.5 };
-		if (pointerMotion.size > 0) {
-			window.addEventListener("pointermove", (event) => {
-				const rect = canvas.getBoundingClientRect();
-				if (!rect.width || !rect.height) return;
-				cursor.toX = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-				cursor.toY = Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height));
-			});
-		}
-
-		// Inverse-distance weighting over the sampled stops, which needs no assumption about
-		// how the cursor grid was laid out.
-		const valueForCursor = (samples) => {
-			let weightSum = 0;
-			const out = new Array(samples[0].value.length).fill(0);
-			for (const sample of samples) {
-				const dx = sample.x - cursor.x;
-				const dy = sample.y - cursor.y;
-				const distance = Math.sqrt(dx * dx + dy * dy);
-				if (distance < 1e-4) return sample.value.slice();
-				const weight = 1 / (distance * distance);
-				weightSum += weight;
-				for (let i = 0; i < out.length; i++) out[i] += sample.value[i] * weight;
-			}
-			for (let i = 0; i < out.length; i++) out[i] /= weightSum || 1;
-			return out;
-		};
-
-		const valueAt = (entry, seconds) => {
-			const { samples, span } = entry;
-			// Always within the range that was actually observed.
-			//
-			// Extrapolating a trend forwards seemed reasonable and is not: a value that was
-			// creeping upwards during the capture keeps creeping for as long as the page is
-			// open, so the backdrop's scale ran away until one flat polygon covered the
-			// screen. These scenes have an intro and then a loop; the samples are a window
-			// onto that, and running back and forth across the window stays inside values the
-			// page really produced.
-			const cycle = span || 1;
-			const phase = (seconds % (cycle * 2)) / cycle;
-			return alongSamples(samples, (phase <= 1 ? phase : 2 - phase) * cycle);
-		};
-
-		const setUniform = (program, uniform, seconds, drawIndex) => {
-			const location = uniformLocation(program, uniform.name);
-			if (!location) return;
-			// The cursor wins where it has a say: those samples were taken at one moment, so
-			// they describe the pointer's effect with time held still.
-			const key = drawIndex + ":" + uniform.name;
-			const arriving = seconds < introSpan ? intro.get(key) : null;
-			const follows = pointerMotion.get(key);
-			const moving = motion.get(key);
-			const value = arriving
-				? alongSamples(arriving, seconds)
-				: follows
-					? valueForCursor(follows)
-					: moving
-						? valueAt(moving, seconds - introSpan)
-						: uniform.value.map(asNumber);
-			if (isClock(uniform.name)) return gl.uniform1f(location, seconds);
-			if (!FREEZE && isResolution(uniform.name) && value.length >= 2) {
-				return value.length === 2
-					? gl.uniform2f(location, canvas.width, canvas.height)
-					: gl.uniform3f(location, canvas.width, canvas.height, 1);
-			}
-			// A sampler holds a texture unit, and the unit was bound before the draw from the
-			// recorded unit map. Setting the integer is all that is left.
-			if (uniform.texture) return gl.uniform1i(location, uniform.value[0] || 0);
-			if (/^uniformMatrix/.test(uniform.kind)) {
-				const matrix = value.slice();
-				if (!FREEZE && isProjection(uniform.name) && matrix.length === 16 && matrix[5]) {
-					// Perspective: [0] is f/aspect. Orthographic ([15] is 1 and [11] is 0) keeps
-					// its half-width instead, scaled the same way.
-					const orthographic = matrix[11] === 0 && matrix[15] === 1;
-					matrix[0] = orthographic ? matrix[5] / aspectScale : matrix[5] / aspectScale;
-				}
-				const size = Math.sqrt(matrix.length) | 0;
-				if (size === 4) return gl.uniformMatrix4fv(location, false, new Float32Array(matrix));
-				if (size === 3) return gl.uniformMatrix3fv(location, false, new Float32Array(matrix));
-				if (size === 2) return gl.uniformMatrix2fv(location, false, new Float32Array(matrix));
-				return;
-			}
-			const integer = /i$|iv$/.test(uniform.kind);
-			const setter = "uniform" + Math.min(Math.max(value.length, 1), 4) + (integer ? "i" : "f");
-			if (typeof gl[setter] === "function") gl[setter].apply(gl, [location].concat(value.slice(0, 4)));
-		};
-
-		let streamCursor = 0;
-		const draw = () => {
-			const seconds = (performance.now() - started) / 1000;
-			adapt(performance.now());
-			// Ease towards the pointer rather than snapping to it.
-			cursor.x += (cursor.toX - cursor.x) * 0.08;
-			cursor.y += (cursor.toY - cursor.y) * 0.08;
-			const first = frame.draws[0];
-			if (first) {
-				const clear = first.state.clearColor;
-				gl.clearColor(clear[0] || 0, clear[1] || 0, clear[2] || 0, clear[3] === undefined ? 1 : clear[3]);
-			}
-
-			// Each target is cleared once, the first time a pass draws into it this frame.
-			const cleared = new Set();
-			for (let callIndex = 0; callIndex < frame.draws.length; callIndex++) {
-				const call = frame.draws[callIndex];
-				const program = programs.get(call.program);
-				if (!program) continue;
-
-				const target = call.target ? targets.get(call.target) : null;
-				gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
-				// A render target has its own size — three.js renders transmission into a
-				// 1024×1024 buffer while the screen is 2400×1934 — so the viewport follows the
-				// pass rather than the canvas.
-				if (target) gl.viewport(0, 0, target.width, target.height);
-				else gl.viewport(0, 0, canvas.width, canvas.height);
-				if (!cleared.has(call.target)) {
-					cleared.add(call.target);
-					gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-				}
-
-				// Put the textures back in the units the page had them in, so every sampler in
-				// this program reads what it read originally — including the render target a
-				// previous pass just wrote.
-				for (const slot of call.units || []) {
-					const texture = textures.get(slot.texture);
-					if (!texture) continue;
-					gl.activeTexture(gl.TEXTURE0 + slot.unit);
-					gl.bindTexture(gl.TEXTURE_2D, texture);
-				}
-
-				gl.useProgram(program);
-
-				// Uniform blocks first: on WebGL2 the camera matrices live here, and a draw
-				// whose blocks are unbound is the difference between a scene and a black
-				// rectangle.
-				if (gl.bindBufferBase) {
-					for (const ubo of call.ubos || []) {
-						const buffer = buffers.get(ubo.buffer);
-						if (!buffer) continue;
-						if (ubo.size) gl.bindBufferRange(gl.UNIFORM_BUFFER, ubo.binding, buffer, ubo.offset, ubo.size);
-						else gl.bindBufferBase(gl.UNIFORM_BUFFER, ubo.binding, buffer);
-					}
-					for (const block of call.blocks || []) {
-						// The block index is only meaningful inside the program it came from,
-						// so it is looked up again by name wherever the page gave us one.
-						let index = block.block;
-						if (block.name && gl.getUniformBlockIndex) {
-							const found = blockIndex(program, block.name);
-							if (found !== gl.INVALID_INDEX) index = found;
-						}
-						try { gl.uniformBlockBinding(program, index, block.binding); } catch (e) { /* not this program's block */ }
-					}
-				}
-
-				if (call.state.depthTest) gl.enable(gl.DEPTH_TEST); else gl.disable(gl.DEPTH_TEST);
-				gl.depthMask(call.state.depthMask !== false);
-				if (call.state.depthFunc) gl.depthFunc(call.state.depthFunc);
-				if (call.state.blend) {
-					gl.enable(gl.BLEND);
-					if (call.state.blendSrcAlpha !== undefined) {
-						gl.blendFuncSeparate(call.state.blendSrc, call.state.blendDst, call.state.blendSrcAlpha, call.state.blendDstAlpha);
-					} else {
-						gl.blendFunc(call.state.blendSrc, call.state.blendDst);
-					}
-					if (call.state.blendEquation) gl.blendEquation(call.state.blendEquation);
-				} else gl.disable(gl.BLEND);
-				if (call.state.cullFace) {
-					gl.enable(gl.CULL_FACE);
-					if (call.state.cullMode) gl.cullFace(call.state.cullMode);
-					if (call.state.frontFace) gl.frontFace(call.state.frontFace);
-				} else gl.disable(gl.CULL_FACE);
-				if (call.state.colorMask && call.state.colorMask.length === 4) {
-					gl.colorMask(call.state.colorMask[0], call.state.colorMask[1], call.state.colorMask[2], call.state.colorMask[3]);
-				}
-
-				for (const attrib of call.attribs) {
-					const buffer = buffers.get(attrib.buffer);
-					if (!buffer) continue;
-					const location = attribLocation(program, attrib.name);
-					if (location < 0) continue;
-					gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-					gl.enableVertexAttribArray(location);
-					// A matrix attribute occupies one location per column. 35674/35675/35676 are
-					// FLOAT_MAT2/3/4; anything else is a plain vector in a single slot.
-					const columns = attrib.glslType === 35676 ? 4 : attrib.glslType === 35675 ? 3 : attrib.glslType === 35674 ? 2 : 1;
-					const size = columns > 1 ? columns : attrib.size;
-					for (let column = 0; column < columns; column++) {
-						const slot = location + column;
-						gl.enableVertexAttribArray(slot);
-						gl.vertexAttribPointer(slot, size, attrib.type, attrib.normalized, attrib.stride, attrib.offset + column * size * 4);
-						if (gl.vertexAttribDivisor) gl.vertexAttribDivisor(slot, attrib.divisor || 0);
-					}
-				}
-				for (const uniform of call.uniforms) setUniform(program, uniform, seconds, callIndex);
-
-				const instanced = call.instances > 0 || call.attribs.some((a) => a.divisor > 0);
-				const instances = call.instances > 0 ? call.instances : 1;
-				if (call.indexBuffer) {
-					const buffer = buffers.get(call.indexBuffer);
-					if (!buffer) continue;
-					gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffer);
-					if (instanced && gl.drawElementsInstanced) gl.drawElementsInstanced(call.mode, call.count, call.indexType, call.offset, instances);
-					else gl.drawElements(call.mode, call.count, call.indexType, call.offset);
-				} else if (instanced && gl.drawArraysInstanced) {
-					gl.drawArraysInstanced(call.mode, call.offset, call.count, instances);
-				} else {
-					gl.drawArrays(call.mode, call.offset, call.count);
-				}
-				${readback}
-			}
-			// One frame of the page's own calls per rendered frame, looping. The reference
-			// frame above put the state where the page had it; this moves it the way the page
-			// moved it.
-			if (streamFrames.length) {
-				playFrame(streamFrames[streamCursor % streamFrames.length]);
-				streamCursor++;
-			}
-			window.__reported = true;
-			requestAnimationFrame(draw);
-		};
-		requestAnimationFrame(draw);
-	}
-})();
-`;
+/**
+ * The script that draws the captured frame again, at the canvas's real size.
+ *
+ * The engine itself is src/runtime/webgl-replay.js, kept as a plain file so it reads as the
+ * code it is. What is generated here is only the wrapper: where the frame data lives, the
+ * switches, and the behaviour when there is one.
+ */
+export function replayRuntime(frame: RippedFrame, dataHref: string, options: ReplayOptions = {}): string {
+	const config = {
+		dataHref,
+		debug: Boolean(options.debug),
+		freeze: Boolean(options.freeze),
+		frame: options.inline ? replayEssentials(frame, !options.behaviour) : null,
+	};
+	return [
+		"// Written by claude-brain. The frame this draws was recorded from the captured page's own",
+		"// WebGL calls: same geometry, same shaders, same uniforms, same render targets.",
+		"(() => {",
+		`const HERO = ${JSON.stringify(config)};`,
+		options.behaviour ? `// ---- behaviour, ported from the page ----\n${options.behaviour}` : "",
+		RUNTIME_SOURCE,
+		"})();",
+		"",
+	].join("\n");
 }
 
 /** What the model is told when the frame was ripped. */
