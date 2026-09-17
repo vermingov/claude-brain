@@ -338,6 +338,84 @@ export function createDesignsTab(container) {
 	tools.append(search, reloadBtn);
 	head.appendChild(tools);
 
+	// --- What is running now -------------------------------------------------
+	//
+	// Capturing a page and rebuilding it take minutes inside the server, whether or not this
+	// tab is open. This is the window into that: what each job is doing, and how far in it is.
+	// It polls only while there is something to say, and stops while the tab is in the
+	// background, because a hidden tab asking every two seconds for the rest of the day is
+	// rude to a machine that is also running a browser.
+	const VERBS = { capture: "Reading", rebuild: "Rebuilding", describe: "Describing" };
+	const jobsPanel = el("section", "jobs-panel");
+	jobsPanel.hidden = true;
+	const jobsList = el("div", "jobs-list");
+	jobsPanel.append(text("h3", "jobs-title", "Working now"), jobsList);
+	let jobsTimer = null;
+	const jobRows = new Map();
+
+	function jobRow() {
+		const node = el("div", "job");
+		const spinner = el("span", "job-spinner");
+		const subject = text("span", "job-subject", "");
+		const elapsed = text("span", "job-elapsed", "");
+		const head = el("div", "job-head");
+		head.append(spinner, subject, elapsed);
+		const stage = text("p", "job-stage", "");
+		const bar = el("div", "job-bar");
+		const fill = el("div", "job-bar-fill");
+		bar.appendChild(fill);
+		node.append(head, stage, bar);
+		return {
+			node,
+			update(job) {
+				subject.textContent = `${VERBS[job.kind] ?? "Working on"} ${job.subject}`;
+				elapsed.textContent = `${Math.round(job.elapsedMs / 1000)}s`;
+				stage.textContent = job.detail ? `${job.stage} — ${job.detail}` : job.stage;
+				const pct = Math.round(job.progress * 100);
+				fill.style.width = `${pct}%`;
+				bar.setAttribute("aria-valuenow", String(pct));
+				bar.title = `${pct}% of the way through`;
+			},
+		};
+	}
+
+	function renderJobs(jobs) {
+		jobsPanel.hidden = jobs.length === 0;
+		for (const [id, row] of jobRows) {
+			if (!jobs.some((job) => job.id === id)) {
+				row.node.remove();
+				jobRows.delete(id);
+			}
+		}
+		for (const job of jobs) {
+			let row = jobRows.get(job.id);
+			if (!row) {
+				row = jobRow();
+				jobRows.set(job.id, row);
+				jobsList.appendChild(row.node);
+			}
+			row.update(job);
+		}
+	}
+
+	async function pollJobs() {
+		if (!live || document.hidden) return;
+		const out = await api("/api/jobs");
+		if (!live) return;
+		renderJobs(Array.isArray(out.jobs) ? out.jobs : []);
+	}
+
+	function startJobPolling() {
+		if (jobsTimer) return;
+		pollJobs();
+		jobsTimer = setInterval(pollJobs, 2000);
+	}
+
+	function stopJobPolling() {
+		clearInterval(jobsTimer);
+		jobsTimer = null;
+	}
+
 	const notices = el("div", "designs-notices");
 	head.appendChild(notices);
 
@@ -379,7 +457,7 @@ export function createDesignsTab(container) {
 	const grid = el("div", "designs-grid");
 	const empty = text("div", "designs-empty", "No designs yet.");
 	grid.appendChild(empty);
-	wrap.append(head, sources, both, grid);
+	wrap.append(head, jobsPanel, sources, both, grid);
 
 	const picker = el("input");
 	picker.type = "file";
@@ -964,14 +1042,22 @@ export function createDesignsTab(container) {
 		const wrap = el("div", "design-rebuild");
 		wrap.appendChild(text("h4", null, "The rebuild"));
 
-		if (row.recreate_status !== "built") {
+		// A rebuild that is being replaced is still a rebuild: the one already on disk stays on
+		// screen, with a line saying what is happening to it, rather than the drawer going blank
+		// for the four minutes the new one takes.
+		const replacing = row.recreate_status !== "built";
+		const previous = row.recreate_at > 0 && row.recreate_score > 0;
+		if (replacing) {
 			wrap.appendChild(text("p", "design-desc empty",
 				row.recreate_error ||
 				(row.recreate_status === "building"
 					? "Building the page again from its own code. It gets scored against the photograph when it renders."
 					: "Queued. This page gets built again from its own code, then scored against the photograph.")));
-			wrap.appendChild(rebuildActions(row));
-			return wrap;
+			if (!previous) {
+				wrap.appendChild(rebuildActions(row));
+				return wrap;
+			}
+			wrap.appendChild(text("p", "design-hint", "Until it lands, this is the one built before."));
 		}
 
 		const notes = rebuildNotes(row);
@@ -987,6 +1073,8 @@ export function createDesignsTab(container) {
 		if (notes?.model) {
 			wrap.appendChild(text("p", "design-hint", `Built by ${notes.model}. ${notes.why ?? ""}`.trim()));
 		}
+
+		wrap.appendChild(rebuildPreview(row));
 
 		const pair = el("div", "design-rebuild-pair");
 		for (const [src, caption] of [
@@ -1017,6 +1105,69 @@ export function createDesignsTab(container) {
 
 		wrap.appendChild(rebuildActions(row));
 		return wrap;
+	}
+
+	/**
+	 * The rebuilt page, running. Not a screenshot of it: the real document, with its own CSS
+	 * and the behaviour this brain recorded off the site, in a frame the server drops into an
+	 * opaque origin. It is built at the width it was captured at and scaled down to fit, so
+	 * what shows here is what the page looks like, not a reflow of it.
+	 *
+	 * Behind a button because a rebuild is a megabyte of markup and a runtime that starts
+	 * animating the moment it loads, and opening a design should not cost that unasked.
+	 */
+	function rebuildPreview(row) {
+		const block = el("div", "design-preview");
+		const id = encodeURIComponent(row.id);
+		const frameSrc = `/api/designs/${id}/recreation.html?v=${row.recreate_at}`;
+		const stage = el("div", "design-preview-stage");
+		stage.hidden = true;
+
+		const run = text("button", "settings-btn primary", "Run the rebuilt page");
+		run.type = "button";
+		run.onclick = () => {
+			if (!stage.hidden) {
+				stage.hidden = true;
+				stage.innerHTML = "";
+				run.textContent = "Run the rebuilt page";
+				return;
+			}
+			const frame = el("iframe", "design-preview-frame");
+			frame.src = frameSrc;
+			frame.loading = "lazy";
+			frame.title = `${titleOf(row)}, rebuilt`;
+			// The capture viewport. Everything below scales this rectangle into whatever room
+			// the drawer has, so the layout is the captured one at any drawer width.
+			frame.width = 1280;
+			frame.height = 800;
+			stage.appendChild(frame);
+			stage.hidden = false;
+			run.textContent = "Hide it";
+			fitPreview(stage, frame);
+		};
+
+		const open = text("a", "settings-btn ghost", "Open it full size");
+		open.href = frameSrc;
+		open.target = "_blank";
+		open.rel = "noopener";
+
+		const controls = el("div", "design-actions");
+		controls.append(run, open);
+		block.append(controls, stage);
+		return block;
+	}
+
+	/** Scale the captured 1280px page into the space the drawer actually has. */
+	function fitPreview(stage, frame) {
+		const apply = () => {
+			const width = stage.clientWidth || stage.getBoundingClientRect().width;
+			if (!width) return;
+			const scale = width / 1280;
+			frame.style.transform = `scale(${scale})`;
+			stage.style.height = `${Math.round(800 * scale)}px`;
+		};
+		apply();
+		if (typeof ResizeObserver === "function") new ResizeObserver(apply).observe(stage);
 	}
 
 	function rebuildActions(row) {
@@ -1210,23 +1361,37 @@ export function createDesignsTab(container) {
 		if (e.key === "Escape" && openId) closeDetail();
 	}
 
+	// A hidden tab is told nothing and asks nothing; coming back asks at once, because what
+	// the server was doing while it was away is the first thing worth knowing.
+	function onVisibility() {
+		if (document.hidden) stopJobPolling();
+		else if (live) {
+			startJobPolling();
+			refresh();
+		}
+	}
+
 	return {
 		show() {
 			live = true;
 			document.addEventListener("paste", onPaste);
 			document.addEventListener("keydown", onKeyDown);
+			document.addEventListener("visibilitychange", onVisibility);
 			window.addEventListener("dragover", blockDrop);
 			window.addEventListener("drop", blockDrop);
 			pollStalled = false;
+			startJobPolling();
 			refresh();
 		},
 		hide() {
 			live = false;
 			document.removeEventListener("paste", onPaste);
 			document.removeEventListener("keydown", onKeyDown);
+			document.removeEventListener("visibilitychange", onVisibility);
 			window.removeEventListener("dragover", blockDrop);
 			window.removeEventListener("drop", blockDrop);
 			stopPoll();
+			stopJobPolling();
 			closeDetail();
 		},
 	};

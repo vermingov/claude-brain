@@ -4,30 +4,32 @@
 // "generous spacing, restrained palette, confident type" about anything, and nothing in
 // the note says whether it actually understood how the page is put together. So for a
 // design captured from a URL, the brain does the one thing that cannot be faked: it
-// rebuilds the page from what it measured, renders the rebuild, and compares the two
-// pictures. The score is the receipt.
+// rebuilds the page, renders the rebuild, and compares the two pictures. The score is the
+// receipt.
 //
-// The rebuild is worth more than the receipt, though. What comes out is a single HTML file
-// that reaches that score using the site's own tokens — the real hexes, the real radii, the
-// real type scale — which is exactly the artefact an agent wants later when the user says
-// "build me something in that style". A paragraph of adjectives is a hint. A working page
-// is a reference implementation.
+// The rebuild is worth more than the receipt, though. What comes out is a page that reaches
+// that score using the site's own tokens — the real hexes, the real radii, the real type
+// scale — which is exactly the artefact an agent wants later when the user says "build me
+// something in that style". A paragraph of adjectives is a hint. A working page is a
+// reference implementation.
 //
-// The loop:
+// There are two ways to get one, and they are tried in that order:
 //
-//   1. Screenshot the live page (headless.ts). This also fixes a wart the URL capture had
-//      on its own: a board built from a link used to show the site's og:image — a logo
-//      card, usually — as its only picture. Now it shows the page.
-//   2. Ask the model for one self-contained document, given the measurements AND the shot.
-//   3. Render it at the same viewport, compare the two (design-compare.ts).
-//   4. If it missed and rounds remain, hand back both pictures, the score, and where the
-//      difference is, and ask for a revision. Keep whichever round scored best — a later
-//      round is not automatically better, and silently keeping the last one loses work the
-//      user already paid for.
+//   the page itself   the rendered DOM, every CSS rule that applies to it, the images and
+//                     fonts they point at, and what the page's own script does to that DOM
+//                     over time and under a pointer — taken rather than written, and played
+//                     back without any of the page's code (page-rebuild.ts). Exact where it
+//                     works, free, and one pass.
+//   a model           when no browser may go there, or the page cannot be read: one
+//                     self-contained document written from the measurements and the
+//                     screenshot, rendered, compared, and revised for as many rounds as the
+//                     user allows. Keep whichever round scored best — a later round is not
+//                     automatically better, and silently keeping the last one loses work the
+//                     user already paid for.
 //
-// Everything is bounded: rounds, per-call cost, render time, and the size of the document
-// the model may return. And every failure is a sentence on the row rather than a silence,
-// because this is a background job the user did not watch happen.
+// Everything in the second path is bounded: rounds, per-call cost, render time, and the size
+// of the document the model may return. And every failure is a sentence on the row rather
+// than a silence, because this is a background job the user did not watch happen.
 
 import { mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -52,6 +54,8 @@ import {
 	updateDesign,
 } from "./design-store";
 import { NO_BROWSER, findBrowser, screenshot } from "./headless";
+import { startJob } from "./jobs";
+import { rebuildPage } from "./page-rebuild";
 import { withPage } from "./cdp";
 import { type StoredAsset, collectAssets, renderAssetManifest, storeAssetBytes, storeVideoBytes } from "./design-assets";
 import { type PageSnapshot, SNAPSHOT_SCRIPT, renderSnapshot, trimSnapshotText } from "./page-snapshot";
@@ -341,6 +345,15 @@ export async function capturePageEvidence(url: string): Promise<PageEvidence> {
 		height: 0,
 	};
 	if (!findBrowser()) return { ...empty, detail: NO_BROWSER };
+	const job = startJob("capture", hostOf(url), "opening the page");
+	try {
+		return await readPage(url, empty, job);
+	} finally {
+		job.end();
+	}
+}
+
+async function readPage(url: string, empty: PageEvidence, job: ReturnType<typeof startJob>): Promise<PageEvidence> {
 
 	// The same gate the fetch went through, re-run for the browser: a URL that reached this
 	// far was vetted before it was read, but this is a second request made by a different
@@ -362,18 +375,23 @@ export async function capturePageEvidence(url: string): Promise<PageEvidence> {
 			});
 			// Lazy images below the fold are part of the design; a page that has never been
 			// scrolled shows grey boxes where they will be.
+			job.stage("scrolling it so nothing is still loading", 0.15);
 			await page.revealLazyContent();
+			job.stage("reading its markup and stylesheets", 0.3);
 			const snap = await page.evaluate<PageSnapshot>(SNAPSHOT_SCRIPT);
 			// Read after the page has been drawing for a while: a uniform is only recognisable
 			// as the clock once it has been written across a few dozen frames.
+			job.stage("looking at what it draws with WebGL", 0.42);
 			const webgl = await page.evaluate<WebglCapture>(WEBGL_READ_SCRIPT);
 			// A scene that needs its engine cannot be recompiled, so photograph what it
 			// actually does, frame by frame. Works whatever drew it — three.js, babylon, a
 			// hand-written loop — because it records the canvas rather than the code.
 			const frames: Uint8Array[] = [];
 			const surface = snap?.surfaces?.find((s) => s.kind === "canvas");
+			job.stage("photographing its moving background", 0.45);
 			if (webgl?.ok && !isQuadShader(webgl) && surface) {
 				for (let i = 0; i < FRAME_COUNT; i++) {
+					job.step(`frame ${i + 1} of ${FRAME_COUNT}`, 0.45 + 0.25 * (i / FRAME_COUNT));
 					const frame = await page.screenshot({
 						width: VIEWPORT.width,
 						height: VIEWPORT.height,
@@ -386,6 +404,7 @@ export async function capturePageEvidence(url: string): Promise<PageEvidence> {
 					await Bun.sleep(FRAME_INTERVAL_MS);
 				}
 			}
+			job.stage("photographing the page", 0.72);
 			const shot = await page.screenshot({ width: VIEWPORT.width, height: VIEWPORT.height });
 			// A canvas or a video is pixels with no rule behind it. Photograph each one on
 			// its own so the rebuild has the actual image to lay behind its hero, instead of
@@ -412,6 +431,7 @@ export async function capturePageEvidence(url: string): Promise<PageEvidence> {
 
 	// The pictures the page draws, fetched through the same guard as everything else. They
 	// are what turns a rebuild from a wireframe into the page.
+	job.stage("downloading the pictures it uses", 0.85);
 	const assets = await collectAssets(run.value.snap?.assets ?? []);
 	for (const still of run.value.stills) {
 		const stored = await storeAssetBytes(still.bytes, {
@@ -639,6 +659,104 @@ interface Round {
  * Rebuild one design, score it, keep the best round. Never throws for an expected outcome:
  * every dead end is a status and a sentence on the row.
  */
+/**
+ * How much of the page's behaviour one rebuild is allowed to watch. Smaller than the numbers a
+ * harness would use: this runs in a queue behind whatever else the user asked for.
+ */
+const REBUILD_EXPLORE = { idleFrames: 180, dwellFrames: 90, watchFrames: 600, patienceFrames: 300, revisitFrames: 900, probesPerScreen: 6 };
+
+/** Where the hero the capture wrote is kept once a rebuild has composed its own runtime over it. */
+function capturedHeroPath(id: string): string {
+	return join(RECREATE_DIR, `${id}.hero.capture.js`);
+}
+
+/**
+ * The moving background an earlier capture read off this page, if it read one: a shader we can
+ * recompile, or a player for the frames we photographed. It rides along in the rebuild's runtime
+ * and draws into the page's own canvas, so it is kept apart from the composed file it ends up in.
+ */
+async function capturedHero(id: string): Promise<{ runtime: string; marker: string } | undefined> {
+	const kept = Bun.file(capturedHeroPath(id));
+	const written = Bun.file(heroRuntimePath(id));
+	const runtime = (await (kept.size > 0 ? kept : written).text().catch(() => "")).trim();
+	if (!runtime) return undefined;
+	if (kept.size === 0) await Bun.write(capturedHeroPath(id), runtime);
+	// Each of these runtimes looks for its own element, and says so in its own text: a replayed
+	// scene wants canvas[data-hero-scene], a recompiled shader canvas[data-hero-shader], a player
+	// for photographed frames [data-hero-frames].
+	const marker = ["data-hero-scene", "data-hero-frames", "data-hero-shader"].find((name) => runtime.includes(name));
+	return marker ? { runtime, marker } : undefined;
+}
+
+/**
+ * The rebuild that is the page itself: its rendered DOM and every rule that applies to it, the
+ * resources they point at, and what its script does to that DOM over time and under a pointer —
+ * taken, not written (page-rebuild.ts). No model is asked anything, so there are no rounds and
+ * nothing to pay for, and the score at the end is a receipt rather than a target.
+ */
+async function rebuildFromPage(id: string, url: string): Promise<{ ok: boolean; detail: string }> {
+	const job = startJob("rebuild", hostOf(url), "opening the page");
+	try {
+		return await rebuildRun(id, url, job);
+	} finally {
+		job.end();
+	}
+}
+
+async function rebuildRun(id: string, url: string, job: ReturnType<typeof startJob>): Promise<{ ok: boolean; detail: string }> {
+	const result = await rebuildPage(url, {
+		runtimeHref: `${id}.hero.js`,
+		viewport: VIEWPORT,
+		explore: REBUILD_EXPLORE,
+		hero: await capturedHero(id),
+		onProgress: (stage, progress, detail) => job.stage(stage, progress, detail),
+	});
+	if ("error" in result) return { ok: false, detail: result.error };
+
+	await Bun.write(recreationHtmlPath(id), result.html);
+	await Bun.write(heroRuntimePath(id), result.runtime);
+	job.stage("rendering the rebuild", 0.96);
+	const shot = await screenshot({
+		url: `file://${recreationHtmlPath(id)}`,
+		out: recreationShotPath(id),
+		width: VIEWPORT.width,
+		height: VIEWPORT.height,
+		timeoutMs: SHOT_TIMEOUT_MS,
+		offline: !loadConfig().designs.recreateNetwork,
+	});
+	if (!shot.ok) return { ok: false, detail: `the rebuild could not be rendered — ${shot.reject}` };
+	await renderThumb(id);
+
+	job.stage("comparing it with the page", 0.98);
+	const comparison = await compareShots(referenceShotPath(id), recreationShotPath(id));
+	const { rules, assets, tapes, interactions, loops, ops, seconds } = result.stats;
+	const notes: RecreateNotes = {
+		approach: [
+			`${rules} of the page's own CSS rules, kept inside the media and container queries that held them`,
+			`${assets} images, videos and fonts downloaded and rewritten to local paths`,
+			`${ops} changes its script made to the page, recorded over ${seconds} s and filed into ${tapes} tapes${loops ? `, ${loops} of them looping` : ""}`,
+			interactions ? `${interactions} things that answer a hover or a click` : "nothing on the page answered a hover or a click",
+		],
+		uncertain: result.tapes.skipped ? Object.entries(result.tapes.skipped).map(([why, n]) => `${n} recorded changes dropped: ${why}`) : [],
+		model: "the page itself",
+		why: "A transplant needs no model: the DOM, the rules and the behaviour are the page's own.",
+		comparison: comparison.ok ? describeComparison(comparison) : (comparison.reject ?? "the two renders could not be compared"),
+		pixel: comparison.pixel,
+		layout: comparison.layout,
+		palette: comparison.palette,
+		rounds: comparison.ok ? [{ round: 1, score: comparison.score }] : [],
+	};
+	updateDesign(id, {
+		recreateStatus: "built",
+		recreateScore: Math.round((comparison.ok ? comparison.score : 0) * 1000),
+		recreateRounds: 1,
+		recreateNotes: JSON.stringify(notes),
+		recreateAt: Date.now(),
+		recreateError: comparison.ok ? "" : (comparison.reject ?? ""),
+	});
+	return { ok: true, detail: "" };
+}
+
 export async function recreateDesign(id: string): Promise<void> {
 	const row = getDesign(id);
 	if (!row) return;
@@ -672,6 +790,16 @@ export async function recreateDesign(id: string): Promise<void> {
 	}
 
 	updateDesign(id, { recreateStatus: "building", recreateError: "" });
+
+	// The page rebuilt from itself, first. It is exact where it works, costs nothing, and the
+	// model below — which writes a page from measurements — is what is left when it cannot run:
+	// a site that will not let a browser near it, a capture with no live URL.
+	const taken = await rebuildFromPage(id, urls[0]!.url);
+	if (taken.ok) {
+		console.log(`[designs] rebuilt ${id} from the page itself`);
+		return;
+	}
+	console.log(`[designs] ${id}: the page could not be transplanted (${taken.detail}) — asking a model instead`);
 
 	// Rebuilding a page is the heaviest thing this package asks a model to do, so it is
 	// the one job that reaches for the best model the user's plan affords — and steps back

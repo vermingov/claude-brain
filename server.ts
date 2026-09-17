@@ -48,6 +48,7 @@ import {
 } from "./src/design-store";
 import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
+import { activeJobs } from "./src/jobs";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
 import { findEpisodes, forgetEpisode } from "./src/episodic";
@@ -1024,6 +1025,10 @@ const serveOptions = {
 		if (url.pathname === "/api/designs" || url.pathname.startsWith("/api/designs/")) {
 			return handleDesigns(url, req, post);
 		}
+
+		// What is running now. Polled while a card is waiting on something, so it says what
+		// that something is doing rather than only that it has not finished.
+		if (url.pathname === "/api/jobs") return jsonResponse({ jobs: activeJobs() });
 
 		if (url.pathname === "/api/status") return jsonResponse(await fullStatus());
 		if (url.pathname === "/api/overview") return jsonResponse(overview());

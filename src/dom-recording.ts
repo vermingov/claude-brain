@@ -375,6 +375,8 @@ export interface ExploreOptions {
 	revisitFrames?: number;
 	/** How many elements per screen are hovered and clicked. 0 skips interaction. */
 	probesPerScreen?: number;
+	/** Called as the page is driven, with what is happening and how far through it is. */
+	onProgress?: (stage: string, progress: number, detail?: string) => void;
 }
 
 /**
@@ -384,12 +386,14 @@ export interface ExploreOptions {
  */
 export async function explore(page: Page, options: ExploreOptions): Promise<DomRecording | null> {
 	const { viewport } = options;
+	const say = options.onProgress ?? (() => {});
 	const idle = options.idleFrames ?? 300;
 	const dwell = options.dwellFrames ?? 120;
 	const step = Math.round(viewport.height * (options.stepShare ?? 0.6));
 	// Frames at sixty a second, waited in real time.
 	const advance = (frames: number) => Bun.sleep(Math.round((frames * 1000) / 60));
 
+	say("settling at the top of the page", 0);
 	await advance(idle);
 	const height = (await page.evaluate<number>("document.documentElement.scrollHeight")) ?? viewport.height;
 	// Down the page, staying with a screen while something new is moving in it. New matters: a star
@@ -403,6 +407,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	const busy: Array<{ y: number; changes: number }> = [];
 	let elsewhere = 0;
 	for (let y = step; y < height; y += step) {
+		say("reading down the page", 0.05 + 0.5 * (y / height), `${Math.round((y / height) * 100)}% of the way down`);
 		await page.evaluate(`window.scrollTo(0, ${y}); true`);
 		const arrival = await opsLength();
 		const band = `${y}, ${y + viewport.height}`;
@@ -426,6 +431,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		if (waited >= watch) busy.push({ y, changes });
 	}
 	await advance(dwell);
+	say("reading back up", 0.56);
 	for (let y = height; y > 0; y -= step * 2) {
 		await page.evaluate(`window.scrollTo(0, ${Math.max(0, y)}); true`);
 		await advance(Math.round(dwell / 2));
@@ -435,7 +441,9 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 
 	// Whatever was still going when the sweep gave up on it gets one longer look, busiest first.
 	const revisit = options.revisitFrames ?? 1_800;
-	for (const { y } of busy.sort((a, b) => b.changes - a.changes).slice(0, 3)) {
+	const watching = busy.sort((a, b) => b.changes - a.changes).slice(0, 3);
+	for (const [index, { y }] of watching.entries()) {
+		say("watching what is still moving", 0.62 + 0.1 * (index / Math.max(1, watching.length)), `${index + 1} of ${watching.length}`);
 		await page.evaluate(`window.scrollTo(0, ${y}); true`);
 		await advance(revisit);
 	}
@@ -455,6 +463,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		});
 		await page.send("Fetch.enable", { patterns: [{ resourceType: "Document", requestStage: "Request" }] });
 		probing: for (let y = 0; y < height; y += viewport.height) {
+			say("hovering and clicking what looks interactive", 0.72 + 0.27 * (y / height), `${Math.round((y / height) * 100)}% of the way down`);
 			await page.evaluate(`window.scrollTo(0, ${y}); true`);
 			// Whatever this screen reveals on arrival plays out before anything is touched.
 			await advance(120);
@@ -493,6 +502,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	}
 	await advance(30);
 
+	say("reading the recording out of the page", 0.99);
 	const json = await readLarge(
 		page,
 		`(() => { const r = window.__domRecorder; r.on = false; return { base: r.base, end: Date.now(), viewport: { width: innerWidth, height: innerHeight }, ops: r.ops, scroll: r.scroll, rects: r.rects, dropped: r.dropped }; })()`,

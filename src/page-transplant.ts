@@ -374,12 +374,13 @@ async function domSettled(page: Page, timeoutMs = 12_000): Promise<void> {
 }
 
 /**
- * Put the replay engine's canvas where the ripped scene's canvas was. The page's own attributes
- * go — its buffer size and its engine's markers belong to a renderer that is not coming — except
- * the class, which the page's CSS positions it by. A canvas that filled its container is sized
- * to fill it again; one that did not keeps the size its renderer gave it.
+ * Hand one of the page's canvases to whatever will draw in it — the replay engine, a shader read
+ * off the page — by the marker that thing looks for. The page's own attributes go: its buffer size
+ * and its engine's markers belong to a renderer that is not coming. The class stays, because the
+ * page's CSS positions the canvas by it. A canvas that filled its container is sized to fill it
+ * again; one that did not keeps the size its renderer gave it.
  */
-export function withHeroCanvas(body: string, index: number): string {
+export function withHeroCanvas(body: string, index: number, marker = "data-hero-scene"): string {
 	return body.replace(/<canvas\b([^>]*)>\s*<\/canvas>/gi, (whole, attrs: string) => {
 		const number = /\sdata-brain-canvas="(\d+)"/.exec(attrs)?.[1];
 		if (Number(number) !== index) return whole.replace(/\sdata-brain-(canvas|fills)(="[^"]*")?/g, "");
@@ -387,8 +388,16 @@ export function withHeroCanvas(body: string, index: number): string {
 		const style = /\sdata-brain-fills/.test(attrs)
 			? "display: block; width: 100%; height: 100%;"
 			: (/\sstyle="([^"]*)"/.exec(attrs)?.[1] ?? "display: block;");
-		return `<canvas data-hero-scene${cls ? ` class="${cls}"` : ""} style="${style}"></canvas>`;
+		return `<canvas ${marker}${cls ? ` class="${cls}"` : ""} style="${style}"></canvas>`;
 	});
+}
+
+/** Which canvas a hero belongs in: the one that filled its container, else the first. */
+export function heroCanvasIndex(body: string): number {
+	const filling = /<canvas\b[^>]*\sdata-brain-canvas="(\d+)"[^>]*\sdata-brain-fills/i.exec(body) ?? /<canvas\b[^>]*\sdata-brain-fills[^>]*\sdata-brain-canvas="(\d+)"/i.exec(body);
+	if (filling) return Number(filling[1]);
+	const first = /<canvas\b[^>]*\sdata-brain-canvas="(\d+)"/i.exec(body);
+	return first ? Number(first[1]) : -1;
 }
 
 /** url() relative to a sheet, made absolute, so the text means the same thing anywhere. */

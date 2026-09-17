@@ -13,7 +13,7 @@
 import { withPage } from "./cdp";
 import { type DomRecording, type ExploreOptions, RECORDER_SCRIPT, explore } from "./dom-recording";
 import { type DomTapes, buildTapes, eachTapeOp } from "./dom-tapes";
-import { assembleTransplant, captureTransplant, pageScriptText, withHeroCanvas } from "./page-transplant";
+import { assembleTransplant, captureTransplant, heroCanvasIndex, pageScriptText, withHeroCanvas } from "./page-transplant";
 import { SKIP_DRAWS } from "./parity-hooks";
 import { type RippedFrame, rebuildRuntime } from "./webgl-ripper";
 
@@ -27,7 +27,15 @@ export interface PageRebuildOptions {
 	viewport?: { width: number; height: number };
 	/** A scene ripped from this page, and which of the page's canvases it was drawn into. */
 	scene?: { frame: RippedFrame; behaviour?: string; canvas: number };
+	/**
+	 * Something else that draws the page's moving background — a shader read off it in an earlier
+	 * visit, a player for photographed frames — as the script that draws it and the marker its
+	 * canvas needs. Appended after the tapes, in the same runtime file.
+	 */
+	hero?: { runtime: string; marker: string; canvas?: number };
 	explore?: Partial<Omit<ExploreOptions, "viewport">>;
+	/** Called through the whole rebuild, with what is happening and how far through it is. */
+	onProgress?: (stage: string, progress: number, detail?: string) => void;
 }
 
 export interface PageRebuild {
@@ -42,13 +50,23 @@ export interface PageRebuild {
 export async function rebuildPage(url: string, options: PageRebuildOptions): Promise<PageRebuild | { error: string }> {
 	const started = Date.now();
 	const viewport = options.viewport ?? VIEWPORT;
+	// The stages, and the share of the whole each one ends at. Watching the page is most of it.
+	const say = options.onProgress ?? (() => {});
+	const WATCHING = { from: 0.15, to: 0.75 };
 	const visit = await withPage(async (page) => {
 		await page.addInitScript(SKIP_DRAWS);
 		await page.addInitScript(RECORDER_SCRIPT);
+		say("opening the page", 0.02, url);
 		await page.goto(url, { ...viewport, loadTimeoutMs: LOAD_TIMEOUT_MS, afterSettleMs: SETTLE_MS });
+		say("reading its DOM and every rule that applies to it", 0.06);
 		const transplant = await captureTransplant(page);
 		if (!transplant?.ok) return { transplant, recording: null, scriptText: "" };
-		const recording = await explore(page, { viewport, ...options.explore });
+		const recording = await explore(page, {
+			viewport,
+			...options.explore,
+			onProgress: (stage, progress, detail) => say(stage, WATCHING.from + (WATCHING.to - WATCHING.from) * progress, detail),
+		});
+		say("reading the page's own scripts", 0.77);
 		return { transplant, recording, scriptText: await pageScriptText(page) };
 	});
 	if (!visit.ok) return { error: visit.reject };
@@ -56,11 +74,19 @@ export async function rebuildPage(url: string, options: PageRebuildOptions): Pro
 	if (!transplant?.ok) return { error: transplant?.note || "the page could not be read" };
 	if (!recording) return { error: "the page's behaviour could not be recorded" };
 
+	say("working out what set each change off", 0.8, `${recording.ops.length} changes recorded`);
 	const tapes = buildTapes(recording);
 	const scene = options.scene;
+	const hero = options.hero;
+	const markHero = (body: string) => {
+		if (scene) return withHeroCanvas(body, scene.canvas, "data-hero-scene");
+		if (!hero) return body;
+		const canvas = hero.canvas ?? heroCanvasIndex(body);
+		return canvas >= 0 ? withHeroCanvas(body, canvas, hero.marker) : body;
+	};
 	const built = await assembleTransplant(transplant, {
 		scriptText,
-		transformBody: scene ? (body) => withHeroCanvas(body, scene.canvas) : undefined,
+		transformBody: scene || hero ? markHero : undefined,
 		tail: `<script src="${options.runtimeHref}"></script>`,
 	});
 
@@ -76,10 +102,14 @@ export async function rebuildPage(url: string, options: PageRebuildOptions): Pro
 		}
 	};
 	eachTapeOp(tapes, (op) => rewrite(op, true));
+	say("downloading what the page points at", 0.86, `${resources.assets.length} files so far`);
 	await resources.download();
 	eachTapeOp(tapes, (op) => rewrite(op, false));
+	say("writing the page and its runtime", 0.95, `${tapes.tapes.length} tapes, ${tapes.interactions.length} things that answer a pointer`);
 
-	const runtime = rebuildRuntime({ tapes, scene: scene ? { frame: scene.frame, behaviour: scene.behaviour } : undefined });
+	const runtime = [rebuildRuntime({ tapes, scene: scene ? { frame: scene.frame, behaviour: scene.behaviour } : undefined }), hero?.runtime ?? ""]
+		.filter(Boolean)
+		.join("\n");
 	const loops = tapes.tapes.filter((t) => t.loop).length + tapes.tapes.reduce((n, t) => n + t.episodes.filter((e) => e.loop).length, 0);
 	return {
 		html: built.html,

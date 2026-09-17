@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { askJson, status as claudeStatus, describeImagesJson, sessionSpendUsd, spendTodayUsd } from "./claude-cli";
 import { loadConfig, vaultReady, vaultRoot } from "./config";
+import { startJob } from "./jobs";
 import { type DesignSpec, normalizeSpec, writeDesignNote } from "./design-note";
 import { type DesignRow, type DesignSource, getDesign, imagePath, listSources, renderPath, sourcePath, updateDesign } from "./design-store";
 import { maybeRecreate } from "./design-recreate";
@@ -377,6 +378,15 @@ function stalled(id: string): boolean {
 export async function extractDesign(id: string): Promise<void> {
 	const row = getDesign(id);
 	if (!row) return;
+	const job = startJob("describe", row.name || row.source_name || "a design", "looking at it");
+	try {
+		await describeDesign(row, id, job);
+	} finally {
+		job.end();
+	}
+}
+
+async function describeDesign(row: DesignRow, id: string, job: ReturnType<typeof startJob>): Promise<void> {
 	if (row.attempts >= MAX_ATTEMPTS && row.status === "failed") return;
 	// Already described, and a description is a paid thing. Every caller that means "do this
 	// again" — retryExtraction, a re-upload of a dead-ended design — resets the status first,
@@ -471,7 +481,12 @@ export async function extractDesign(id: string): Promise<void> {
 			armWake(Date.now());
 			return;
 		}
-		fail(row, "the vision call did not come back with a usable description");
+		// The call ran and was billed, and what came back could not be read as a description.
+		// Say which attempt that was and when the next one is, because "failed" on its own
+		// reads as final when it is not.
+		const attempt = row.attempts + 1;
+		const again = attempt <= BACKOFF_MS.length ? ` — trying again in ${Math.round(BACKOFF_MS[attempt - 1]! / 60000)} min` : "";
+		fail(row, `${cfg.llm.model} looked at it but did not describe it (attempt ${attempt} of ${MAX_ATTEMPTS})${again}`);
 		return;
 	}
 
