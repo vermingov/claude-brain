@@ -11,7 +11,7 @@
 // everything else is waiting on.
 
 import { withPage } from "./cdp";
-import { type DomRecording, type ExploreOptions, RECORDER_SCRIPT, explore } from "./dom-recording";
+import { type DomRecording, type ExploreOptions, PAGE_CLOCK, RECORDER_SCRIPT, explore } from "./dom-recording";
 import { type DomTapes, buildTapes, eachTapeOp } from "./dom-tapes";
 import { assembleTransplant, captureTransplant, heroCanvasIndex, pageScriptText, withHeroCanvas } from "./page-transplant";
 import { SKIP_DRAWS } from "./parity-hooks";
@@ -55,6 +55,7 @@ export async function rebuildPage(url: string, options: PageRebuildOptions): Pro
 	const WATCHING = { from: 0.15, to: 0.75 };
 	const visit = await withPage(async (page) => {
 		await page.addInitScript(SKIP_DRAWS);
+		await page.addInitScript(PAGE_CLOCK);
 		await page.addInitScript(RECORDER_SCRIPT);
 		say("opening the page", 0.02, url);
 		await page.goto(url, { ...viewport, loadTimeoutMs: LOAD_TIMEOUT_MS, afterSettleMs: SETTLE_MS });

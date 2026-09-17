@@ -81,6 +81,76 @@ window.__brainWalk = window.__brainWalk || (function () {
 `;
 
 /**
+ * The page's clock, run at sixty frames a second whatever this machine manages.
+ *
+ * A capture renders in software, on a machine that is also running everything else, and a page of
+ * any weight comes out at twenty or thirty frames a second — unevenly. Everything recorded off it
+ * is sampled at that rate, so the rebuild moves the way the capture struggled: the stutter is in
+ * the data, and no amount of care at playback invents the frames that were never taken.
+ *
+ * So the page is given a clock of its own. Animation frames are queued rather than run, and one
+ * step of exactly a sixtieth of a second is handed out per real frame; `performance.now`,
+ * `Date.now`, `setTimeout` and `setInterval` all read and schedule against that step. The page
+ * then believes it is running at sixty frames a second and its own maths says so — its easing, its
+ * timers, its every-frame writes — and what the recorder stamps is an even sixty-a-second grid.
+ * Wall time is only how long the capture takes, which on a slow machine is longer than the page
+ * time it bought; that is the trade, and it is the right way round.
+ *
+ * CSS animations and transitions keep the engine's own clock, which is fine: they are not recorded
+ * at all, they are transplanted as the rules they are, and they run natively in the rebuild.
+ */
+export const PAGE_CLOCK = String.raw`(() => {
+	if (window.__pageClock) return;
+	const STEP = 1000 / 60;
+	const realRaf = window.requestAnimationFrame.bind(window);
+	const realNow = performance.now.bind(performance);
+	const started = Date.now();
+	const clock = { now: realNow(), frame: 0, queue: new Map(), next: 1, timers: new Map(), timerId: 1 };
+	window.__pageClock = clock;
+
+	performance.now = () => clock.now;
+	Date.now = () => started + clock.now;
+	window.requestAnimationFrame = (cb) => {
+		const id = clock.next++;
+		clock.queue.set(id, cb);
+		return id;
+	};
+	window.cancelAnimationFrame = (id) => clock.queue.delete(id);
+
+	const schedule = (fn, delay, args, repeat) => {
+		const id = clock.timerId++;
+		clock.timers.set(id, { at: clock.now + Math.max(0, Number(delay) || 0), every: repeat ? Math.max(1, Number(delay) || 0) : 0, fn, args });
+		return id;
+	};
+	window.setTimeout = (fn, delay, ...args) => schedule(fn, delay, args, false);
+	window.setInterval = (fn, delay, ...args) => schedule(fn, delay, args, true);
+	window.clearTimeout = (id) => clock.timers.delete(id);
+	window.clearInterval = (id) => clock.timers.delete(id);
+
+	const pump = () => {
+		realRaf(pump);
+		clock.now += STEP;
+		clock.frame++;
+		// Timers first: a page that schedules work for "now" expects it before the frame it drew for.
+		for (const [id, timer] of Array.from(clock.timers)) {
+			if (timer.at > clock.now) continue;
+			if (timer.every) timer.at = clock.now + timer.every;
+			else clock.timers.delete(id);
+			try {
+				if (typeof timer.fn === "function") timer.fn.apply(null, timer.args);
+				else if (typeof timer.fn === "string") (0, eval)(timer.fn);
+			} catch (e) { /* the page's own timer threw; it would have thrown anyway */ }
+		}
+		const frame = clock.queue;
+		clock.queue = new Map();
+		for (const cb of frame.values()) {
+			try { cb(clock.now); } catch (e) { /* likewise */ }
+		}
+	};
+	realRaf(pump);
+})()`;
+
+/**
  * Installed before the page's own scripts. It wraps what a MutationObserver cannot see — a value
  * typed into an input, a scroll offset set from script, an animation started through the Web
  * Animations API — and waits. `window.__domRecorder.start()` is called by the transplant at the
@@ -90,8 +160,27 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 	if (window.__domRecorder) return;
 	${CANON_WALKER}
 	const MAX_OPS = 250000;
-	const recorder = { on: false, ops: [], ids: new WeakMap(), next: 0, scroll: [], rects: [], dropped: 0 };
+	const recorder = { on: false, ops: [], ids: new WeakMap(), next: 0, scroll: [], rects: [], dropped: 0, listens: new WeakMap() };
 	window.__domRecorder = recorder;
+
+	// Which elements are actually interactive, asked of the page rather than guessed from its
+	// styling. A cursor and a role are a guess — and a poor one for a component that puts its
+	// handlers on a plain div — while a listener for a pointer is the page saying so itself.
+	// Installed before any of the page's own script, which is the only moment it can be.
+	const POINTERISH = /^(click|pointerdown|pointerup|pointermove|pointerover|pointerenter|mousedown|mouseup|mousemove|mouseover|mouseenter|touchstart|touchmove|dragstart|wheel)$/;
+	const addListener = EventTarget.prototype.addEventListener;
+	EventTarget.prototype.addEventListener = function (type, listener, options) {
+		try {
+			if (POINTERISH.test(String(type)) && this instanceof Element) {
+				const kinds = recorder.listens.get(this) || new Set();
+				kinds.add(String(type));
+				recorder.listens.set(this, kinds);
+			}
+		} catch (e) {
+			/* a page that hands us something strange as a target */
+		}
+		return addListener.apply(this, arguments);
+	};
 	// The wall clock. performance.now may be a harness's virtual clock, and a page's timers and
 	// transitions — most of what moves its DOM — do not run on that.
 	const now = () => Date.now();
@@ -204,7 +293,13 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 	};
 
 	// The harness says what it is about to do, so the changes that follow can be filed under it.
-	recorder.mark = (kind, id) => { if (recorder.on) recorder.ops.push([now(), "m", id, kind]); };
+	// A mark for a pointer sample carries where the pointer was inside the element, in thousandths
+	// of its box, which is what makes the changes that follow a function of position rather than
+	// of time.
+	recorder.mark = (kind, id, u, v) => {
+		if (!recorder.on) return;
+		recorder.ops.push(u === undefined ? [now(), "m", id, kind] : [now(), "m", id, kind, u, v]);
+	};
 	// Elements a person could plausibly interact with, on screen now, as ids. Links that go
 	// somewhere and submit buttons are left alone: following them would end the recording. A link
 	// to a fragment stays — tabs are often exactly that.
@@ -212,9 +307,12 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 		const found = [];
 		const seen = new Set();
 		recorder.targets = new Map();
-		const candidates = document.querySelectorAll('[role=tab], [role=button], [aria-controls], [aria-expanded], [aria-selected], [data-state], button, summary, [tabindex="0"], label');
+		// What the page told us listens for a pointer comes first, then the usual shapes of a
+		// control, then anything the cursor says is clickable.
+		const listening = Array.from(document.querySelectorAll("body *")).filter((el) => recorder.listens.has(el));
+		const candidates = document.querySelectorAll('[role=tab], [role=button], [role=radio], [role=slider], [role=switch], [role=option], [aria-controls], [aria-expanded], [aria-selected], [aria-checked], [data-state], button, summary, input, select, [tabindex="0"], label');
 		const pointer = Array.from(document.querySelectorAll("body *")).filter((el) => el.childElementCount < 6 && getComputedStyle(el).cursor === "pointer");
-		for (const el of [...Array.from(candidates), ...pointer]) {
+		for (const el of [...listening, ...Array.from(candidates), ...pointer]) {
 			if (found.length >= limit) break;
 			if (seen.has(el)) continue;
 			seen.add(el);
@@ -504,8 +602,25 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	const idle = options.idleFrames ?? 300;
 	const dwell = options.dwellFrames ?? 120;
 	const step = Math.round(viewport.height * (options.stepShare ?? 0.6));
-	// Frames at sixty a second, waited in real time.
-	const advance = (frames: number) => Bun.sleep(Math.round((frames * 1000) / 60));
+	// Waits are counted in the page's own frames, not in seconds of ours. With the page clock
+	// installed (PAGE_CLOCK) a frame is a sixtieth of the page's second however long this machine
+	// takes to draw it, so "two seconds of this demo" means two seconds of the demo.
+	const clockFrame = async () => (await page.evaluate<number>("window.__pageClock ? window.__pageClock.frame : -1")) ?? -1;
+	const onItsOwnClock = (await clockFrame()) >= 0;
+	const advance = async (frames: number) => {
+		if (!onItsOwnClock) {
+			await Bun.sleep(Math.round((frames * 1000) / 60));
+			return;
+		}
+		const until = (await clockFrame()) + frames;
+		// However slow the machine is, the page gets its frames — but not for ever, in case the
+		// page stops drawing altogether.
+		const deadline = Date.now() + Math.max(20_000, frames * 200);
+		while (Date.now() < deadline) {
+			if ((await clockFrame()) >= until) return;
+			await Bun.sleep(25);
+		}
+	};
 
 	say("settling at the top of the page", 0);
 	await advance(idle);
@@ -632,6 +747,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 					0.72 + 0.27 * Math.min(1, probed.size / Math.max(1, targets.length)),
 					`${probed.size} of ${targets.length} on this screen`,
 				);
+				const before = await opsLength();
 				await page.evaluate(`window.__domRecorder.mark("hover", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y: cy });
 				await settle(12, 120);
@@ -644,6 +760,52 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 				await settle(24, 300);
 				await page.evaluate(`window.__domRecorder.mark("end", ${hit}); true`);
 				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: away.x, y: away.y });
+				// What the thing does as the pointer moves over it, and as it is dragged. A page that
+				// answers where the pointer is — a button that leans towards it, a blob that follows
+				// it, a slider that tracks it — cannot be replayed from one recorded click: what it
+				// does is a function of position, so the position is swept and each sample marked
+				// with it. The rebuild interpolates between them (dom-surfaces.ts).
+				// Only what answered at all. Something that did nothing when hovered and nothing when
+				// clicked will do nothing across a lattice either, and most of a page is that.
+				const answered = (await opsLength()) > before;
+				const box = answered
+					? await page.evaluate<[number, number, number, number] | null>(
+							`(() => { const el = window.__domRecorder.targets.get(${hit}); if (!el || !el.isConnected) return null; const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height].map(Math.round); })()`,
+						)
+					: null;
+				if (box && box[2] >= 16 && box[3] >= 16) {
+					const [bx, by, bw, bh] = box;
+					const spot = (u: number, v: number) => [Math.round(bx + bw * u), Math.round(by + bh * v)] as const;
+					for (const v of [0.15, 0.5, 0.85]) {
+						for (const u of [0.15, 0.5, 0.85]) {
+							const [px, py] = spot(u, v);
+							if (px < 1 || py < 1 || px > viewport.width - 2 || py > viewport.height - 2) continue;
+							await page.evaluate(`window.__domRecorder.mark("at", ${hit}, ${Math.round(u * 1000)}, ${Math.round(v * 1000)}); true`);
+							await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: px, y: py });
+							await advance(10);
+						}
+					}
+					// And the same across a drag, which is the other thing a pointer does.
+					const steps = 8;
+					const [sx, sy] = spot(0.12, 0.5);
+					await page.evaluate(`window.__domRecorder.mark("grab", ${hit}, 120, 500); true`);
+					await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: sx, y: sy });
+					await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x: sx, y: sy, button: "left", clickCount: 1 });
+					await advance(10);
+					for (let step = 1; step <= steps; step++) {
+						const u = 0.12 + (0.76 * step) / steps;
+						const [px, py] = spot(u, 0.5);
+						await page.evaluate(`window.__domRecorder.mark("drag", ${hit}, ${Math.round(u * 1000)}, 500); true`);
+						await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: px, y: py, button: "left", buttons: 1 });
+						await advance(8);
+					}
+					const [ex, ey] = spot(0.88, 0.5);
+					await page.evaluate(`window.__domRecorder.mark("drop", ${hit}, 880, 500); true`);
+					await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: ex, y: ey, button: "left", clickCount: 1 });
+					await settle(12, 120);
+					await page.evaluate(`window.__domRecorder.mark("end", ${hit}); true`);
+					await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: away.x, y: away.y });
+				}
 				// A probe puts the page back as it found it. One click opening a dialog is the end of
 				// the visit otherwise: everything behind it stops answering to a pointer, and the rest
 				// of the page — seventy of the seventy-five things on it — never gets touched.

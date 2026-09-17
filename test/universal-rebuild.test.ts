@@ -195,6 +195,59 @@ describe("scene source", () => {
 	});
 });
 
+describe("pointer surfaces", () => {
+	test("what a control does as the pointer crosses it becomes a surface, with the numbers pulled out", async () => {
+		const { surfacesOf, split } = await import("../src/dom-surfaces");
+		expect(split("translate(12px, -4.5px)")).toEqual({
+			shape: { parts: ["translate(", "px, ", "px)"], count: 2 },
+			numbers: [12, -4.5],
+		});
+		// The pointer swept across node 7; node 8 leaned towards it, and its own style did not move.
+		const ops: Array<[number, ...unknown[]]> = [];
+		const spots: Array<[number, number]> = [
+			[150, 150],
+			[500, 150],
+			[850, 500],
+			[500, 850],
+		];
+		for (let i = 0; i < spots.length; i++) {
+			const [u, v] = spots[i]!;
+			ops.push([1000 + i * 100, "m", 7, "at", u, v]);
+			ops.push([1010 + i * 100, "a", 8, "style", `transform: translate(${u / 100}px, ${v / 100}px)`, ""]);
+			ops.push([1020 + i * 100, "a", 9, "class", "still", "still"]);
+		}
+		const { surfaces, sampled } = surfacesOf({ ops });
+		expect(surfaces.length).toBe(1);
+		expect(surfaces[0]!).toMatchObject({ over: 7, target: 8, kind: "a", name: "style", on: "move" });
+		expect(surfaces[0]!.samples.map((s) => s.numbers)).toEqual([
+			[1.5, 1.5],
+			[5, 1.5],
+			[8.5, 5],
+			[5, 8.5],
+		]);
+		// The sampled ops are held back from the tapes: they answer the harness's pointer, not time.
+		expect(sampled.size).toBe(8);
+	});
+
+	test("a drag across it is its own surface, and a value that never moves is not one", async () => {
+		const { surfacesOf } = await import("../src/dom-surfaces");
+		const ops: Array<[number, ...unknown[]]> = [
+			[1000, "m", 7, "grab", 120, 500],
+			[1010, "a", 8, "style", "left: 10px", ""],
+			[1100, "m", 7, "drag", 400, 500],
+			[1110, "a", 8, "style", "left: 40px", ""],
+			[1200, "m", 7, "drag", 700, 500],
+			[1210, "a", 8, "style", "left: 70px", ""],
+			[1300, "m", 7, "drag", 880, 500],
+			[1310, "a", 8, "style", "left: 88px", ""],
+			[1320, "a", 9, "style", "opacity: 1", ""],
+		];
+		const { surfaces } = surfacesOf({ ops });
+		expect(surfaces.map((s) => [s.target, s.on])).toEqual([[8, "drag"]]);
+		expect(surfaces[0]!.samples.length).toBe(4);
+	});
+});
+
 describe("behaviour tapes", () => {
 	// A page 3000px tall in an 800px viewport: a hero on screen at load, a demo at 1800px.
 	// Node 0 is the hero, 1 a star inside it, 2 the demo, 3 the demo's input, 4 a text run in it.
@@ -374,6 +427,6 @@ describe("behaviour tapes", () => {
 		const { rebuildRuntime } = await import("../src/webgl-ripper");
 		expect(() => new Function(CANON_WALKER)).not.toThrow();
 		expect(() => new Function(RECORDER_SCRIPT)).not.toThrow();
-		expect(() => new Function(rebuildRuntime({ tapes: { tapes: [], interactions: [], skipped: {} } }))).not.toThrow();
+		expect(() => new Function(rebuildRuntime({ tapes: { tapes: [], interactions: [], surfaces: [], skipped: {} } }))).not.toThrow();
 	});
 });

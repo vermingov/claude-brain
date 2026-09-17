@@ -40,6 +40,7 @@
 import type { DomRecording } from "./dom-recording";
 import { type ComponentTree, componentTree, scrollReactions, visibilityOf } from "./dom-geometry";
 import { interactionsOf } from "./dom-interactions";
+import { type Surface, surfacesOf } from "./dom-surfaces";
 import { PLAYED_LENGTH, type RecordedOp, type TapeOp, played, stateKey } from "./dom-ops";
 
 export type { TapeOp };
@@ -70,6 +71,8 @@ export interface Interaction {
 export interface DomTapes {
 	tapes: Tape[];
 	interactions: Interaction[];
+	/** What answers the pointer's position rather than the clock (dom-surfaces.ts). */
+	surfaces: Surface[];
 	/** Recorded changes that were dropped, and why, for the notes. */
 	skipped: Record<string, number>;
 }
@@ -102,6 +105,10 @@ export function buildTapes(recording: DomRecording): DomTapes {
 
 	const skipped: Record<string, number> = {};
 	const skip = (why: string) => (skipped[why] = (skipped[why] ?? 0) + 1);
+	// What the pointer sweeps drew out of the page is a surface, not a sequence: it is held apart
+	// here so the tapes below do not replay a harness's own pointer path as if it were the page
+	// moving by itself.
+	const { surfaces, sampled } = surfacesOf(recording);
 	const { interactions, claimed } = interactionsOf(recording, tree);
 
 	const reactive = scrollReactions(recording, tree, visibility, claimed);
@@ -110,7 +117,7 @@ export function buildTapes(recording: DomRecording): DomTapes {
 	const undisturbed = recording.ops.find((op) => op[1] === "m")?.[0] ?? end;
 	const byAnchor = new Map<string, { anchor: number; threshold: number; ops: RecordedOp[] }>();
 	for (const op of recording.ops) {
-		if (op[1] === "m" || claimed.has(op)) continue;
+		if (op[1] === "m" || claimed.has(op) || sampled.has(op)) continue;
 		const [, kind, target] = op as [number, string, number];
 		if (kind === "c" && target === -1) {
 			skip("changes to the body's own children");
@@ -150,7 +157,7 @@ export function buildTapes(recording: DomRecording): DomTapes {
 		if (threshold > 0) tape.threshold = threshold;
 		tapes.push(tape);
 	}
-	return { tapes, interactions, skipped };
+	return { tapes, interactions, surfaces, skipped };
 }
 
 /**

@@ -117,6 +117,58 @@ export class Page {
 		}
 	}
 
+	/**
+	 * Put the page on a clock of its own, and hand it time in slices.
+	 *
+	 * A capture runs in a headless browser rendering in software, which cannot keep sixty frames a
+	 * second on a page of any weight. Everything recorded off it is then sampled at whatever rate
+	 * that machine managed — twenty a second, unevenly — and a rebuild made from those samples
+	 * moves the way the capture struggled rather than the way the page runs.
+	 *
+	 * Virtual time fixes it at the source: the browser advances the page's clock only when the page
+	 * has finished with the moment it is on, so an animation gets every frame it asked for, timers
+	 * fire when the page thinks they should, and the recording comes back dense and evenly spaced.
+	 * It is also faster than real time on a light page, because nothing waits for a display.
+	 */
+	async startVirtualTime(): Promise<boolean> {
+		try {
+			await this.send("Emulation.setVirtualTimePolicy", { policy: "pause" });
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Let the page live for `ms` of its own time, and come back when it has spent them. */
+	async grantVirtualTime(ms: number): Promise<void> {
+		const budget = Math.max(1, Math.round(ms));
+		await new Promise<void>((resolve) => {
+			let done = false;
+			const finish = () => {
+				if (done) return;
+				done = true;
+				off();
+				clearTimeout(timer);
+				resolve();
+			};
+			const off = this.on("Emulation.virtualTimeBudgetExpired", finish);
+			// A page that never goes idle would otherwise hold the visit open for ever; real time is
+			// the backstop, generously, since virtual time is usually the faster of the two.
+			const timer = setTimeout(finish, Math.max(10_000, budget * 4));
+			this.send("Emulation.setVirtualTimePolicy", {
+				policy: "pauseIfNetworkFetchesPending",
+				budget,
+				// Without this, a page whose timers keep queueing more timers never lets the clock move.
+				maxVirtualTimeTaskStarvationCount: 100_000,
+			}).catch(finish);
+		});
+	}
+
+	/** Give the page back to the wall clock. */
+	async stopVirtualTime(): Promise<void> {
+		await this.send("Emulation.setVirtualTimePolicy", { policy: "advance" }).catch(() => ({}));
+	}
+
 	/** Call `listener` with each event of this protocol method; the returned function stops it. */
 	on(method: string, listener: (params: Record<string, unknown>) => void): () => void {
 		const set = this.listeners.get(method) ?? new Set();
