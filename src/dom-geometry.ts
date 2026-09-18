@@ -12,6 +12,26 @@ import { type RecordedOp, stateKey } from "./dom-ops";
 const COMPONENT_HEIGHT = 1.2;
 /** A change this soon after the page scrolled was the page reacting to the scroll. */
 const SCROLL_REACTION_MS = 300;
+/**
+ * How near the viewport already counts as in view, when nothing more exact is known.
+ *
+ * A page rarely waits for an element to be strictly on screen before starting it: an observer with
+ * a rootMargin sets a card going as it comes up, so by the time it is visible the animation is
+ * already under way. Judged against the viewport alone, all of that happened before the card was
+ * ever seen, and a whole entry animation is filed as page-load behaviour that the rebuild then
+ * plays to nobody. The rebuild's own observer is given the same margin, so the two agree.
+ */
+export const LEAD_PX = 300;
+/**
+ * How much of a thing has to have been on screen for that to count as a visit.
+ *
+ * Coming down a page a screen at a time, a card can be cut by the bottom of the screen at one stop
+ * and by the top at the next, and so be passed by without ever being shown. Pages notice: a demo
+ * that waits to be properly in view does nothing through such a visit. Counted as a visit anyway,
+ * it becomes the first thing a rebuild plays when a reader arrives — the nothing that was recorded
+ * — while what the page really does on arrival waits for a second visit that never comes.
+ */
+const SHOWN_SHARE = 0.9;
 
 export interface ComponentTree {
 	parentOf(id: number): number;
@@ -66,6 +86,16 @@ export function componentTree(recording: DomRecording): ComponentTree {
 	return { parentOf, anchorOf, box, stableId, baselineNodes: recording.rects.length };
 }
 
+/**
+ * The share of an element an observer has to be given for it to answer when the element is properly
+ * shown — which for anything taller than the screen is less than all of it, because all of it never
+ * shows at once.
+ */
+export const shownThreshold = (box: [number, number], vh: number) => {
+	const height = box[1] - box[0];
+	return height <= vh ? SHOWN_SHARE : Math.min(0.95, (vh * SHOWN_SHARE) / height);
+};
+
 export type Visibility = ReturnType<typeof visibilityOf>;
 
 /** When an anchor was on screen, and what the page was doing to the scroll around a moment. */
@@ -81,7 +111,16 @@ export function visibilityOf(recording: DomRecording, tree: ComponentTree) {
 	};
 	/** How much of a box is showing with the page scrolled to y, from 0 to 1. */
 	const shareShowing = (box: [number, number], y: number) => Math.max(0, Math.min(box[1], y + vh) - Math.max(box[0], y)) / (box[1] - box[0]);
-	const inView = (box: [number, number], y: number, threshold: number) => (threshold > 0 ? shareShowing(box, y) >= threshold : shareShowing(box, y) > 0);
+	/** How much of a box was showing, as a share of it — or of the screen, when it is the larger. */
+	const shown = (box: [number, number], y: number) => {
+		const height = box[1] - box[0];
+		const visible = Math.max(0, Math.min(box[1], y + vh) - Math.max(box[0], y));
+		return height <= vh ? visible / height : visible / vh;
+	};
+	// A threshold says how much of the box the page itself waited for, and is taken at its word.
+	// Without one, coming up on the viewport is near enough.
+	const inView = (box: [number, number], y: number, threshold: number) =>
+		threshold > 0 ? shareShowing(box, y) >= threshold : shown(box, y) >= SHOWN_SHARE;
 	const visibleAt = (anchor: number, t: number, threshold: number): boolean => anchor === -1 || inView(tree.box.get(anchor)!, scrollAt(t), threshold);
 	/** Where the page was scrolled from and to, when t came right after a scroll; null otherwise. */
 	const scrolledJustBefore = (t: number): [number, number] | null => {
@@ -101,7 +140,7 @@ export function visibilityOf(recording: DomRecording, tree: ComponentTree) {
 		}
 		return out;
 	};
-	return { episodesOf, scrolledJustBefore, shareShowing };
+	return { episodesOf, scrolledJustBefore, shareShowing, showing: shownThreshold };
 }
 
 /**

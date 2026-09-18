@@ -14,7 +14,19 @@ function startDomPlayer(data) {
 	const interactions = data.interactions || [];
 	if (!tapes.length && !interactions.length && !(data.surfaces && data.surfaces.length)) return;
 	// What the player has done, for anyone checking a rebuild from devtools or a harness.
-	const state = (window.__brainPlayer = { tapes: tapes.length, observed: 0, entered: 0, exited: 0, applied: 0, missing: 0, failed: 0, interactions: 0, loops: 0, pointer: 0 });
+	const state = (window.__brainPlayer = { tapes: tapes.length, observed: 0, entered: 0, exited: 0, applied: 0, missing: 0, failed: 0, interactions: 0, loops: 0, pointer: 0, unanchored: 0, detached: 0, entries: [] });
+	// Long literals a page repeated — a photograph inside a style rule, the same gradient on every
+	// frame — are carried once and referred to by name (dom-packing.ts). The names are letters, not
+	// digits, so the interpolation below reads straight past them.
+	const words = data.dictionary || [];
+	const MARK = /\u0001([a-z]+)\u0001/g;
+	const at = (name) => {
+		let n = 0;
+		for (let i = 0; i < name.length; i++) n = n * 26 + (name.charCodeAt(i) - 96);
+		return n - 1;
+	};
+	const expand = (value) =>
+		typeof value === "string" && value.indexOf("\u0001") >= 0 ? value.replace(MARK, (whole, name) => { const word = words[at(name)]; return word === undefined ? whole : word; }) : value;
 	const nodes = new Map();
 	const idOf = new WeakMap();
 	const number = (root, first) =>
@@ -64,7 +76,10 @@ function startDomPlayer(data) {
 	const valueOf = (op) => (op[1] === "t" ? op[3] : op[1] === "a" || op[1] === "p" ? op[4] : null);
 	const keyOf = (op) => (op[1] === "a" || op[1] === "p" ? op[1] + ":" + op[2] + ":" + op[3] : op[1] === "t" ? "t:" + op[2] : null);
 	/** The longest gap still worth carrying a value across; past this it was a jump, not motion. */
-	const GLIDE_MS = 900;
+	const GLIDE_MS = 120;
+	// Below this the next sample is already the viewer's next frame, so carrying the value across
+	// writes sixty times a second to arrive where the very next op was going to put it anyway.
+	const FRAME_MS = 20;
 
 	// Each ops list is looked at once: which op continues which, and what their numbers are.
 	const glides = new WeakMap();
@@ -83,7 +98,8 @@ function startDomPlayer(data) {
 			const before = last.get(key);
 			if (before !== undefined) {
 				const from = plan.shape.get(before);
-				if (from && sameShape(from, shape) && ops[i][0] - ops[before][0] <= GLIDE_MS) plan.next.set(before, i);
+				const gap = ops[i][0] - ops[before][0];
+				if (from && sameShape(from, shape) && gap > FRAME_MS && gap <= GLIDE_MS) plan.next.set(before, i);
 			}
 			last.set(key, i);
 		}
@@ -117,24 +133,27 @@ function startDomPlayer(data) {
 			return;
 		}
 		state.applied++;
+		// Written to, but not to anything anyone can see: the node was replaced out of the document
+		// and this change belongs to an older numbering of the same subtree.
+		if (node.isConnected === false) state.detached++;
 		try {
 			if (kind === "a") {
 				if (node.nodeType !== 1 || node.tagName === "CANVAS") return;
 				if (op[4] === null) node.removeAttribute(op[3]);
-				else node.setAttribute(op[3], op[4]);
+				else node.setAttribute(op[3], expand(op[4]));
 			} else if (kind === "t") {
-				if (node.nodeType === 3) node.data = op[3];
+				if (node.nodeType === 3) node.data = expand(op[3]);
 			} else if (kind === "p") {
 				if (op[3] === "scrollTop" || op[3] === "scrollLeft") node[op[3]] = Number(op[4]);
 				else if (op[3] === "checked") node.checked = op[4] === "true";
-				else node[op[3]] = op[4];
+				else node[op[3]] = expand(op[4]);
 			} else if (kind === "w") {
 				const options = Object.assign({}, op[4]);
 				for (const key of ["iterations", "duration"]) if (options[key] === "Infinity") options[key] = Infinity;
 				if (node.animate) node.animate(op[3], options);
 			} else if (kind === "c") {
 				if (node === document.body || node.tagName === "CANVAS") return;
-				const markup = op[3] === null ? transplanted.get(op[2]) : op[3];
+				const markup = op[3] === null ? transplanted.get(op[2]) : expand(op[3]);
 				if (markup === undefined) return;
 				if (node.setHTMLUnsafe) node.setHTMLUnsafe(markup);
 				else node.innerHTML = markup;
@@ -338,7 +357,12 @@ function startDomPlayer(data) {
 			continue;
 		}
 		const element = nodes.get(tape.anchor);
-		if (!element || element.nodeType !== 1 || typeof IntersectionObserver === "undefined") continue;
+		// A tape whose anchor is not in this document can never play; counted rather than dropped in
+		// silence, because that is indistinguishable from a component that simply does nothing.
+		if (!element || element.nodeType !== 1 || typeof IntersectionObserver === "undefined") {
+			state.unanchored++;
+			continue;
+		}
 		let entries = 0;
 		let inside = false;
 		let running = null;
@@ -361,6 +385,8 @@ function startDomPlayer(data) {
 			if (inside) {
 				entries++;
 				state.entered++;
+				// Which component started when, for anyone asking why a rebuild sat still.
+				state.entries.push([Math.round(performance.now()), tape.anchor, episode.enter.length]);
 				running = play(episode.enter, episode.loop);
 			} else if (episode) {
 				state.exited++;
@@ -369,7 +395,9 @@ function startDomPlayer(data) {
 				running = null;
 				play(episode.exit);
 			}
-		}, { threshold: threshold > 0 ? [0, threshold] : 0 }).observe(element);
+					// The margin the tapes were built with (dom-geometry LEAD_PX): a page that starts a card
+			// as it comes up is answered here as it comes up too.
+		}, { threshold: threshold > 0 ? [0, threshold] : 0, rootMargin: threshold > 0 ? "0px" : "300px" }).observe(element);
 		state.observed++;
 	}
 }

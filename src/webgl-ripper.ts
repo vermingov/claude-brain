@@ -37,6 +37,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CANON_WALKER } from "./dom-recording";
+import { packTapes } from "./dom-packing";
+import type { DomTapes } from "./dom-tapes";
 
 /** Ceilings. A hero scene is a few megabytes; anything past this is a game. */
 const MAX_TOTAL_BUFFER_BYTES = 24 * 1024 * 1024;
@@ -1216,10 +1218,14 @@ const DOM_PLAYER_SOURCE = readFileSync(join(import.meta.dir, "runtime", "dom-pla
  * the replay engine when the page had a scene. Both are this package's code; what they are given
  * is data — tapes, a frame, and a behaviour that has been through the port's checks.
  */
-export function rebuildRuntime(options: { tapes?: unknown; scene?: { frame: RippedFrame; behaviour?: string } }): string {
+export function rebuildRuntime(options: { tapes?: DomTapes; scene?: { frame: RippedFrame; behaviour?: string } }): string {
 	const parts = ["// Written by claude-brain: the rebuild's runtime."];
 	if (options.tapes) {
-		parts.push("(() => {", CANON_WALKER, DOM_PLAYER_SOURCE, `startDomPlayer(${JSON.stringify(options.tapes)});`, "})();");
+		// What the page repeated is carried once and named (dom-packing.ts); the player puts it back.
+		const tapes = options.tapes as DomTapes;
+		const dictionary = packTapes(tapes);
+		const data = JSON.stringify({ ...tapes, dictionary });
+		parts.push("(() => {", CANON_WALKER, DOM_PLAYER_SOURCE, `startDomPlayer(${data});`, "})();");
 	}
 	if (options.scene) parts.push(replayRuntime(options.scene.frame, "", { inline: true, behaviour: options.scene.behaviour }));
 	return parts.join("\n");

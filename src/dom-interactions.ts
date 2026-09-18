@@ -82,13 +82,18 @@ export function interactionsOf(recording: DomRecording, tree: ComponentTree) {
 		}
 		const node = op[2] as number;
 		const anchor = tree.anchorOf(node);
-		if (probe && !moving(nodeRhythm.get(node), t) && (within(node, probe.component) || !moving(anchorRhythm.get(anchor), t))) {
-			probe.ops.push(op);
-			claimed.add(op);
-			continue;
-		}
+		// Asked before the beat is recorded, so "already moving" is judged against the node's past
+		// rather than against this change.
+		const mine = !!probe && !moving(nodeRhythm.get(node), t) && (within(node, probe.component) || !moving(anchorRhythm.get(anchor), t));
+		// Every change is a beat, including the ones an input is given. What a node does is a fact
+		// about the node; leaving the claimed ones out lets a probe swallow a thing's first change
+		// and then, its rhythm never advancing, the rest of them for as long as the page runs.
 		beat(nodeRhythm, node, t);
 		beat(anchorRhythm, anchor, t);
+		if (mine) {
+			probe!.ops.push(op);
+			claimed.add(op);
+		}
 	}
 
 	const state = stateTimeline(recording, tree);

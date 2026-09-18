@@ -201,7 +201,10 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 				const read = () => (name === "scrollTop" || name === "scrollLeft" ? Math.round(d.get.call(this)) : String(d.get.call(this)));
 				const before = id !== undefined ? read() : undefined;
 				d.set.call(this, value);
-				if (id !== undefined) push(["p", id, name, read(), before]);
+				// Where the page itself is scrolled to belongs to whoever is reading the rebuild. The
+				// harness moves down the page to see it; recorded, that is replayed as the page
+				// snatching the view away from under them.
+				if (id !== undefined && this !== recorder.scroller) push(["p", id, name, read(), before]);
 			},
 		}));
 	};
@@ -230,7 +233,7 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 		"scroll",
 		(event) => {
 			const el = event.target;
-			if (!recorder.on || !el || el === document || el === document.documentElement || el === window) return;
+			if (!recorder.on || !el || el === document || el === document.documentElement || el === window || el === recorder.scroller) return;
 			const id = idOf(el);
 			if (id === undefined) return;
 			let state = scrolled.get(id);
@@ -437,23 +440,59 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 		}
 	};
 
+	// What actually scrolls. A page is not always the thing that moves: an app shell pins the
+	// document to the viewport and scrolls a panel inside it, and then window.scrollY never leaves
+	// zero, scrollTo does nothing, and a capture that trusts either sees the first screen and calls
+	// it the whole page. So the scroller is found once and everything — how tall the page is, where
+	// a box sits on it, where it is now — is asked of that.
+	recorder.scrollerOf = () => {
+		const root = document.scrollingElement || document.documentElement;
+		if (root && root.scrollHeight > root.clientHeight + 40) return root;
+		let best = null;
+		for (const el of document.querySelectorAll("*")) {
+			if (el.scrollHeight <= el.clientHeight + 40) continue;
+			const overflow = getComputedStyle(el).overflowY;
+			if (overflow !== "auto" && overflow !== "scroll") continue;
+			const box = el.getBoundingClientRect();
+			// The one that carries the page, not a list box in a corner of it.
+			const covers = Math.min(box.width, innerWidth) * Math.min(box.height, innerHeight);
+			if (covers < innerWidth * innerHeight * 0.4) continue;
+			if (!best || el.scrollHeight > best.scrollHeight) best = el;
+		}
+		return best || root;
+	};
+	/** How far down the page is now, and how far it can go, whatever is doing the scrolling. */
+	recorder.scrollTop = () => (recorder.scroller === document.scrollingElement ? scrollY : (recorder.scroller ? recorder.scroller.scrollTop : 0));
+	recorder.scrollHeight = () => (recorder.scroller ? recorder.scroller.scrollHeight : document.documentElement.scrollHeight);
+	recorder.scrollTo = (y) => {
+		if (recorder.scroller === document.scrollingElement) window.scrollTo(0, y);
+		else if (recorder.scroller) recorder.scroller.scrollTop = y;
+	};
+
 	recorder.start = () => {
 		recorder.ids = new WeakMap();
 		recorder.next = 0;
+		recorder.scroller = recorder.scrollerOf();
 		number(document.body);
 		// The tree, and where every element was in document coordinates, so a tape can find the
 		// component a change belongs to and say when it came into view from the scroll alone.
 		// [id, parent id, top, bottom]; -1 for a node with no box. The body is the root, id -1.
 		const rects = [];
+		const numbered = new Map();
 		window.__brainWalk(document.body, 0, (node, id) => {
+			numbered.set(id, Array.isArray(node) ? node[0] : node);
 			const first = Array.isArray(node) ? node[0] : node;
 			const parentNode = first.parentNode && first.parentNode.host ? first.parentNode.host : first.parentNode;
 			const parent = parentNode === document.body ? -1 : (recorder.ids.get(parentNode) ?? -1);
 			if (Array.isArray(node) || node.nodeType !== 1) { rects.push([id, parent, -1, -1]); return; }
 			const r = node.getBoundingClientRect();
-			rects.push(r.width || r.height ? [id, parent, Math.round(r.top + scrollY), Math.round(r.bottom + scrollY)] : [id, parent, -1, -1]);
+			const down = recorder.scrollTop();
+			rects.push(r.width || r.height ? [id, parent, Math.round(r.top + down), Math.round(r.bottom + down)] : [id, parent, -1, -1]);
 		});
 		recorder.rects = rects;
+		// Kept so a harness can take hold of any component it numbered, not only the controls the
+		// interactive() list last looked for: that map is rebuilt per probe, and is empty until one.
+		recorder.nodeAt = numbered;
 		recorder.boxes = new Map(rects.filter((r) => r[2] >= 0).map((r) => [r[0], [r[2], r[3]]]));
 		recorder.base = now();
 		recorder.on = true;
@@ -505,11 +544,15 @@ export const RECORDER_SCRIPT = String.raw`(() => {
 		// reaction to leaving view as something that happened while still in it.
 		let lastY = -1;
 		const track = () => {
-			if (!recorder.on || scrollY === lastY) return;
-			recorder.scroll.push([now(), Math.round(scrollY)]);
-			lastY = scrollY;
+			if (!recorder.on) return;
+			const y = recorder.scrollTop();
+			if (y === lastY) return;
+			recorder.scroll.push([now(), Math.round(y)]);
+			lastY = y;
 		};
-		addEventListener("scroll", track, { passive: true });
+		// Caught on the way down: a scroll event does not bubble, so a panel scrolling inside the
+		// page never reaches a listener on the window unless it is heard in the capture phase.
+		addEventListener("scroll", track, { passive: true, capture: true });
 		track();
 		return recorder.next;
 	};
@@ -544,6 +587,8 @@ export interface ExploreOptions {
 	watchFrames?: number;
 	/** The longest a section still going when the sweep left it is watched for again. */
 	revisitFrames?: number;
+	/** How long each component is given, once it is fully in view. */
+	centreFrames?: number;
 	/** The most elements a whole page may be probed at; 0 skips interaction entirely. Every
 	 * candidate on a screen is probed — a page of interactive blocks has dozens in one screen and
 	 * taking eight of them is taking a tenth of the page. */
@@ -625,7 +670,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	say("settling at the top of the page", 0);
 	await advance(idle);
 	await pull();
-	const height = (await page.evaluate<number>("document.documentElement.scrollHeight")) ?? viewport.height;
+	const height = (await page.evaluate<number>("window.__domRecorder.scrollHeight()")) ?? viewport.height;
 	// Down the page, staying with a screen while something new is moving in it. New matters: a star
 	// field twinkles whether or not anyone is there, and waiting for it to stop would mean waiting
 	// for the whole page. So on arrival the sweep notes which nodes in this band were changing while
@@ -644,7 +689,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	let elsewhere = 0;
 	for (let y = step; y < height; y += step) {
 		say("reading down the page", 0.05 + 0.5 * (y / height), `${Math.round((y / height) * 100)}% of the way down`);
-		await page.evaluate(`window.scrollTo(0, ${y}); true`);
+		await page.evaluate(`window.__domRecorder.scrollTo(${y}); true`);
 		const arrival = await opsLength();
 		const band = `${y}, ${y + viewport.height}`;
 		const background = (await page.evaluate<number[]>(`window.__domRecorder.movers(${elsewhere}, ${band})`)) ?? [];
@@ -669,12 +714,89 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		if (!(await pull())) return kept.ops.length ? kept : null;
 	}
 	await advance(dwell);
+
+	// Coming down a screen at a time shows most of a page but not necessarily all of any one thing:
+	// a card a little taller than half the step is cut by the bottom of the screen at one stop and
+	// by the top at the next, and is never once whole. Pages wait for that. A demo that begins when
+	// it is properly in view — most observers are written that way — then never begins at all, and
+	// the capture records a component that does nothing, which is exactly what the rebuild goes on
+	// to reproduce. So every component-sized box is brought to the middle of the screen once, the
+	// way a reader arriving at it would see it, and given long enough to start.
+	const centres =
+		(await page.evaluate<Array<[number, number]>>(`(() => {
+			const vh = innerHeight;
+			const wanted = new Set();
+			const out = [];
+			for (const [id, box] of window.__domRecorder.boxes) {
+				const height = box[1] - box[0];
+				if (height < 80 || height > vh) continue;
+				const y = Math.max(0, Math.round(box[0] - (vh - height) / 2));
+				const key = Math.round(y / 60);
+				if (wanted.has(key)) continue;
+				wanted.add(key);
+				out.push([y, id]);
+			}
+			return out.sort((a, b) => a[0] - b[0]);
+		})()`)) ?? [];
+	const settle = options.centreFrames ?? 240;
+	// Held from the first touch onwards: what follows presses on the components themselves, and one
+	// of them being a link would otherwise end the recording here.
+	await page.evaluate("window.__domRecorder.hold(true); true");
+	for (const [index, [y, id]] of centres.entries()) {
+		say("looking at each thing properly", 0.5 + 0.06 * (index / Math.max(1, centres.length)), `${index + 1} of ${centres.length}`);
+		await page.evaluate(`window.__domRecorder.scrollTo(${y}); true`);
+		await advance(settle);
+		// And dragged across, which is the other thing a pointer does to a component. Probing drags
+		// whatever small control it has just hovered — a button, a chip — and a reel that turns under
+		// the hand is not any of those: it is the body of the card, which nothing else ever takes hold
+		// of. So the component itself is dragged here, while it is centred and whole.
+		const box = await page.evaluate<[number, number, number, number] | null>(
+			`(() => { const el = window.__domRecorder.nodeAt.get(${id}); if (!el || !el.isConnected || el.nodeType !== 1) return null; const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height].map(Math.round); })()`,
+		);
+		if (box && box[2] >= 120 && box[3] >= 60) {
+			const [bx, by, bw, bh] = box;
+			const midY = by + Math.round(bh / 2);
+			const spot = (u: number) => Math.round(bx + bw * u);
+			if (midY > 1 && midY < viewport.height - 2) {
+				// Touched where it is, rather than where a control would be. A card that answers a
+				// pointer anywhere on it — lighting up, tilting, opening — holds no button for a list
+				// of likely controls to find, so nothing ever asks it.
+				await page.evaluate(`window.__domRecorder.mark("hover", ${id}); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: spot(0.5), y: midY });
+				await advance(20);
+				await page.evaluate(`window.__domRecorder.mark("click", ${id}); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x: spot(0.5), y: midY, button: "left", clickCount: 1 });
+				await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: spot(0.5), y: midY, button: "left", clickCount: 1 });
+				await advance(36);
+				await page.evaluate(`window.__domRecorder.mark("end", ${id}); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 2, y: viewport.height - 2 });
+				await advance(12);
+				await page.evaluate(`window.__domRecorder.mark("grab", ${id}, 150, 500); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: spot(0.15), y: midY });
+				await page.send("Input.dispatchMouseEvent", { type: "mousePressed", x: spot(0.15), y: midY, button: "left", buttons: 1, clickCount: 1 });
+				await advance(8);
+				for (let step = 1; step <= 8; step++) {
+					const u = 0.15 + (0.7 * step) / 8;
+					await page.evaluate(`window.__domRecorder.mark("drag", ${id}, ${Math.round(u * 1000)}, 500); true`);
+					await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: spot(u), y: midY, button: "left", buttons: 1 });
+					await advance(8);
+				}
+				await page.evaluate(`window.__domRecorder.mark("drop", ${id}, 850, 500); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: spot(0.85), y: midY, button: "left", clickCount: 1 });
+				await advance(24);
+				await page.evaluate(`window.__domRecorder.mark("end", ${id}); true`);
+				await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 2, y: viewport.height - 2 });
+			}
+		}
+		if (!(await pull())) return kept.ops.length ? kept : null;
+	}
+
 	say("reading back up", 0.56);
 	for (let y = height; y > 0; y -= step * 2) {
-		await page.evaluate(`window.scrollTo(0, ${Math.max(0, y)}); true`);
+		await page.evaluate(`window.__domRecorder.scrollTo(${Math.max(0, y)}); true`);
 		await advance(Math.round(dwell / 2));
 	}
-	await page.evaluate("window.scrollTo(0, 0); true");
+	await page.evaluate("window.__domRecorder.scrollTo(0); true");
 	await advance(dwell);
 
 	// Whatever was still going when the sweep gave up on it gets one longer look, busiest first.
@@ -682,7 +804,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 	const watching = busy.sort((a, b) => b.changes - a.changes).slice(0, 3);
 	for (const [index, { y }] of watching.entries()) {
 		say("watching what is still moving", 0.62 + 0.1 * (index / Math.max(1, watching.length)), `${index + 1} of ${watching.length}`);
-		await page.evaluate(`window.scrollTo(0, ${y}); true`);
+		await page.evaluate(`window.__domRecorder.scrollTo(${y}); true`);
 		await advance(revisit);
 		if (!(await pull())) return kept.ops.length ? kept : null;
 	}
@@ -717,7 +839,7 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 		await page.send("Fetch.enable", { patterns: [{ resourceType: "Document", requestStage: "Request" }] });
 		await page.evaluate("window.__domRecorder.hold(true); true");
 		probing: for (let y = 0; y < height; y += viewport.height) {
-			await page.evaluate(`window.scrollTo(0, ${y}); true`);
+			await page.evaluate(`window.__domRecorder.scrollTo(${y}); true`);
 			// Whatever this screen reveals on arrival plays out before anything is touched.
 			await advance(120);
 			// The list is read again before every probe. Touching one thing re-renders others —
@@ -825,13 +947,13 @@ export async function explore(page: Page, options: ExploreOptions): Promise<DomR
 					break probing;
 				}
 				// A fragment link may have scrolled; the next probe is for this screen.
-				await page.evaluate(`if (Math.abs(scrollY - ${y}) > 2) window.scrollTo(0, ${y}); true`);
+				await page.evaluate(`if (Math.abs(window.__domRecorder.scrollTop() - ${y}) > 2) window.__domRecorder.scrollTo(${y}); true`);
 			}
 		}
 		await page.evaluate("if (window.__domRecorder && window.__domRecorder.hold) window.__domRecorder.hold(false); true").catch(() => ({}));
 		await page.send("Fetch.disable").catch(() => ({}));
 		unblock();
-		await page.evaluate("window.scrollTo(0, 0); true");
+		await page.evaluate("window.__domRecorder.scrollTo(0); true");
 	}
 	await advance(30);
 

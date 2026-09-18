@@ -365,6 +365,12 @@ export async function withPage<T>(
 			// spares, which on this machine came to sixteen processes and 1.6 GB while a rip
 			// was running.
 			"--renderer-process-limit=1",
+			// A headless browser tells a page it has no pointer and cannot hover, and a page that
+			// asks — through @media (hover: hover) or matchMedia — then serves its touch variant:
+			// no cursor effects, no hover states, nothing that follows a pointer. Capturing that is
+			// capturing a different site. These are Blink's own device settings, and they can only
+			// be set here, at launch: hover and any-hover on, pointer and any-pointer fine.
+			"--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
 			"--disable-features=site-per-process,IsolateOrigins",
 			"--disable-breakpad",
 			"--remote-debugging-port=0",

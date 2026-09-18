@@ -38,7 +38,7 @@
 // moved, with the share it had to reach — the threshold the rebuild's observer uses.
 
 import type { DomRecording } from "./dom-recording";
-import { type ComponentTree, componentTree, scrollReactions, visibilityOf } from "./dom-geometry";
+import { type ComponentTree, componentTree, scrollReactions, shownThreshold, visibilityOf } from "./dom-geometry";
 import { interactionsOf } from "./dom-interactions";
 import { type Surface, surfacesOf } from "./dom-surfaces";
 import { PLAYED_LENGTH, type RecordedOp, type TapeOp, played, stateKey } from "./dom-ops";
@@ -81,6 +81,17 @@ export interface DomTapes {
 const EXIT_WINDOW_MS = 1_500;
 /** A change this soon after the page scrolled was the page reacting to the scroll. */
 const SCROLL_REACTION_MS = 300;
+/**
+ * How long a component's changes still count as the visit that started them, once it has scrolled
+ * off.
+ *
+ * Much longer than the window for a reaction to leaving, and deliberately so. A card set going as
+ * it comes up runs for as long as it runs — several seconds of it — while the capture has already
+ * moved down the page. Measured against a second and a half, nearly all of that happened out of
+ * view, and a thing that plays when you reach it is filed as a thing that plays by itself from
+ * load: in the rebuild it is over before anyone scrolls down to it.
+ */
+const SEEN_AFTER_MS = 12_000;
 /** A component that changed this often out of view runs on its own clock. */
 const AMBIENT_OPS = 5;
 const AMBIENT_SPAN_MS = 3_000;
@@ -97,6 +108,101 @@ const MISSED_CYCLES = 1.5;
 const RAN_SHARE = 0.05;
 /** Changes closer together than this are one moment. */
 const MOMENT_MS = 50;
+/**
+ * A gap longer than this, in a tape that never comes round again, was the capture looking
+ * elsewhere rather than the page waiting.
+ *
+ * The harness works through a page a screen at a time and then probes it control by control, so a
+ * component's changes arrive in bursts minutes apart. Those minutes are an artefact of how the
+ * watching was done, and played back as recorded they are a component that does one thing on load
+ * and its next thing eight minutes later — which no one is still there to see. A tape that repeats
+ * is left alone: its own cycle already says how long it waits.
+ */
+const DEAD_GAP_MS = 1_500;
+/** What such a gap is left as, so a burst still reads as a separate thing happening. */
+const KEPT_GAP_MS = 400;
+
+/**
+ * A cycle slower than this is not one anyone waits to see come round.
+ *
+ * When no exact cycle is found, a loop falls back to repeating everything that was watched, and
+ * over a capture that ran for minutes that is a component doing its one thing and then nothing at
+ * all. Such a tape is better treated as having no cycle: squeezed, and repeated on what it becomes.
+ */
+const MAX_PERIOD_MS = 30_000;
+
+/** The same ops with the capture's dead time taken out of the gaps between them. */
+function squeeze(ops: TapeOp[]): TapeOp[] {
+	if (ops.length < 2) return ops;
+	let shift = 0;
+	let previous = ops[0]![0];
+	return ops.map((op) => {
+		const gap = op[0] - previous;
+		if (gap > DEAD_GAP_MS) shift += gap - KEPT_GAP_MS;
+		previous = op[0];
+		return [op[0] - shift, ...op.slice(1)] as TapeOp;
+	});
+}
+
+/** A tape's ops and its cycle, with dead time taken out unless the cycle is quick enough to keep. */
+function tighten(ops: TapeOp[], loop: Loop | undefined): { ops: TapeOp[]; loop?: Loop } {
+	if (loop && loop[1] <= MAX_PERIOD_MS) return { ops, loop };
+	const tight = squeeze(ops);
+	if (!loop || tight.length < 2) return { ops: tight };
+	return { ops: tight, loop: [0, Math.max(KEPT_GAP_MS, tight[tight.length - 1]![0])] };
+}
+
+/**
+ * A tape that can be played from where it begins.
+ *
+ * A subtree the page replaced is numbered afresh from that moment on, so a change to one of its
+ * nodes means nothing without the replacement that made it. In a recording the two are always in
+ * order. A tape is cut out of that recording — one visit of many, with the rest left behind — and
+ * the replacement can easily fall outside the cut, leaving thousands of changes addressed to nodes
+ * the rebuild has no way to name. They resolve to nothing, and a component that the capture caught
+ * in full plays as a component that does nothing at all.
+ *
+ * So each list is handed the replacements its own changes depend on, at its head, before anything
+ * that needs them.
+ */
+function selfContained(ops: TapeOp[], mints: Array<{ first: number; op: RecordedOp }>, baseline: number): TapeOp[] {
+	if (!ops.length || !mints.length) return ops;
+	const ownerOf = (id: number) => {
+		let low = 0;
+		let high = mints.length - 1;
+		let found: { first: number; op: RecordedOp } | null = null;
+		while (low <= high) {
+			const mid = (low + high) >> 1;
+			if (mints[mid]!.first <= id) {
+				found = mints[mid]!;
+				low = mid + 1;
+			} else high = mid - 1;
+		}
+		return found;
+	};
+	// Each replacement goes where its own generation of nodes begins, not all of them at the front:
+	// a subtree replaced twice has two sets of numbers, and putting the later replacement first
+	// throws away the nodes the earlier changes are addressed to. They would still be written to —
+	// nothing errors, the node simply is not in the document any more — and the component sits there
+	// unchanged while its tape plays out against nodes nobody can see.
+	const have = new Set<number>();
+	const out: TapeOp[] = [];
+	let added = false;
+	for (const op of ops) {
+		if (op[1] === "c" && typeof op[4] === "number") have.add(op[4]);
+		const target = op[2];
+		if (typeof target === "number" && target >= baseline) {
+			const owner = ownerOf(target);
+			if (owner && !have.has(owner.first)) {
+				have.add(owner.first);
+				out.push(played(owner.op, op[0] as number));
+				added = true;
+			}
+		}
+		out.push(op);
+	}
+	return added ? out : ops;
+}
 
 export function buildTapes(recording: DomRecording): DomTapes {
 	const tree = componentTree(recording);
@@ -137,7 +243,7 @@ export function buildTapes(recording: DomRecording): DomTapes {
 	const tapes: Tape[] = [];
 	for (const { anchor, threshold, ops } of byAnchor.values()) {
 		const episodes = anchor === -1 ? [] : visibility.episodesOf(anchor, threshold);
-		const { ambient, triggered } = splitAmbient(ops, episodes, anchor === -1);
+		const { ambient, triggered } = splitAmbient(ops, episodes, anchor === -1, undisturbed);
 		if (ambient.length) {
 			const tape: Tape = { anchor, before: ambient.map((op) => played(op, op[0] - recording.base)), episodes: [] };
 			const loop = loopOf(
@@ -146,7 +252,9 @@ export function buildTapes(recording: DomRecording): DomTapes {
 				Math.min(end, undisturbed),
 				tree,
 			);
-			if (loop) tape.loop = loop;
+			const tight = tighten(tape.before, loop);
+			tape.before = tight.ops;
+			if (tight.loop) tape.loop = tight.loop;
 			tapes.push(tape);
 		}
 		if (!triggered.length) continue;
@@ -154,9 +262,29 @@ export function buildTapes(recording: DomRecording): DomTapes {
 		const tape = restarts(triggered, episodes)
 			? triggeredTape(anchor, triggered, episodes, recording.base, end, undisturbed, tree)
 			: whileSeenTape(anchor, triggered, episodes, end, undisturbed, tree);
+		// The rebuild's observer is told what counts as in view here, so the two agree about when a
+		// component's visit begins. Without it the observer answers as the thing comes up, plays the
+		// first of these ops, and then waits out the seconds the page spent not yet properly showing.
+		const shown = anchor === -1 ? 0 : shownThreshold(tree.box.get(anchor) ?? [0, 1], recording.viewport.height);
 		if (threshold > 0) tape.threshold = threshold;
+		else if (shown > 0) tape.threshold = Math.round(shown * 100) / 100;
 		tapes.push(tape);
 	}
+	// Every list is made to stand on its own, now that it is known which ops it kept.
+	const mints = recording.ops
+		.filter((op) => op[1] === "c" && typeof op[4] === "number")
+		.map((op) => ({ first: op[4] as number, op }))
+		.sort((a, b) => a.first - b.first);
+	const baseline = tree.baselineNodes;
+	for (const tape of tapes) {
+		tape.before = selfContained(tape.before, mints, baseline);
+		if (tape.whileSeen) tape.whileSeen.ops = selfContained(tape.whileSeen.ops, mints, baseline);
+		for (const episode of tape.episodes) {
+			episode.enter = selfContained(episode.enter, mints, baseline);
+			episode.exit = selfContained(episode.exit, mints, baseline);
+		}
+	}
+	for (const interaction of interactions) interaction.ops = selfContained(interaction.ops, mints, baseline);
 	return { tapes, interactions, surfaces, skipped };
 }
 
@@ -166,11 +294,16 @@ export function buildTapes(recording: DomRecording): DomTapes {
  * both at once — stars that twinkle whether or not anyone is there, above a demo that waits until
  * it is looked at.
  */
-function splitAmbient(ops: RecordedOp[], episodes: Array<{ enter: number; exit: number }>, all: boolean) {
+function splitAmbient(ops: RecordedOp[], episodes: Array<{ enter: number; exit: number }>, all: boolean, undisturbed: number) {
 	if (all) return { ambient: ops, triggered: [] as RecordedOp[] };
-	const seen = (t: number) => episodes.some((e) => e.enter <= t && t < e.exit + EXIT_WINDOW_MS);
+	const seen = (t: number) => episodes.some((e) => e.enter <= t && t < e.exit + SEEN_AFTER_MS);
 	const unseenByKey = new Map<string, RecordedOp[]>();
 	for (const op of ops) {
+		// Read from the page left to itself, as loops are. Once the harness is hovering and clicking
+		// its way down the page, a component answering that is not a component running on its own,
+		// and counting those answers as proof of an own clock makes everything ambient: played from
+		// load, and over before a reader has scrolled far enough to see it.
+		if (op[0] >= undisturbed) continue;
 		if (seen(op[0])) continue;
 		const key = stateKey(op) ?? `${op[1]}:${op[2]}`;
 		unseenByKey.set(key, [...(unseenByKey.get(key) ?? []), op]);
@@ -225,7 +358,9 @@ function whileSeenTape(anchor: number, ops: RecordedOp[], episodes: Array<{ ente
 		tree,
 	);
 	const tape: Tape = { anchor, before: [], episodes: [], whileSeen: { ops: onScreen.map((op) => played(op, op[0])) } };
-	if (loop) tape.whileSeen!.loop = loop;
+	const tight = tighten(tape.whileSeen!.ops, loop);
+	tape.whileSeen!.ops = tight.ops;
+	if (tight.loop) tape.whileSeen!.loop = tight.loop;
 	return tape;
 }
 
@@ -244,6 +379,11 @@ function triggeredTape(anchor: number, ops: RecordedOp[], episodes: Array<{ ente
 		const episode = episodes[index]!;
 		if (t >= episode.exit && t - episode.exit <= EXIT_WINDOW_MS) {
 			tape.episodes[index]!.exit.push(played(op, t - episode.exit));
+		} else if (t >= episode.exit + SEEN_AFTER_MS) {
+			// Long past the visit that could have started it. Filed under that visit anyway — which is
+			// what happens to everything after the last one — it makes a component's arrival a thing
+			// that takes as long as the capture did, and the burst a reader should see is stretched
+			// out among minutes of the harness working its way down the page. So it is left out.
 		} else {
 			tape.episodes[index]!.enter.push(played(op, t - episode.enter));
 			entered[index]!.push(op);
@@ -271,6 +411,12 @@ function triggeredTape(anchor: number, ops: RecordedOp[], episodes: Array<{ ente
 		} else if (loops[i]) {
 			episode.loop = loops[i];
 		}
+	}
+	tape.before = squeeze(tape.before);
+	for (const episode of tape.episodes) {
+		const tight = tighten(episode.enter, episode.loop);
+		episode.enter = tight.ops;
+		episode.loop = tight.loop;
 	}
 	// Visits where nothing happened still count — the second entry plays the second set — but
 	// empty ones at the end are nothing to play.
