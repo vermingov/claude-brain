@@ -37,6 +37,7 @@ import {
 	referenceShotPath,
 	renderPath as designRenderPath,
 	shadersPath,
+	siteArchivePath,
 	sourceCssPath,
 	sourceHtmlPath,
 	saveUrlDesign,
@@ -48,6 +49,9 @@ import {
 } from "./src/design-store";
 import { embedPendingEpisodes, recordEpisode } from "./src/episodic";
 import { rebuildGraph } from "./src/graph";
+import { openArchive } from "./src/site-archive";
+import { fillIn } from "./src/site-fill";
+import { mirrorKey, mirrorOrigin, serveMirror } from "./src/site-serve";
 import { activeJobs } from "./src/jobs";
 import { buildGraph, noteDetail } from "./src/graph-builder";
 import { ensureLayout } from "./src/graph-positions";
@@ -98,6 +102,23 @@ function sameOrigin(req: Request): boolean {
 	if (site && site !== "same-origin" && site !== "none") return false;
 	const origin = req.headers.get("origin");
 	return !origin || ALLOWED_ORIGINS.has(origin);
+}
+
+function serveCopy(req: Request, id: string): Response | Promise<Response> {
+	const archive = openArchive(siteArchivePath(id));
+	if (!archive) return new Response("there is no copy by that name", { status: 404 });
+	// The same switch that lets a rebuild's render reach the network lets a copy ask the site for
+	// what the visit never caught; with it off, a copy is exactly its recording.
+	const fill = loadConfig().designs.recreateNetwork ? (url: string) => fillIn(archive, url) : undefined;
+	return serveMirror(req, archive, { embedders: [...ALLOWED_ORIGINS], fill });
+}
+
+/** Where a design's living copy opens, or null when its rebuild did not keep one. */
+function copyAddress(id: string): string | null {
+	const archive = openArchive(siteArchivePath(id));
+	if (!archive) return null;
+	const page = new URL(archive.manifest.document);
+	return mirrorOrigin(id, PORT) + page.pathname + page.search;
 }
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -474,7 +495,7 @@ async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Res
 			const status = await claudeStatus();
 			const designs = loadConfig().designs;
 			return jsonResponse({
-				designs: listDesigns({ all: url.searchParams.has("all") }),
+				designs: listDesigns({ all: url.searchParams.has("all") }).map((row) => ({ ...row, copy: copyAddress(row.id) })),
 				llm: { available: status.available, reason: status.reason ?? null, enabled: loadConfig().llm.enabled },
 				// Whether pages can be rendered at all decides what the tab may promise, so
 				// it rides along with the list rather than making the tab poll for it.
@@ -627,7 +648,7 @@ async function handleDesigns(url: URL, req: Request, post: boolean): Promise<Res
 				thumb: src.thumb,
 				captured: src.extract.length > 0,
 			}));
-			return jsonResponse({ row, spec, sources });
+			return jsonResponse({ row: { ...row, copy: copyAddress(row.id) }, spec, sources });
 		}
 		return jsonResponse({ error: `unknown design action: ${action}` }, 404);
 	}
@@ -880,6 +901,12 @@ const serveOptions = {
 	// A cold graph build or first consolidation can outrun the 10 s default.
 	idleTimeout: 60,
 	async fetch(req: Request) {
+		// A design's living copy has an origin to itself, <id>.localhost, and that origin is given
+		// the copy and nothing else. Decided before anything below is looked at: the code running
+		// there is a stranger's, and none of this server's routes are for it.
+		const copy = mirrorKey(req.headers.get("host"));
+		if (copy) return serveCopy(req, copy);
+
 		const url = new URL(req.url);
 		const post = req.method === "POST";
 		if (post && !sameOrigin(req)) return jsonResponse({ error: "cross-origin request rejected" }, 403);

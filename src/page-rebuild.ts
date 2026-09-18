@@ -15,6 +15,7 @@ import { type DomRecording, type ExploreOptions, PAGE_CLOCK, RECORDER_SCRIPT, ex
 import { type DomTapes, buildTapes, eachTapeOp } from "./dom-tapes";
 import { assembleTransplant, captureTransplant, heroCanvasIndex, pageScriptText, withHeroCanvas } from "./page-transplant";
 import { SKIP_DRAWS } from "./parity-hooks";
+import { type SiteRecording, recordSite } from "./site-capture";
 import { type RippedFrame, rebuildRuntime } from "./webgl-ripper";
 
 const VIEWPORT = { width: 1280, height: 800 };
@@ -43,6 +44,8 @@ export interface PageRebuild {
 	runtime: string;
 	recording: DomRecording;
 	tapes: DomTapes;
+	/** Everything the page asked the network for during the visit, for running its own code again. */
+	site: SiteRecording;
 	/** What was kept and what was not, in numbers, for the notes. */
 	stats: { rules: number; assets: number; ops: number; tapes: number; interactions: number; loops: number; seconds: number };
 }
@@ -57,23 +60,31 @@ export async function rebuildPage(url: string, options: PageRebuildOptions): Pro
 		await page.addInitScript(SKIP_DRAWS);
 		await page.addInitScript(PAGE_CLOCK);
 		await page.addInitScript(RECORDER_SCRIPT);
+		// Before the page opens, so its document is the first thing kept; and through the whole
+		// visit, because what a page loads when a control is first used is loaded then and not before.
+		const traffic = await recordSite(page);
 		say("opening the page", 0.02, url);
 		await page.goto(url, { ...viewport, loadTimeoutMs: LOAD_TIMEOUT_MS, afterSettleMs: SETTLE_MS });
 		say("reading its DOM and every rule that applies to it", 0.06);
 		const transplant = await captureTransplant(page);
-		if (!transplant?.ok) return { transplant, recording: null, scriptText: "" };
+		if (!transplant?.ok) return { transplant, recording: null, scriptText: "", site: null };
 		const recording = await explore(page, {
 			viewport,
 			...options.explore,
 			onProgress: (stage, progress, detail) => say(stage, WATCHING.from + (WATCHING.to - WATCHING.from) * progress, detail),
 		});
 		say("reading the page's own scripts", 0.77);
-		return { transplant, recording, scriptText: await pageScriptText(page) };
+		const scriptText = await pageScriptText(page);
+		return { transplant, recording, scriptText, site: await traffic.stop() };
 	});
 	if (!visit.ok) return { error: visit.reject };
-	const { transplant, recording, scriptText } = visit.value;
+	const { transplant, recording, scriptText, site } = visit.value;
 	if (!transplant?.ok) return { error: transplant?.note || "the page could not be read" };
-	if (!recording) return { error: "the page's behaviour could not be recorded" };
+	if (!recording || !site) return { error: "the page's behaviour could not be recorded" };
+	// While it probes, the visit answers every attempt to leave the page with 204 No Content. Those
+	// are this harness declining to go, not something the site said, and a copy that kept them would
+	// make every link on the page do nothing.
+	site.exchanges = site.exchanges.filter((exchange) => !(exchange.kind === "Document" && exchange.status === 204));
 
 	say("working out what set each change off", 0.8, `${recording.ops.length} changes recorded`);
 	const tapes = buildTapes(recording);
@@ -117,6 +128,7 @@ export async function rebuildPage(url: string, options: PageRebuildOptions): Pro
 		runtime,
 		recording,
 		tapes,
+		site,
 		stats: {
 			rules: built.rules,
 			assets: resources.assets.length,

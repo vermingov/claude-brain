@@ -1108,10 +1108,12 @@ export function createDesignsTab(container) {
 	}
 
 	/**
-	 * The rebuilt page, running. Not a screenshot of it: the real document, with its own CSS
-	 * and the behaviour this brain recorded off the site, in a frame the server drops into an
-	 * opaque origin. It is built at the width it was captured at and scaled down to fit, so
-	 * what shows here is what the page looks like, not a reflow of it.
+	 * The rebuilt page, running. Not a screenshot of it. When the rebuild kept the page's own
+	 * code (row.copy), that is what runs: the site's scripts against a recording of its network,
+	 * on an origin of its own, so every control does what it does on the site. Otherwise it is the
+	 * document with its CSS and the behaviour recorded off the site, in a frame the server drops
+	 * into an opaque origin. Either way it is built at the width it was captured at and scaled
+	 * down to fit, so what shows here is what the page looks like, not a reflow of it.
 	 *
 	 * Behind a button because a rebuild is a megabyte of markup and a runtime that starts
 	 * animating the moment it loads, and opening a design should not cost that unasked.
@@ -1119,17 +1121,18 @@ export function createDesignsTab(container) {
 	function rebuildPreview(row) {
 		const block = el("div", "design-preview");
 		const id = encodeURIComponent(row.id);
-		const frameSrc = `/api/designs/${id}/recreation.html?v=${row.recreate_at}`;
+		const frameSrc = row.copy || `/api/designs/${id}/recreation.html?v=${row.recreate_at}`;
+		const runLabel = row.copy ? "Run the page" : "Run the rebuilt page";
 		const stage = el("div", "design-preview-stage");
 		stage.hidden = true;
 
-		const run = text("button", "settings-btn primary", "Run the rebuilt page");
+		const run = text("button", "settings-btn primary", runLabel);
 		run.type = "button";
 		run.onclick = () => {
 			if (!stage.hidden) {
 				stage.hidden = true;
 				stage.innerHTML = "";
-				run.textContent = "Run the rebuilt page";
+				run.textContent = runLabel;
 				return;
 			}
 			const frame = el("iframe", "design-preview-frame");
@@ -1174,11 +1177,18 @@ export function createDesignsTab(container) {
 		const actions = el("div", "design-actions");
 		const id = encodeURIComponent(row.id);
 		if (row.recreate_status === "built") {
-			const open = text("a", "settings-btn ghost", "Open the rebuilt page");
-			open.href = `/api/designs/${id}/recreation.html`;
-			open.target = "_blank";
-			open.rel = "noopener";
-			actions.appendChild(open);
+			// With a copy there are two pages to open: the site's own code running from its
+			// recording, and the still document built from its DOM and rules.
+			const pages = row.copy
+				? [[row.copy, "Open the working copy"], [`/api/designs/${id}/recreation.html`, "Open the still rebuild"]]
+				: [[`/api/designs/${id}/recreation.html`, "Open the rebuilt page"]];
+			for (const [href, label] of pages) {
+				const open = text("a", "settings-btn ghost", label);
+				open.href = href;
+				open.target = "_blank";
+				open.rel = "noopener";
+				actions.appendChild(open);
+			}
 		}
 		// The page's own code, when the capture got it. This is the thing an agent reads
 		// when it is building something in this style and the summary is not enough.

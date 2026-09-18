@@ -10,7 +10,7 @@
 // exception spelled out in saveDesign() — re-dropping is also the natural gesture for
 // "that one failed, try again", and a silent no-op there would be a dead end.
 
-import { existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DATA_DIR, designFolder, vaultRoot } from "./config";
 import { type ImageMime, imageMeta, sniffMime } from "./image-meta";
@@ -187,6 +187,11 @@ export function heroRuntimePath(id: string): string {
 	return join(RECREATE_DIR, `${id}.hero.js`);
 }
 
+/** Everything the page asked the network for, kept so its own code can be run again (site-archive.ts). */
+export function siteArchivePath(id: string): string {
+	return join(RECREATE_DIR, `${id}.site`);
+}
+
 /** Every file a rebuild owns, including the scratch names a killed round can leave. */
 export function recreationFiles(id: string): string[] {
 	return [
@@ -198,6 +203,7 @@ export function recreationFiles(id: string): string[] {
 		sourceCssPath(id),
 		shadersPath(id),
 		heroRuntimePath(id),
+		siteArchivePath(id),
 		join(RECREATE_DIR, `${id}.candidate.png`),
 		join(RECREATE_DIR, `${id}.candidate.html`),
 	];
@@ -832,7 +838,8 @@ export function forgetDesign(
 	const removed: string[] = [];
 	for (const path of removes) {
 		try {
-			unlinkSync(path);
+			// Recursive because one of a rebuild's names is a folder: the recorded site.
+			rmSync(path, { recursive: true });
 			removed.push(path);
 		} catch {
 			/* already gone — the row going away is what matters */

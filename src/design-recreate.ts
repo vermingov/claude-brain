@@ -45,6 +45,7 @@ import {
 	recreationHtmlPath,
 	recreationShotPath,
 	heroRuntimePath,
+	siteArchivePath,
 	recreationThumbPath,
 	referenceShotPath,
 	shadersPath,
@@ -57,6 +58,7 @@ import { NO_BROWSER, findBrowser, screenshot } from "./headless";
 import { startJob } from "./jobs";
 import { rebuildPage } from "./page-rebuild";
 import { ripScene } from "./scene-rip";
+import { writeArchive } from "./site-archive";
 import type { RippedFrame } from "./webgl-ripper";
 import { type Page, withPage } from "./cdp";
 import { type StoredAsset, collectAssets, renderAssetManifest, storeAssetBytes, storeVideoBytes } from "./design-assets";
@@ -785,6 +787,7 @@ async function rebuildRun(id: string, url: string, job: ReturnType<typeof startJ
 
 	await Bun.write(recreationHtmlPath(id), result.html);
 	await Bun.write(heroRuntimePath(id), result.runtime);
+	const copy = await writeArchive(siteArchivePath(id), result.site);
 	job.stage("rendering the rebuild", 0.96);
 	const shot = await screenshot({
 		url: `file://${recreationHtmlPath(id)}`,
@@ -807,6 +810,7 @@ async function rebuildRun(id: string, url: string, job: ReturnType<typeof startJ
 			`${assets} images, videos and fonts downloaded and rewritten to local paths`,
 			`${ops} changes its script made to the page, recorded over ${seconds} s and filed into ${tapes} tapes${loops ? `, ${loops} of them looping` : ""}`,
 			interactions ? `${interactions} things that answer a hover or a click` : "nothing on the page answered a hover or a click",
+			`a living copy: the page's own code with the ${copy.entries.length} answers the network gave it, so what it does when used is what the page does`,
 		].filter(Boolean),
 		uncertain: result.tapes.skipped ? Object.entries(result.tapes.skipped).map(([why, n]) => `${n} recorded changes dropped: ${why}`) : [],
 		model: "the page itself",
